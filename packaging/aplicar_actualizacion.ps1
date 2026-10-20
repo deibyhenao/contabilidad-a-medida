@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory=$true)][int]$ParentId,
     [Parameter(Mandatory=$true)][string]$Installer,
     [Parameter(Mandatory=$true)][ValidatePattern('^[a-f0-9]{64}$')][string]$SHA256,
@@ -16,7 +16,15 @@ try {
     $null = $parentProcess.Handle  # conserva el handle original, evita reutilización de PID
     [IO.File]::WriteAllText($ReadyFile, 'ready')
     if (-not $parentProcess.WaitForExit(120000)) { throw 'La aplicación no se cerró a tiempo.' }
-    if ((Get-FileHash -LiteralPath $Installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $SHA256) {
+    $algoritmo = [Security.Cryptography.SHA256]::Create()
+    $archivo = [IO.File]::OpenRead($Installer)
+    try {
+        $huella = [BitConverter]::ToString($algoritmo.ComputeHash($archivo)).Replace('-', '').ToLowerInvariant()
+    } finally {
+        $archivo.Dispose()
+        $algoritmo.Dispose()
+    }
+    if ($huella -ne $SHA256) {
         throw 'El instalador no supera la verificación de integridad.'
     }
     # Argumentos del ejecutable; nunca se evalúan como código de PowerShell.
