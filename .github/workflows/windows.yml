@@ -6,6 +6,12 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      publicar:
+        description: 'Publicar instalador de la versión de version.py después de validar'
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -36,7 +42,7 @@ jobs:
           path: build/pruebas.xml
 
   publicar:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publicar)
     needs: validar
     runs-on: windows-latest
     timeout-minutes: 30
@@ -51,9 +57,11 @@ jobs:
           python-version: '3.10'
           cache: pip
       - name: Comprobar versión del tag
+        id: version
         env:
           TAG_PUBLICACION: ${{ github.ref_name }}
-        run: python -c "import os; from version import VERSION; assert os.environ['TAG_PUBLICACION'] == 'v'+VERSION, 'El tag debe coincidir con version.py'"
+        run: |
+          python -c "import os,re; from version import VERSION; assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', VERSION); tag='v'+VERSION; assert not os.environ['GITHUB_REF'].startswith('refs/tags/') or os.environ['TAG_PUBLICACION']==tag, 'El tag debe coincidir con version.py'; open(os.environ['GITHUB_OUTPUT'],'a').write('tag='+tag+'\n')"
       - run: python -m pip install -r requirements.txt -r requirements-build.txt
       - name: Construir y diagnosticar ejecutable e instalador
         shell: pwsh
@@ -74,5 +82,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG_PUBLICACION: ${{ github.ref_name }}
-        run: gh release create "$env:TAG_PUBLICACION" release/*.exe release/SHA256SUMS.txt --verify-tag --title "Contabilidad a Medida $env:TAG_PUBLICACION" --generate-notes
+          TAG_PUBLICACION: ${{ steps.version.outputs.tag }}
+          COMMIT_PUBLICACION: ${{ github.sha }}
+        run: gh release create "$env:TAG_PUBLICACION" (Get-ChildItem -LiteralPath release -Filter '*.exe' -File).FullName release/SHA256SUMS.txt --target "$env:COMMIT_PUBLICACION" --title "Contabilidad a Medida $env:TAG_PUBLICACION" --generate-notes

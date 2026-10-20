@@ -45,7 +45,7 @@ git push origin v1.0.1
 
 El workflow `.github/workflows/windows.yml` ejecuta la suite completa en Windows. Solo si pasa, compila, diagnostica el ejecutable con datos ficticios, genera el instalador y publica la release con `SHA256SUMS.txt`. El tag debe coincidir exactamente con `version.py`; no se reutilizan tags ni se sobrescriben releases publicadas. No hacen falta claves API de clientes para las pruebas ni para compilar.
 
-También puedes editar el código en GitHub y crear una nueva release con un tag `v<versión>` apuntando a `main`: el workflow construye y publica sus assets. Para dejar que el workflow cree la release por sí solo, crea el tag desde un clon. Quien desarrolla necesita acceso de escritura a GitHub; los usuarios finales no necesitan cuenta ni token.
+La opción más sencilla sin terminal: cambia `version.py` y el código en GitHub, abre **Actions → Windows · pruebas e instalador → Run workflow**, activa **publicar** y ejecuta. Tras pasar las pruebas, el workflow construye el instalador y crea el tag y la release de esa versión. No reutilices una versión ya publicada. Quien desarrolla necesita acceso de escritura a GitHub; los usuarios finales no necesitan cuenta ni token.
 
 No subas bases SQLite, expedientes, PDFs, archivos `.env`, claves de firma ni copias. El paquete se construye a partir de módulos importados, `assets`, las dos plantillas originales y el auxiliar de actualización; no se empaqueta toda la carpeta del proyecto.
 
