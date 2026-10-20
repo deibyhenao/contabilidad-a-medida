@@ -255,11 +255,22 @@ def boton(texto: str, on_click, p: Paleta, icono=None, tipo: str = "primario", t
     return pulsable(c, on_click, {"bgcolor": fondo}, {"bgcolor": fondo_encima})
 
 
-def boton_icono(icono, on_click, p: Paleta, tooltip: str, color: Optional[str] = None) -> ft.Container:
-    """Icono pulsable de 34 px (área de clic cómoda), círculo tintado al pasar el ratón."""
-    c = ft.Container(ft.Icon(icono, size=19, color=color or p.acento), width=34, height=34, border_radius=17,
-                     alignment=ft.Alignment.CENTER, tooltip=tooltip)
-    return pulsable(c, on_click, {"bgcolor": "#00000000"}, {"bgcolor": p.hover}, escala=0.92)
+def boton_icono(icono, on_click, p: Paleta, tooltip: str, color: Optional[str] = None,
+                peligro: bool = False) -> ft.Container:
+    """Icono pulsable de 34 px (área de clic cómoda), círculo tintado al pasar el ratón.
+    ``peligro``: en reposo es neutro y solo al pasar el ratón se vuelve rojo sobre rojo suave."""
+    icono_c = ft.Icon(icono, size=19, color=color or p.acento, animate_opacity=ANIM_HOVER)
+    c = ft.Container(icono_c, width=34, height=34, border_radius=17, alignment=ft.Alignment.CENTER, tooltip=tooltip)
+    c = pulsable(c, on_click, {"bgcolor": "#00000000"}, {"bgcolor": p.rojo_suave if peligro else p.hover},
+                 escala=0.95)
+    if peligro:
+        reposo_color, base = icono_c.color, c.on_hover
+
+        def on_hover(e):
+            icono_c.color = p.rojo if e.data in (True, "true") else reposo_color
+            base(e)
+        c.on_hover = on_hover
+    return c
 
 
 def accion(texto: str, on_click, p: Paleta, icono=None, tipo: str = "neutro",

@@ -142,6 +142,7 @@ class App:
             pg.window.prevent_close = True
             pg.window.on_event = self._evento_ventana
         pg.on_keyboard_event = self._atajo
+        pg.on_platform_brightness_change = self._cambio_tema
 
         self.barra_progreso = ft.ProgressBar(opacity=0, color=p.acento, bgcolor="transparent", bar_height=2,
                                              animate_opacity=ft.Animation(200, ft.AnimationCurve.EASE_OUT_CUBIC))
@@ -164,10 +165,10 @@ class App:
             self.cid = clientes[0]["id"]
         raiz = ft.Column([
             self.barra_progreso,
-            ft.Container(self.aviso_actualizacion, padding=ft.Padding.symmetric(horizontal=16, vertical=8)),
             ft.Row([self._barra_lateral(), self.zona_principal], spacing=0, expand=True,
                    vertical_alignment=ft.CrossAxisAlignment.STRETCH),
         ], spacing=0, expand=True)
+        self._raiz = raiz
         if contenedor is not None:
             contenedor.controls.insert(0, raiz)
         else:
@@ -218,6 +219,21 @@ class App:
                     self.ctrl._lock.release()
             await self.page.window.destroy()
 
+    def _cambio_tema(self, _e=None) -> None:
+        """El sistema cambió entre claro y oscuro: se repinta con la otra paleta sin perder cliente ni pestaña."""
+        p = ui.OSCURO if self.page.platform_brightness == ft.Brightness.DARK else ui.CLARO
+        if p is self.p or self.cerrando or getattr(self, "_raiz", None) is None:
+            return
+        self.p = p
+        preparar_pagina(self.page, p)
+        self.barra_progreso.color = p.acento
+        self.lbl_estado.color = p.texto2
+        self.aviso_actualizacion.cambiar_paleta(p)
+        self._raiz.controls[1].controls[0] = self._barra_lateral()
+        self.buscar.value = self.filtro
+        self._refrescar_clientes()
+        self._pintar_principal()
+
     # ================================================================== actualizaciones
     def _mostrar_actualizacion(self, estado, **kwargs):
         if not self.cerrando:
@@ -236,6 +252,10 @@ class App:
                 self._update_ruta = None
                 self._mostrar_actualizacion("disponible" if publicacion else "actual",
                                              version=publicacion.version if publicacion else VERSION)
+                if not publicacion:
+                    t = threading.Timer(3.0, self._volver_a_reposo)
+                    t.daemon = True
+                    t.start()
             except Exception:
                 self._mostrar_actualizacion("reposo" if automatica else "error", version=VERSION)
             finally:
@@ -245,6 +265,10 @@ class App:
         except Exception:
             self._update_lock.release()
             self._mostrar_actualizacion("error")
+
+    def _volver_a_reposo(self) -> None:
+        if getattr(self.aviso_actualizacion, "estado", None) == "actual":
+            self._mostrar_actualizacion("reposo", version=VERSION)
 
     def cancelar_actualizacion(self):
         if self.aviso_actualizacion.estado == "descargando":
@@ -495,7 +519,8 @@ class App:
             width=272, bgcolor=p.barra, padding=ft.Padding.only(left=14, right=14, top=22, bottom=14),
             border=ft.Border.only(right=ft.BorderSide(1, p.separador)),
             content=ft.Column([
-                ft.Column([ui.titulo("Contabilidad", p, 22), ui.leyenda("Gestoría · a medida", p)], spacing=2),
+                ft.Column([ui.titulo("Contabilidad", p, 22), ui.leyenda("Gestoría · a medida", p),
+                           ft.Container(self.aviso_actualizacion, margin=ft.Margin.only(top=4))], spacing=2),
                 ft.Container(height=6),
                 ft.Row([ft.Container(self.selector_cartera, expand=True)]),
                 self.buscar,
@@ -505,12 +530,20 @@ class App:
                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
                 self.lista_clientes,
                 ui.separador(p),
-                ui.fila(I.FOLDER_OUTLINED, p.texto2, "Carpeta de clientes", None, p,
-                        on_click=self.elegir_carpeta_clientes),
-                self.lbl_carpeta,
+                self._fila_carpeta(),
                 ui.fila(I.TUNE, p.texto2, "Ajustes e IA", None, p, on_click=self.dialogo_ajustes),
             ], spacing=6, expand=True),
         )
+
+    def _fila_carpeta(self) -> ft.Control:
+        """«Carpeta de clientes» con el nombre de la carpeta como subtítulo y la ruta completa en el tooltip."""
+        p = self.p
+        fila = ui.fila(I.FOLDER_OUTLINED, p.texto2, "Carpeta de clientes", self.lbl_carpeta.value or "—", p,
+                       on_click=self.elegir_carpeta_clientes)
+        detalle = fila.content.controls[1].controls[1]
+        detalle.max_lines, detalle.overflow, detalle.tooltip = 1, ft.TextOverflow.ELLIPSIS, self.lbl_carpeta.tooltip
+        self.lbl_carpeta = detalle
+        return fila
 
     async def _on_buscar(self, e) -> None:
         self.filtro = (e.control.value or "").strip().casefold()
@@ -557,24 +590,15 @@ class App:
         siguiente = len(clientes) > 50
         clientes = clientes[:50]
         filas = []
+        self._filas_cli = {}
         for c in clientes:
             activo = c["id"] == self.cid
-            fila_c = ft.Container(
-                content=ft.Row([
-                    ui.avatar(c["nombre"], c["apellidos"], p, activo),
-                    ft.Column([
-                        ft.Text(f"{c['nombre']} {c['apellidos']}", size=14, weight=ft.FontWeight.W_600,
-                                color="#FFFFFF" if activo else p.texto, max_lines=1,
-                                overflow=ft.TextOverflow.ELLIPSIS),
-                        ft.Text(c["nif"], size=11, color="#D9FFFFFF" if activo else p.texto2),
-                    ], spacing=0, expand=True, tight=True),
-                ], spacing=10),
-                border_radius=12, padding=ft.Padding.symmetric(horizontal=8, vertical=7),
-            )
-            fondo = p.relleno if activo else "#00000000"
-            filas.append(ui.pulsable(fila_c, lambda e, cid=c["id"]: self.abrir_cliente(cid),
-                                     {"bgcolor": fondo}, {"bgcolor": p.relleno if activo else p.hover},
+            fila_c = ft.Container(content=self._contenido_fila(c, activo), border_radius=12,
+                                  padding=ft.Padding.symmetric(horizontal=8, vertical=7))
+            reposo, encima = {"bgcolor": p.relleno if activo else "#00000000"}, {"bgcolor": p.relleno if activo else p.hover}
+            filas.append(ui.pulsable(fila_c, lambda e, cid=c["id"]: self.abrir_cliente(cid), reposo, encima,
                                      escala=0.98))
+            self._filas_cli[c["id"]] = (fila_c, reposo, encima, c)
         if not filas:
             vacia = f"Sin {ETIQUETA[self.cartera].lower()}. Pulsa + para crear el primero."
             filas.append(ui.leyenda(vacia if not self.filtro else "Ningún cliente coincide.", p, p.texto3))
@@ -589,6 +613,34 @@ class App:
         self.lista_clientes.controls = filas
         self._refrescar_contadores()
 
+    def _contenido_fila(self, c: dict, activo: bool) -> ft.Row:
+        p = self.p
+        return ft.Row([
+            ui.avatar(c["nombre"], c["apellidos"], p, activo),
+            ft.Column([
+                ft.Text(f"{c['nombre']} {c['apellidos']}", size=14, weight=ft.FontWeight.W_600,
+                        color="#FFFFFF" if activo else p.texto, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                ft.Text(c["nif"], size=11, color="#FFFFFF" if activo else p.texto2),
+            ], spacing=0, expand=True, tight=True),
+        ], spacing=10)
+
+    def _marcar_cliente(self, anterior: Optional[int], cid: int) -> None:
+        """Cambia la selección en su sitio: solo se repintan dos filas y el fondo pasa con la transición de
+        140 ms de ``ui.pulsable``. Si el cliente no está en la página visible, se rehace la lista."""
+        filas = getattr(self, "_filas_cli", {})
+        if cid not in filas:
+            self._refrescar_clientes()
+            return
+        p = self.p
+        for ident, activo in ((anterior, False), (cid, True)):
+            if ident is None or ident not in filas:
+                continue
+            cont, reposo, encima, datos = filas[ident]
+            reposo["bgcolor"] = p.relleno if activo else "#00000000"
+            encima["bgcolor"] = p.relleno if activo else p.hover
+            cont.bgcolor = reposo["bgcolor"]
+            cont.content = self._contenido_fila(datos, activo)
+
     # ================================================================== zona principal
     def abrir_cliente(self, cid: int) -> None:
         if self.ocupada():
@@ -601,8 +653,8 @@ class App:
                 self.acciones_documentales.descartar()
         if anterior and nuevo and cartera_de(anterior.get("tipo_cliente")) != cartera_de(nuevo.get("tipo_cliente")):
             self.seccion = 0  # las pestañas de cada cartera son distintas
-        self.cid = cid
-        self._refrescar_clientes()
+        anterior_cid, self.cid = self.cid, cid
+        self._marcar_cliente(anterior_cid, cid)
         self.informe = None
         self._pintar_principal()
         self.en_segundo_plano("Cargando expediente…", lambda ej=self.ejercicio: self.ctrl.abrir_cliente(cid, ej))
@@ -645,14 +697,17 @@ class App:
             chips.append(ui.pastilla(texto, color, p.rojo_suave if res.asumida else p.campo))
         anios = [str(a) for a in range(date.today().year - 4, date.today().year + 1)]
         selector_anio = ui.desplegable("Ejercicio", [(a, a) for a in reversed(anios)], p, str(self.ejercicio),
-                                       on_select=self._cambiar_ejercicio, width=130)
+                                       on_select=self._cambiar_ejercicio, width=110)
+        selector_anio.label = None
         acciones = ft.Row([
-            ui.boton_icono(I.TABLE_VIEW_OUTLINED, self._abrir_excel, p, "Abrir Excel del cliente"),
-            ui.boton_icono(I.FOLDER_OPEN_OUTLINED, self._abrir_carpeta, p, "Abrir carpeta del cliente"),
-            ui.boton_icono(I.SYNC, self.sincronizar, p, "Sincronizar Excel y recalcular"),
-            ui.boton_icono(I.EDIT_OUTLINED, self.dialogo_editar_cliente, p, "Editar datos del cliente"),
-            ui.boton_icono(I.PERSON_REMOVE_OUTLINED, self.confirmar_eliminar_cliente, p, "Eliminar cliente", p.rojo),
-            selector_anio,
+            ui.boton_icono(I.TABLE_VIEW_OUTLINED, self._abrir_excel, p, "Abrir Excel del cliente", p.texto2),
+            ui.boton_icono(I.FOLDER_OPEN_OUTLINED, self._abrir_carpeta, p, "Abrir carpeta del cliente", p.texto2),
+            ui.boton_icono(I.SYNC, self.sincronizar, p, "Sincronizar Excel y recalcular", p.texto2),
+            ui.boton_icono(I.EDIT_OUTLINED, self.dialogo_editar_cliente, p, "Editar datos del cliente", p.texto2),
+            ui.boton_icono(I.PERSON_REMOVE_OUTLINED, self.confirmar_eliminar_cliente, p, "Eliminar cliente",
+                           p.texto2, peligro=True),
+            ft.Container(width=4),
+            ft.Container(selector_anio, tooltip="Ejercicio fiscal"),
         ], spacing=4)
         return ft.Container(
             padding=ft.Padding.only(left=28, right=28, top=24, bottom=16),
@@ -681,20 +736,20 @@ class App:
         punto = ft.Container(width=8, height=8, border_radius=4, bgcolor=p.verde if ia_ok else p.naranja)
         zona = ft.Container(
             content=ft.Row([
-                ft.Container(ft.Icon(I.UPLOAD_FILE, size=26, color=p.acento), width=52, height=52, border_radius=12,
+                ft.Container(ft.Icon(I.UPLOAD_FILE, size=22, color=p.acento), width=40, height=40, border_radius=10,
                              bgcolor=p.acento_suave, alignment=ft.Alignment.CENTER),
                 ft.Column([
                     ui.cuerpo("Añade facturas, el 036/037 o modelos presentados en PDF"
                               if self._es_residente() else "Añade escrituras, IBI, contratos o modelos en PDF",
                               p, peso=ft.FontWeight.W_600),
-                    ui.leyenda("Haz clic para elegirlos o arrástralos a la carpeta _ARRASTRA_AQUI del cliente. "
-                               "Se leen, se archivan y el Excel se actualiza solo.", p),
                     ft.Row([punto, ui.leyenda(ia_texto, p)], spacing=6),
-                ], spacing=3, expand=True, tight=True),
+                ], spacing=2, expand=True, tight=True),
                 ui.boton("Elegir PDFs", self.elegir_pdfs, p, I.ADD),
                 ui.boton("Abrir bandeja", self._abrir_bandeja, p, I.INBOX_OUTLINED, tipo="secundario"),
-            ], spacing=16, vertical_alignment=ft.CrossAxisAlignment.CENTER),
-            padding=18, border_radius=18,
+            ], spacing=14, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            padding=ft.Padding.symmetric(horizontal=14, vertical=10), border_radius=14,
+            tooltip="Haz clic para elegirlos o arrástralos a la carpeta _ARRASTRA_AQUI del cliente. "
+                    "Se leen, se archivan y el Excel se actualiza solo.",
         )
         return ui.pulsable(zona, self.elegir_pdfs,
                            {"bgcolor": p.tarjeta, "border": ft.Border.all(1, p.separador)},
@@ -722,10 +777,14 @@ class App:
         n_pend = len([x for x in (self.informe.pendientes if self.informe else []) if x.nivel != "info"])
         etiquetas_seg = []
         for n in nombres:
-            texto = f"{n} · {n_pend}" if n == "Pendientes" and n_pend else n
-            etiquetas_seg.append(ft.Container(ft.Text(texto, size=13, weight=ft.FontWeight.W_600,
-                                                      color=p.rojo if (n == "Pendientes" and n_pend) else p.texto),
-                                              padding=ft.Padding.symmetric(horizontal=8, vertical=4)))
+            etiqueta: ft.Control = ft.Text(n, size=13, weight=ft.FontWeight.W_600, color=p.texto, no_wrap=True)
+            if n == "Pendientes" and n_pend:
+                cifra = ft.Container(ft.Text(str(n_pend), size=11, weight=ft.FontWeight.W_700, color=p.rojo),
+                                     bgcolor=p.rojo_suave, border_radius=ui.PILDORA,
+                                     padding=ft.Padding.symmetric(horizontal=6, vertical=0))
+                etiqueta = ft.Row([etiqueta, cifra], spacing=6, tight=True,
+                                  vertical_alignment=ft.CrossAxisAlignment.CENTER)
+            etiquetas_seg.append(ft.Container(etiqueta, padding=ft.Padding.symmetric(horizontal=8, vertical=4)))
         self.seccion = min(self.seccion, len(nombres) - 1)
         return ft.CupertinoSlidingSegmentedButton(
             controls=etiquetas_seg, selected_index=self.seccion, bgcolor=p.campo, thumb_color=p.segmento,

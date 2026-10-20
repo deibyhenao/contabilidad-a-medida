@@ -1,5 +1,5 @@
 """Una única versión para la app, el instalador y GitHub Releases."""
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 APP_NAME = "Contabilidad a Medida"
 EXE_NAME = "ContabilidadAMedida.exe"
 APP_ID = "{86CC85BC-5473-497D-8D93-70C73F05D41F}"

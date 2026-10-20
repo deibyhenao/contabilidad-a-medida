@@ -110,9 +110,18 @@ def test_banner_claro_oscuro_y_estados():
         for estado in ESTADOS:
             aviso.mostrar(estado,version='1.0.1',progreso=.42)
             assert aviso.estado==estado and aviso._titulo.value
-            assert aviso.bgcolor==p.tarjeta
+            # Compacto (reposo, comprobando, al día): sin superficie propia sobre la barra lateral.
+            # Expandido: tarjeta opaca de 244 px.
+            if estado in ('reposo','comprobando','actual'):
+                assert aviso.compacto and aviso.bgcolor is None and aviso.width is None
+            else:
+                assert not aviso.compacto and aviso.bgcolor==p.tarjeta and aviso.width==244
     aviso.mostrar('descargando',progreso=.42)
     assert '42' in aviso._detalle.value and aviso._barra.value==.42
+    aviso.mostrar('reposo',version='1.0.0')
+    assert aviso._titulo.value=='Versión 1.0.0'
+    aviso.mostrar('actual',version='1.0.0')
+    assert aviso._titulo.value=='Al día · 1.0.0'
 
 
 def test_fallo_no_muestra_datos_internos():
