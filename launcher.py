@@ -11,7 +11,10 @@ import traceback
 def diagnostico(salida: Path) -> None:
     # No usa el almacén real, incluso al probar un ejecutable recién construido.
     with tempfile.TemporaryDirectory(prefix="CAM-paquete-") as temporal:
-        raiz = Path(temporal)
+        # Los runners Windows pueden redirigir TEMP mediante un junction.
+        # Usamos el destino real de nuestro temporal, sin relajar la validación
+        # de las carpetas de datos elegidas por el usuario.
+        raiz = Path(temporal).resolve()
         os.environ["LOCALAPPDATA"] = str(raiz / "local")
         datos = raiz / "Datos ficticios"
         datos.mkdir()
