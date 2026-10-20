@@ -1,0 +1,38 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+Clientes/
+~$*.xlsx
+contabilidad.db
+*.db-journal
+*.db-wal
+*.db-shm
+# Carteras de clientes (datos reales) y copias de la BD
+Clientes_No_Residentes/
+Clientes_Residentes/
+backups/
+# Vídeo de demostración: material pesado regenerable
+video/demo/entorno/
+video/demo/entorno_base/
+video/demo/capturas/
+video/demo/capturas_windows/
+video/demo/grabaciones/
+video/demo/para_arrastrar/
+video/contabilidad-keynote/assets/
+video/contabilidad-keynote/renders/
+video/contabilidad-keynote/.hyperframes/
+
+# Configuración local de secretos (la app usa entorno o keyring)
+.env
+.env.*
+!.env.example
+
+# Artefactos y herramientas de empaquetado
+build/
+dist/
+release/
+.venv-build/
+work/
+*.pfx
+*.p12
