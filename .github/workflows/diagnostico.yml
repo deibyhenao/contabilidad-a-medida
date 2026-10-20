@@ -1,0 +1,29 @@
+name: Diagnóstico del instalador · sin publicar
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostico:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: pip
+      - run: python -m pip install -r requirements.txt -r requirements-build.txt
+      - name: Compilar y diagnosticar sin publicar una release
+        run: python scripts/build_release.py --solo-ejecutable
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diagnostico-paquete
+          path: build/diagnostico-paquete.json
+          if-no-files-found: warn

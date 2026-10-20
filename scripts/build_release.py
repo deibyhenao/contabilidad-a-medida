@@ -38,9 +38,17 @@ def main():
         raise RuntimeError('Contenido ajeno al programa en el paquete: '+repr(prohibidos))
     salida = ROOT/'build/diagnostico-paquete.json'
     salida.unlink(missing_ok=True)
-    ejecutar([dist/'ContabilidadAMedida.exe', '--diagnostico-paquete', salida])
-    if not json.loads(salida.read_text(encoding='utf-8')).get('ok'):
-        raise RuntimeError('El diagnóstico del ejecutable falló: '+salida.read_text(encoding='utf-8'))
+    try:
+        diagnostico = subprocess.run(
+            [str(dist/'ContabilidadAMedida.exe'), '--diagnostico-paquete', str(salida)],
+            cwd=ROOT, timeout=180, check=False)
+    except subprocess.TimeoutExpired as exc:
+        detalle = salida.read_text(encoding='utf-8') if salida.exists() else 'No se generó el informe JSON.'
+        raise RuntimeError('El diagnóstico no terminó en 180 segundos: '+detalle) from exc
+    detalle = salida.read_text(encoding='utf-8') if salida.exists() else 'No se generó el informe JSON.'
+    print('Diagnóstico del ejecutable: '+detalle, flush=True)
+    if diagnostico.returncode != 0 or not salida.exists() or not json.loads(detalle).get('ok'):
+        raise RuntimeError('El diagnóstico del ejecutable falló: '+detalle)
     if args.solo_ejecutable:
         return
     ejecutar([args.iscc, '/DAppVersion='+VERSION, '/DProjectRoot='+str(ROOT), ROOT/'packaging/instalador.iss'])

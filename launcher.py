@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import traceback
 
 
 def diagnostico(salida: Path) -> None:
@@ -48,8 +49,13 @@ if __name__ == "__main__":
         try:
             diagnostico(Path(sys.argv[2]))
         except Exception as exc:
-            Path(sys.argv[2]).write_text(json.dumps({"ok":False,"error":repr(exc)}),encoding="utf-8")
-            raise
+            try:
+                Path(sys.argv[2]).write_text(json.dumps({"ok":False,"error":repr(exc),
+                    "traceback":traceback.format_exc()}),encoding="utf-8")
+            finally:
+                # Un traceback sin capturar en el bootloader windowless abre
+                # un diálogo modal y deja esperando al runner sin supervisión.
+                sys.exit(1)
     else:
         if getattr(sys, 'frozen', False):
             os.environ['FLET_VIEW_PATH'] = str(Path(__file__).resolve().parent/'desktop/flet')
