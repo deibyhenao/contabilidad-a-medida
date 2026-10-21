@@ -107,5 +107,31 @@ def test_excel_no_activa_vinculos_fuera_del_expediente(tmp_path, valor):
         eg._link(celda, valor, tmp_path)
         assert celda.hyperlink is None
         assert celda.data_type == "s"
+        assert celda.value == valor
+    finally:
+        libro.close()
+
+
+def test_backup_excel_ruta_larga_conserva_libro_y_diez_copias(tmp_path):
+    # Un destino que cabe en Windows puede dejar de caber al añadir el sello.
+    cliente = tmp_path
+    while len(str(cliente)) < 190:
+        cliente = cliente / ("directorio_" + "x" * min(24, 190-len(str(cliente))))
+    cliente.mkdir(parents=True)
+    destino = cliente / "EXPEDIENTE_CON_NOMBRE_LARGO_DE_CLIENTE.xlsx"
+    libro = openpyxl.Workbook()
+    try:
+        libro.active['B1'] = 12345.67
+        for n in range(12):
+            libro.active['A1'] = n
+            eg._guardar_atomico(libro, destino, cliente)
+        copias = list((cliente/'_backups').glob('*.xlsx'))
+        assert len(copias) == 10
+        assert all(p.name.startswith('CAM_') for p in copias)
+        assert all(len(str(p)) < 260 for p in copias)
+        with destino.open('rb') as archivo:
+            guardado = openpyxl.load_workbook(archivo)
+            assert guardado.active['B1'].value == 12345.67
+            guardado.close()
     finally:
         libro.close()

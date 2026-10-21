@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import json
+import hashlib
 import shutil
 import tempfile
 import re
@@ -119,6 +120,8 @@ def _link(cell, valor, carpeta_cliente: Path | None = None) -> None:
             permitido = False
     cell.hyperlink = relativo if permitido else None
     if not permitido:
+        cell.value = str(valor)  # conserva el dato manual, sin convertirlo en vínculo
+        cell.data_type = 's'
         return
     fuente = copy(cell.font)
     fuente.color = "0000FF"
@@ -164,9 +167,15 @@ def _guardar_atomico(wb, destino: Path, carpeta_cliente: Path) -> None:
                 backups = sanitize_safe_path(carpeta_cliente, "_backups")
                 backups.mkdir(parents=True, exist_ok=True)
                 sello = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                copia = sanitize_safe_path(backups, backups / f"{destino.stem}_{sello}.xlsx")
+                corto = "CAM_" + hashlib.sha256(destino.name.encode("utf-8")).hexdigest()[:12]
+                nombre = f"{destino.stem}_{sello}.xlsx"
+                if len(str(backups / nombre)) > 247:
+                    # La ruta del cliente puede ser larga aunque el Excel quepa.
+                    # Evita superar MAX_PATH únicamente al añadir el sello de copia.
+                    nombre = f"{corto}_{sello}.xlsx"
+                copia = sanitize_safe_path(backups, backups / nombre)
                 shutil.copy2(destino, copia)
-                patron = re.compile(re.escape(destino.stem) + r"_\d{8}_\d{6}_\d{6}\.xlsx")
+                patron = re.compile("(?:" + re.escape(destino.stem) + "|" + corto + r")_\d{8}_\d{6}_\d{6}\.xlsx")
                 copias = []
                 for candidata in backups.glob("*.xlsx"):
                     if not patron.fullmatch(candidata.name):
