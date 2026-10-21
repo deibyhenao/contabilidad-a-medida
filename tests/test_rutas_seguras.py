@@ -135,3 +135,26 @@ def test_backup_excel_ruta_larga_conserva_libro_y_diez_copias(tmp_path):
             guardado.close()
     finally:
         libro.close()
+
+
+def test_excel_bloqueado_en_ruta_larga_conserva_copia_pendiente(tmp_path, monkeypatch):
+    cliente = tmp_path
+    while len(str(cliente)) < 190:
+        cliente = cliente / ("directorio_" + "x" * min(24, 190-len(str(cliente))))
+    cliente.mkdir(parents=True)
+    destino = cliente / "EXPEDIENTE_CON_NOMBRE_LARGO_DE_CLIENTE.xlsx"
+    destino.write_bytes(b'original abierto en Excel')
+    libro = openpyxl.Workbook()
+    libro.active['A1'] = 'Corrección manual'
+    def bloqueado(*args):
+        raise PermissionError('Excel abierto')
+    monkeypatch.setattr(eg.os, 'replace', bloqueado)
+    try:
+        with pytest.raises(eg.ExcelBloqueadoError) as error:
+            eg._guardar_atomico(libro, destino, cliente)
+        pendientes = list(cliente.glob('PENDIENTE_*.xlsx'))
+        assert len(pendientes) == 1 and len(str(pendientes[0])) < 260
+        assert destino.read_bytes() == b'original abierto en Excel'
+        assert pendientes[0].read_bytes().startswith(b'PK')
+    finally:
+        libro.close()

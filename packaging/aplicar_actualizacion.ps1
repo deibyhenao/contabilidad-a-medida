@@ -81,10 +81,10 @@ try {
     $rollbackDir = Join-Path $cacheDir ('rollback-' + [Guid]::NewGuid().ToString('N'))
     $null = New-Item -ItemType Directory -Path $rollbackDir
     $archivos | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $rollbackDir 'manifest.json') -Encoding UTF8
-    foreach ($relativa in $archivos) {
-        $destino = Join-Path (Join-Path $rollbackDir 'archivos') $relativa
-        $null = [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destino))
-        [IO.File]::Copy((Join-Path $InstallDir $relativa), $destino, $false)
+    for ($indice = 0; $indice -lt $archivos.Count; $indice++) {
+        # Respaldo plano: duplicar el árbol puede superar MAX_PATH en Windows.
+        $destino = Join-Path $rollbackDir ('archivo-' + $indice.ToString('D6') + '.bak')
+        [IO.File]::Copy((Join-Path $InstallDir $archivos[$indice]), $destino, $false)
     }
     # Argumentos del ejecutable; nunca se evalúan como código de PowerShell.
     if ($InstallDir.Contains('"') -or $Installer.Contains('"')) { throw 'Ruta inválida.' }
@@ -107,7 +107,7 @@ try {
     }
     Start-Process -FilePath $exe -WorkingDirectory $InstallDir -WindowStyle Hidden | Out-Null
 } catch {
-    'No se pudo completar la actualización.' | Out-File -LiteralPath $logFile -Encoding utf8 -Append
+    ('No se pudo completar la actualización. Tipo: ' + $_.Exception.GetType().Name) | Out-File -LiteralPath $logFile -Encoding utf8 -Append
     if ($instaladorIniciado) {
         try {
             # El programa sigue cerrado. Retira solo adiciones del árbol de código;
@@ -121,11 +121,12 @@ try {
                     Remove-Item -LiteralPath $adicion -Force
                 }
             }
-            foreach ($relativa in $archivos) {
+            for ($indice = 0; $indice -lt $archivos.Count; $indice++) {
+                $relativa = $archivos[$indice]
                 $destino = Join-Path $InstallDir $relativa
                 ComprobarRuta $destino
                 $null = [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($destino))
-                [IO.File]::Copy((Join-Path (Join-Path $rollbackDir 'archivos') $relativa), $destino, $true)
+                [IO.File]::Copy((Join-Path $rollbackDir ('archivo-' + $indice.ToString('D6') + '.bak')), $destino, $true)
             }
             'Se restauraron los archivos de la versión anterior.' | Out-File -LiteralPath $logFile -Encoding utf8 -Append
             Start-Process -FilePath (Join-Path $InstallDir 'ContabilidadAMedida.exe') -WorkingDirectory $InstallDir -WindowStyle Hidden | Out-Null
@@ -146,24 +147,13 @@ try {
 } finally {
     if ($rollbackDir -and -not $conservarRespaldo) {
         # Borrado individual de nuestras copias; sin borrado recursivo de rutas calculadas.
-        foreach ($relativa in $archivos) {
-            $copia = Join-Path (Join-Path $rollbackDir 'archivos') $relativa
+        for ($indice = 0; $indice -lt $archivos.Count; $indice++) {
+            $copia = Join-Path $rollbackDir ('archivo-' + $indice.ToString('D6') + '.bak')
             ComprobarRuta $copia
             Remove-Item -LiteralPath $copia -Force -ErrorAction SilentlyContinue
         }
         Remove-Item -LiteralPath (Join-Path $rollbackDir 'manifest.json') -Force -ErrorAction SilentlyContinue
-        # Solo directorios vacíos, de abajo arriba, dentro del respaldo exclusivo.
-        $directorios = New-Object 'Collections.Generic.HashSet[string]'
-        foreach ($relativa in $archivos) {
-            $padre = [IO.Path]::GetDirectoryName((Join-Path (Join-Path $rollbackDir 'archivos') $relativa))
-            while ($padre -and $padre.StartsWith($rollbackDir + '\', [StringComparison]::OrdinalIgnoreCase)) {
-                $null = $directorios.Add($padre)
-                $padre = [IO.Path]::GetDirectoryName($padre)
-            }
-        }
-        foreach ($directorio in ($directorios | Sort-Object Length -Descending)) {
-            try { [IO.Directory]::Delete($directorio, $false) } catch { }
-        }
+        # Solo se retira el directorio exclusivo si quedó vacío.
         try { [IO.Directory]::Delete($rollbackDir, $false) } catch { }
     }
     # Rutas absolutas verificadas arriba; sin recursión ni comodines.

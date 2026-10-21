@@ -193,6 +193,10 @@ def _guardar_atomico(wb, destino: Path, carpeta_cliente: Path) -> None:
         except PermissionError as exc:
             sello = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             pendiente = destino.with_name(f"{destino.stem}_PENDIENTE_{sello}.xlsx")
+            if len(str(pendiente)) > 247:
+                descriptor, nombre = tempfile.mkstemp(prefix="PENDIENTE_", suffix=".xlsx", dir=destino.parent)
+                os.close(descriptor)
+                pendiente = Path(nombre)
             shutil.copyfile(temporal, pendiente)
             raise ExcelBloqueadoError(pendiente) from exc
     finally:
