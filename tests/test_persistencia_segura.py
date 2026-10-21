@@ -165,3 +165,55 @@ def test_migracion_no_toca_bd_si_carpeta_backup_esta_bloqueada(tmp_path):
     with pytest.raises(OSError):
         Database(ruta)
     assert ruta.read_bytes() == antes
+
+
+def test_repara_indices_actuales_con_copia_previa_sin_repetir_migracion(tmp_path, monkeypatch):
+    ruta = tmp_path / "indices.db"
+    with Database(ruta) as db:
+        db.set_config("manual", "conservar")
+        esperados = set(database._indices_esquema())
+        for nombre in esperados:
+            db.con.execute(f'DROP INDEX "{nombre}"')
+        db.con.commit()
+    eventos = []
+    snapshot_real = database.crear_snapshot
+
+    def snapshot_antes(ruta):
+        with sqlite3.connect(ruta) as con:
+            presentes = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+            assert not presentes & esperados
+        eventos.append("backup")
+        return snapshot_real(ruta)
+
+    def no_migrar(_self):
+        pytest.fail("La reparación de índices no debe repetir el esquema")
+
+    monkeypatch.setattr(database, "crear_snapshot", snapshot_antes)
+    monkeypatch.setattr(Database, "_crear_esquema", no_migrar)
+    for _ in range(2):
+        with Database(ruta) as db:
+            presentes = {r[0] for r in db.con.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+            assert esperados <= presentes
+            assert db.get_config("manual") == "conservar"
+            assert db.con.execute("PRAGMA user_version").fetchone()[0] == VERSION_ESQUEMA
+    assert eventos == ["backup"]
+    assert len(list((tmp_path / "Backups_Seguridad").glob("*.db"))) == 1
+
+
+def test_reparacion_indices_fallo_backup_no_ejecuta_ddl(tmp_path, monkeypatch):
+    ruta = tmp_path / "indices.db"
+    with Database(ruta) as db:
+        db.set_config("manual", "conservar")
+        db.con.execute("DROP INDEX ix_clientes_orden")
+        db.con.commit()
+
+    def sin_copia(_ruta):
+        raise OSError("Sin espacio para respaldo")
+
+    monkeypatch.setattr(database, "crear_snapshot", sin_copia)
+    with pytest.raises(OSError, match="respaldo"):
+        Database(ruta)
+    with sqlite3.connect(ruta) as con:
+        assert not con.execute("SELECT 1 FROM sqlite_master WHERE name='ix_clientes_orden'").fetchall()
+        assert con.execute("SELECT valor FROM config WHERE clave='manual'").fetchone()[0] == "conservar"
+        assert con.execute("PRAGMA user_version").fetchone()[0] == VERSION_ESQUEMA

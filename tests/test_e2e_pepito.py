@@ -294,7 +294,7 @@ def test_e2e_pepito_flujo_completo(tmp_path):
 
 
 def test_controlador_metodos_auxiliares_y_excel_bloqueado(tmp_path, monkeypatch):
-    ctrl = Controlador(tmp_path / "aux.db")
+    ctrl = Controlador(tmp_path / "auxiliar.db")
     ctrl.cambiar_carpeta_clientes(tmp_path / "Clientes")
     try:
         c = ctrl.crear_cliente("María", "Gómez", "Y9999999Z", pais="Alemania", ejercicio=2026)

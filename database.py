@@ -427,6 +427,42 @@ def _normalizar(col: Columna, valor: Any) -> Any:
     return str(valor).strip() if isinstance(valor, str) else valor
 
 
+def _indices_esquema() -> dict[str, str]:
+    """Catálogo común de índices propios; identificadores de metadatos internos."""
+    especificaciones = [
+        ("ix_clientes_orden", "clientes", "apellidos,nombre,id"),
+        ("ix_clientes_cartera_orden", "clientes", "cartera,apellidos,nombre,id"),
+        ("ix_clientes_tipo", "clientes", "tipo_cliente"),
+        ("ix_inmuebles_override", "inmuebles", "cliente_id,manual_override,codigo"),
+        ("ix_documentos_cambios_campo", "documentos_cambios", "cliente_id,tabla,codigo,campo,id"),
+        ("ix_documentos_cambios_fuente", "documentos_cambios", "cliente_id,documento,id"),
+    ]
+    indices = {}
+    for t in TABLAS.values():
+        nombre = f"ux_{t.nombre}_clave"
+        indices[nombre] = (f"CREATE UNIQUE INDEX IF NOT EXISTS {nombre} "
+                           f"ON {t.nombre}(cliente_id,clave) WHERE clave IS NOT NULL")
+        campos = {c.campo for c in t.columnas_bd}
+        grupos = []
+        if "ejercicio" in campos:
+            grupos.append(("ejercicio", "codigo"))
+        if "inmueble" in campos:
+            grupos.append(("inmueble", "ejercicio", "codigo") if "ejercicio" in campos
+                          else ("inmueble", "codigo"))
+        if "contrato" in campos:
+            grupos.append(("contrato", "codigo"))
+        if "ref_catastral" in campos:
+            grupos.append(("ref_catastral",))
+        if t.nombre == "documentos":
+            grupos.append(("sha256",))
+        for columnas in grupos:
+            nombre = f"ix_{t.nombre}_{'_'.join(columnas)}"
+            especificaciones.append((nombre, t.nombre, f"cliente_id,{','.join(columnas)}"))
+    for nombre, tabla, columnas in especificaciones:
+        indices[nombre] = f"CREATE INDEX IF NOT EXISTS {nombre} ON {tabla}({columnas})"
+    return indices
+
+
 # --------------------------------------------------------------------------------------------- motor
 class Database:
     def __init__(self, db_path: Path | str = DB_PATH_DEFECTO, multihilo: bool = False,
@@ -472,6 +508,8 @@ class Database:
                         if version < VERSION_ESQUEMA:
                             self._crear_esquema()
                             self.con.execute(f"PRAGMA user_version = {VERSION_ESQUEMA}")
+                else:
+                    self._reparar_indices()
         except BaseException:
             self.con.close()
             raise
@@ -518,6 +556,20 @@ class Database:
         self.cerrar()
 
     # ------------------------------------------------------------------ esquema
+    def _reparar_indices(self) -> None:
+        """Recupera índices ausentes sin repetir migraciones ni tocar registros."""
+        esperados = _indices_esquema()
+        presentes = {r[0] for r in self.con.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+        faltantes = esperados.keys() - presentes
+        if not faltantes:
+            return
+        crear_snapshot(self.db_path)
+        with self.transaccion():
+            if self.con.execute("PRAGMA user_version").fetchone()[0] != VERSION_ESQUEMA:
+                raise RuntimeError("La versión de la base de datos cambió durante la reparación.")
+            for nombre in sorted(faltantes):
+                self.con.execute(esperados[nombre])
+
     def _crear_esquema(self) -> None:
         cur = self.con.cursor()
         cur.execute("CREATE TABLE IF NOT EXISTS config (clave TEXT PRIMARY KEY, valor TEXT)")
@@ -544,10 +596,6 @@ class Database:
                     {", ".join(cols)},
                     UNIQUE(cliente_id, codigo))"""
             )
-            cur.execute(
-                f"CREATE UNIQUE INDEX IF NOT EXISTS ux_{t.nombre}_clave ON {t.nombre}(cliente_id, clave) "
-                "WHERE clave IS NOT NULL"
-            )
             # Migración suave: columnas añadidas en versiones posteriores
             existentes = {r["name"] for r in cur.execute(f"PRAGMA table_info({t.nombre})")}
             for c in t.columnas_bd:
@@ -565,30 +613,9 @@ class Database:
         crear_esquema(self)
         self._confirmar()
 
-        # Los UNIQUE existentes ya indexan nif y (cliente_id, codigo): no duplicarlos.
-        cur.execute("CREATE INDEX IF NOT EXISTS ix_clientes_orden ON clientes(apellidos,nombre,id)")
-        # Cartera + orden: listar 600 clientes de una cartera sin tabla temporal de ordenación
-        cur.execute("CREATE INDEX IF NOT EXISTS ix_clientes_cartera_orden ON clientes(cartera,apellidos,nombre,id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS ix_clientes_tipo ON clientes(tipo_cliente)")
-        cur.execute("CREATE INDEX IF NOT EXISTS ix_inmuebles_override ON inmuebles(cliente_id,manual_override,codigo)")
-        for t in TABLAS.values():
-            campos = {c.campo for c in t.columnas_bd}
-            grupos = []
-            if "ejercicio" in campos:
-                grupos.append(("ejercicio", "codigo"))
-            if "inmueble" in campos:
-                grupos.append(("inmueble", "ejercicio", "codigo") if "ejercicio" in campos
-                              else ("inmueble", "codigo"))
-            if "contrato" in campos:
-                grupos.append(("contrato", "codigo"))
-            if "ref_catastral" in campos:
-                grupos.append(("ref_catastral",))
-            if t.nombre == "documentos":
-                grupos.append(("sha256",))
-            for columnas in grupos:
-                nombre = f"ix_{t.nombre}_{'_'.join(columnas)}"
-                cur.execute(f"CREATE INDEX IF NOT EXISTS {nombre} ON {t.nombre}"
-                            f"(cliente_id,{','.join(columnas)})")
+        # Los UNIQUE de tablas ya indexan nif y (cliente_id,codigo).
+        for sql in _indices_esquema().values():
+            cur.execute(sql)
         self._confirmar()
 
     # ------------------------------------------------------------------ config
