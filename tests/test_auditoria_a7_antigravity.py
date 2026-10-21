@@ -1,6 +1,7 @@
 """Suite de auditoría independiente A7 (Antigravity): 12 escenarios fiscales/funcionales y regresiones."""
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from types import SimpleNamespace
@@ -552,6 +553,7 @@ def test_ui_claro_oscuro_gastos_arrastres_clasificar_y_sin_fugas(expediente_ag, 
     ctrl.estado_ia = lambda: (False, "IA desactivada en test")
 
     page = MagicMock(spec=ft.Page)
+    page.run_task.side_effect = lambda callback: asyncio.run(callback())
     page.platform_brightness = ft.Brightness.DARK if oscuro else ft.Brightness.LIGHT
     page.services = []
     page.dialogs = []
@@ -593,3 +595,4 @@ def test_ui_claro_oscuro_gastos_arrastres_clasificar_y_sin_fugas(expediente_ag, 
     for prohibido in ("json_ia", "origen", "detalle_limite", "NO_MOSTRAR_JSON_IA", "HIDDEN_TOKEN", "cliente_id"):
         assert prohibido not in dlg_textos
     assert "detalle_limite" not in {c.campo for c in campos_editables("m210_alquiler")}
+
