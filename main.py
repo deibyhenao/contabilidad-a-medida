@@ -21,6 +21,7 @@ from typing import Any, Callable, Optional
 import flet as ft
 
 import ui_estilo as ui
+from concurrencia import ejecutar_en_ui
 from version import VERSION
 from app_paths import AlmacenNoDisponible
 from ui_actualizaciones import AvisoActualizacion
@@ -236,9 +237,11 @@ class App:
 
     # ================================================================== actualizaciones
     def _mostrar_actualizacion(self, estado, **kwargs):
-        if not self.cerrando:
-            self.aviso_actualizacion.mostrar(estado, **kwargs)
-            self.page.update()
+        def mostrar():
+            if not self.cerrando:
+                self.aviso_actualizacion.mostrar(estado, **kwargs)
+                self.page.update()
+        ejecutar_en_ui(self.page, mostrar)
 
     def comprobar_actualizacion(self, automatica=False):
         if self.cerrando or not self._update_lock.acquire(blocking=False):
@@ -292,7 +295,8 @@ class App:
             ruta_bd = self.ctrl.lector.db_path
             try:
                 self._mostrar_actualizacion("instalando", version=self._update_publicacion.version)
-                auxiliar = await asyncio.to_thread(updater.preparar_instalacion, self._update_ruta, self._update_publicacion)
+                auxiliar = await asyncio.to_thread(updater.preparar_instalacion, self._update_ruta, self._update_publicacion,
+                                                 db_path=self.ctrl.lector.db_path)
                 self.cerrando = True
                 self._update_cancel.set()
                 if self._evento_dialogo:
@@ -329,7 +333,7 @@ class App:
                     ultima[0] = ahora
                     self._mostrar_actualizacion("descargando", version=publicacion.version, progreso=valor)
             try:
-                ruta = updater.descargar(publicacion, progreso, self._update_cancel)
+                ruta = updater.descargar(publicacion, progreso, self._update_cancel, db_path=self.ctrl.lector.db_path)
                 self._update_ruta = ruta
                 self._mostrar_actualizacion("listo", version=publicacion.version)
             except updater.DescargaCancelada:
@@ -377,37 +381,53 @@ class App:
             return False
         cid, ej = self.cid, self.ejercicio
 
-        def tarea():
+        def terminar(res, error):
             try:
                 if self.cerrando:
                     return
-                self.set_ocupado(True, texto)
-                res = trabajo() or {}
-                if despues is not None:
-                    despues()  # solo si el trabajo terminó bien (p. ej. mostrar la cartera de destino)
-                if (self.cid, self.ejercicio) == (cid, ej):
-                    self._aplicar_resultado(res)
-                if res.get("avisos_documentales"):
-                    self.avisar(" ".join(res["avisos_documentales"]), error=True)
-                if res.get("error_excel"):
-                    self._dialogo_excel_bloqueado(res["error_excel"])
-                elif exito and not res.get("avisos_documentales"):
-                    self.avisar(exito)
-            except CanceladoPorUsuario:
-                self.avisar("Documento descartado.")
-            except excel_generator.ExcelConflictoImportacion as exc:
-                mensaje = ui.cuerpo(str(exc), self.p)
-                mensaje.selectable = True
-                entendido = ui.accion("Entendido", self.cerrar_dialogo, self.p, tipo="primario")
-                entendido.autofocus = True
-                self._dialogo("Revisar cambios del Excel", mensaje, [entendido], icono=I.INFO_OUTLINE)
-            except Exception as exc:  # mensaje para el usuario, nunca una traza
-                self.avisar(str(exc) or exc.__class__.__name__, error=True)
+                if error is None:
+                    if despues is not None:
+                        despues()
+                    if (self.cid, self.ejercicio) == (cid, ej):
+                        self._aplicar_resultado(res)
+                    if res.get("avisos_documentales"):
+                        self.avisar(" ".join(res["avisos_documentales"]), error=True)
+                    if res.get("error_excel"):
+                        self._dialogo_excel_bloqueado(res["error_excel"])
+                    elif exito and not res.get("avisos_documentales"):
+                        self.avisar(exito)
+                elif isinstance(error, CanceladoPorUsuario):
+                    self.avisar("Documento descartado.")
+                elif isinstance(error, excel_generator.ExcelConflictoImportacion):
+                    mensaje = ui.cuerpo(str(error), self.p)
+                    mensaje.selectable = True
+                    entendido = ui.accion("Entendido", self.cerrar_dialogo, self.p, tipo="primario")
+                    entendido.autofocus = True
+                    self._dialogo("Revisar cambios del Excel", mensaje, [entendido], icono=I.INFO_OUTLINE)
+                else:
+                    self.avisar(str(error) or error.__class__.__name__, error=True)
             finally:
                 self._turno.release()
                 if not self.cerrando:
                     self.set_ocupado(False)
                     self._pintar_principal()
+
+        def tarea():
+            res, error = {}, None
+            try:
+                if not self.cerrando:
+                    ejecutar_en_ui(self.page, lambda: self.set_ocupado(True, texto) if not self.cerrando else None)
+                    res = trabajo() or {}
+            except Exception as exc:
+                error = exc
+            try:
+                # Mantiene el turno hasta aplicar el resultado en el bucle de UI.
+                ejecutar_en_ui(self.page, lambda: terminar(res, error))
+            except Exception:
+                # La sesión pudo desaparecer antes de aceptar la notificación.
+                if self._turno.locked():
+                    self._turno.release()
+                raise
         try:
             self.page.run_thread(tarea)
         except Exception:
@@ -445,7 +465,7 @@ class App:
                              shape=ft.RoundedRectangleBorder(radius=18),
                              content=ft.Container(contenido, width=ancho), actions=acciones,
                              actions_alignment=ft.MainAxisAlignment.END)
-        self.page.show_dialog(dlg)
+        ejecutar_en_ui(self.page, lambda: self.page.show_dialog(dlg) if not self.cerrando else None)
         return dlg
 
     def cerrar_dialogo(self, _e=None) -> None:
@@ -550,7 +570,7 @@ class App:
         self._pagina_clientes = 0
         self._busqueda_version += 1
         version, filtro, cartera = self._busqueda_version, self.filtro, self.cartera
-        await asyncio.sleep(0.18)  # agrupa las pulsaciones; no consulta por cada tecla
+        await asyncio.sleep(0.30)  # agrupa las pulsaciones; no consulta por cada tecla
         if self.cerrando or version != self._busqueda_version:
             return
         self.lista_clientes.opacity = 0.55
@@ -578,6 +598,7 @@ class App:
         self.page.update()
 
     def _refrescar_clientes(self, clientes=None) -> None:
+        self.lista_clientes.opacity = 1  # una navegación invalida la búsqueda pendiente
         p = self.p
         pagina = getattr(self, "_pagina_clientes", 0)
         if clientes is None:
@@ -2424,21 +2445,16 @@ class App:
                 return
             cid = c["id"]  # el cliente mostrado en la confirmación
 
-            def tarea():
+            def terminar(destino, restantes, error):
                 try:
-                    if self.cerrando:
-                        return
-                    self.set_ocupado(True, f"Eliminando a {nombre}…")
-                    destino = self.ctrl.eliminar_cliente(cid)
-                    restantes = self.ctrl.lector.listar_clientes(limite=1, cartera=self.cartera)
-                    self.cid = restantes[0]["id"] if restantes else None
-                    self.informe = None
                     if not self.cerrando:
-                        self.avisar(f"{nombre} eliminado. Su carpeta se guardó en {destino.parent.name}/{destino.name}."
-                                    if destino.exists() else f"{nombre} eliminado. No tenía carpeta que archivar.")
-                except Exception as exc:
-                    if not self.cerrando:
-                        self.avisar(str(exc), error=True)
+                        if error is not None:
+                            self.avisar(str(error), error=True)
+                        else:
+                            self.cid = restantes[0]["id"] if restantes else None
+                            self.informe = None
+                            self.avisar(f"{nombre} eliminado. Su carpeta se guardó en {destino.parent.name}/{destino.name}."
+                                        if destino.exists() else f"{nombre} eliminado. No tenía carpeta que archivar.")
                 finally:
                     self._turno.release()
                     if not self.cerrando:
@@ -2448,6 +2464,23 @@ class App:
                             self.abrir_cliente(self.cid)
                         else:
                             self._pintar_principal()
+
+            def tarea():
+                destino, restantes, error = None, [], None
+                try:
+                    if not self.cerrando:
+                        ejecutar_en_ui(self.page, lambda: self.set_ocupado(True, f"Eliminando a {nombre}…")
+                                       if not self.cerrando else None)
+                        destino = self.ctrl.eliminar_cliente(cid)
+                        restantes = self.ctrl.lector.listar_clientes(limite=1, cartera=self.cartera)
+                except Exception as exc:
+                    error = exc
+                try:
+                    ejecutar_en_ui(self.page, lambda: terminar(destino, restantes, error))
+                except Exception:
+                    if self._turno.locked():
+                        self._turno.release()
+                    raise
             try:
                 self.page.pop_dialog()
                 self.page.run_thread(tarea)
@@ -2624,26 +2657,39 @@ class App:
             if self.cerrando or (self.cid, self.ejercicio) != (cid, ej):
                 self._turno.release()
                 continue
-            try:
-                self.set_ocupado(True, "Procesando PDFs de la bandeja…")
-                for r in self.ctrl.procesar_bandeja(cid, ej, confirmar=lambda ext: self.revisar_extraccion(ext, cid, ej)):
-                    if r.get("ok"):
-                        if (self.cid, self.ejercicio) == (cid, ej):
-                            self._aplicar_resultado(r)
-                        if r.get("error_excel"):
-                            self._dialogo_excel_bloqueado(r["error_excel"])
-                        else:
-                            self.avisar(f"Bandeja: {r['archivo']} procesado.")
-                    elif not r.get("cancelado"):
-                        self.avisar(f"Bandeja: no se pudo leer {r['archivo']} (movido a _errores).", True)
-            except Exception as exc:
-                if not self.cerrando:
-                    self.avisar(f"Bandeja: {exc}", True)
-            finally:
+            def mostrar_resultado(r, cid=cid, ej=ej):
+                if self.cerrando:
+                    return
+                if r.get("ok"):
+                    if (self.cid, self.ejercicio) == (cid, ej):
+                        self._aplicar_resultado(r)
+                    if r.get("error_excel"):
+                        self._dialogo_excel_bloqueado(r["error_excel"])
+                    else:
+                        self.avisar(f"Bandeja: {r['archivo']} procesado.")
+                elif not r.get("cancelado"):
+                    self.avisar(f"Bandeja: no se pudo leer {r['archivo']} (movido a _errores).", True)
+
+            def terminar():
                 self._turno.release()
                 if not self.cerrando:
                     self.set_ocupado(False)
                     self._pintar_principal()
+
+            try:
+                ejecutar_en_ui(self.page, lambda: self.set_ocupado(True, "Procesando PDFs de la bandeja…")
+                               if not self.cerrando else None)
+                for r in self.ctrl.procesar_bandeja(cid, ej, confirmar=lambda ext: self.revisar_extraccion(ext, cid, ej)):
+                    ejecutar_en_ui(self.page, lambda resultado=r: mostrar_resultado(resultado))
+            except Exception as exc:
+                mensaje = f"Bandeja: {exc}"
+                ejecutar_en_ui(self.page, lambda texto=mensaje: self.avisar(texto, True) if not self.cerrando else None)
+            finally:
+                try:
+                    ejecutar_en_ui(self.page, terminar)
+                except Exception:
+                    if self._turno.locked():
+                        self._turno.release()
 
 
 def preparar_pagina(pg: ft.Page, p) -> None:
@@ -2686,30 +2732,35 @@ def pantalla_carga(p) -> ft.Container:
 
 def main(page: ft.Page) -> None:
     """Pinta la pantalla de carga y vuelve enseguida: Flet solo envía la primera pantalla al terminar esta
-    función. La carga real (módulos, BD, interfaz) sigue en un hilo y al acabar la pantalla se funde."""
+    función. Módulos y BD se cargan en un worker; el bucle UI monta y anima la pantalla."""
     p = ui.OSCURO if page.platform_brightness == ft.Brightness.DARK else ui.CLARO
     preparar_pagina(page, p)
     splash = pantalla_carga(p)
     pila = ft.Stack([splash], expand=True)
     page.add(pila)
 
-    def cargar() -> None:
-        app = None
+    async def cargar() -> None:
+        app, ctrl = None, None
         try:
             inicio = time.perf_counter()
-            time.sleep(0.05)  # deja que llegue el primer fotograma (opacidad 0) antes de animar la entrada
+            await asyncio.sleep(0.05)  # deja llegar el primer fotograma antes de animar
             splash.content.opacity, splash.content.scale = 1, 1
             page.update()
-            _cargar_modulos()
-            app = App(page)
+            await asyncio.to_thread(_cargar_modulos)
+            ctrl = await asyncio.to_thread(Controlador)
+            app = App(page, ctrl)
             app.iniciar(pila)
             page.update()
             # Mínimo ~0,9 s en pantalla para que no parpadee; luego fundido de salida (más corto que la entrada)
             minimo = float(os.environ.get("SPLASH_MIN", "0.9"))  # SPLASH_MIN=8 para revisarla con calma
-            time.sleep(max(0.0, minimo - (time.perf_counter() - inicio)))
+            await asyncio.sleep(max(0.0, minimo - (time.perf_counter() - inicio)))
+            if app.cerrando:
+                return
             splash.opacity = 0
             page.update()
-            time.sleep(0.3)
+            await asyncio.sleep(0.3)
+            if app.cerrando:
+                return
             if splash in pila.controls:
                 pila.controls.remove(splash)
                 page.update()
@@ -2718,11 +2769,9 @@ def main(page: ft.Page) -> None:
                 app.cerrando = True
                 if app._evento_dialogo:
                     app._evento_dialogo.set()
-                if app.ctrl._lock.acquire(blocking=False):
-                    try:
-                        app.ctrl.cerrar()
-                    finally:
-                        app.ctrl._lock.release()
+                await asyncio.to_thread(app.ctrl.cerrar)
+            elif ctrl is not None:
+                await asyncio.to_thread(ctrl.cerrar)
             if page.window:
                 page.window.prevent_close = False
             splash.opacity = 1
@@ -2736,7 +2785,7 @@ def main(page: ft.Page) -> None:
             pila.controls = [splash]
             page.update()
 
-    page.run_thread(cargar)
+    page.run_task(cargar)
 
 
 if __name__ == "__main__":

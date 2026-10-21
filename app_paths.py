@@ -30,7 +30,10 @@ def carpeta_datos() -> Path:
     parser = configparser.ConfigParser(interpolation=None)
     try:
         # Inno Setup utiliza UTF-16LE para los INI Unicode nuevos.
-        raw = configuracion_usuario().read_bytes()
+        config = configuracion_usuario()
+        if config.resolve() != Path(os.path.abspath(config)):
+            raise ValueError("La configuración es un enlace")
+        raw = config.read_bytes()
         text = raw.decode("utf-16") if raw.startswith((b"\xff\xfe", b"\xfe\xff")) else raw.decode("utf-8-sig")
         parser.read_string(text)
         ruta = Path(parser["Datos"]["Carpeta"])
@@ -40,8 +43,8 @@ def carpeta_datos() -> Path:
         if absoluta.resolve() != absoluta:
             raise ValueError("La carpeta es un enlace")
         instalacion = Path(sys.executable).resolve().parent
-        if ruta.resolve() == instalacion or instalacion in ruta.resolve().parents:
-            raise ValueError("Los datos no pueden estar dentro del programa")
+        if ruta.resolve() == instalacion or instalacion in ruta.resolve().parents or ruta.resolve() in instalacion.parents:
+            raise ValueError("Los datos y el programa no pueden solaparse")
         return absoluta
     except (OSError, ValueError, KeyError, configparser.Error, UnicodeError) as exc:
         raise AlmacenNoDisponible("No se puede abrir la carpeta de datos elegida. Comprueba que la unidad esté conectada y que tengas permisos; no se ha creado otra base de datos.") from exc

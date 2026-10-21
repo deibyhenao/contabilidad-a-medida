@@ -28,6 +28,10 @@ from carteras import NR, RAIZ, RES, PREFIJO_EXCEL, TIPO_NR, cartera_de, validar_
 from gastos import decimal_finito, ejercicio_registrado, fraccion, redondear_eur
 
 from app_paths import RECURSOS as RECURSOS_DIR, carpeta_datos
+from persistencia import crear_snapshot
+from rutas_seguras import sanitize_safe_path
+
+VERSION_ESQUEMA = 1
 
 PROYECTO_DIR = carpeta_datos()
 DB_PATH_DEFECTO = PROYECTO_DIR / "contabilidad.db"
@@ -429,7 +433,8 @@ class Database:
                  solo_lectura: bool = False):
         """``multihilo=True``: la conexión se usa desde varios hilos (UI Flet). Activa WAL para que una
         conexión de lectura no choque con la de escritura."""
-        self.db_path = Path(db_path)
+        ruta = Path(db_path).absolute()
+        self.db_path = sanitize_safe_path(ruta.parent, ruta)
         self._nivel_transaccion = 0
         self._documento_origen = None
         self._registrando_documentos = False
@@ -437,15 +442,39 @@ class Database:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
         destino = self.db_path.resolve().as_uri() + "?mode=ro" if solo_lectura else str(self.db_path)
         self.con = sqlite3.connect(destino, uri=solo_lectura, check_same_thread=not multihilo, timeout=30)
-        self.con.create_function("casefold", 1, lambda v: str(v or "").casefold(), deterministic=True)
-        self.con.row_factory = sqlite3.Row
-        self.con.execute("PRAGMA foreign_keys = ON")
-        if solo_lectura:
-            self.con.execute("PRAGMA query_only = ON")
-        else:
-            if multihilo:
+        try:
+            self.con.create_function("casefold", 1, lambda v: str(v or "").casefold(), deterministic=True)
+            self.con.row_factory = sqlite3.Row
+            self.con.execute("PRAGMA foreign_keys = ON")
+            self.con.execute("PRAGMA temp_store = MEMORY")
+            # Tope por conexión, no reserva anticipada de 64 MiB.
+            self.con.execute("PRAGMA cache_size = -64000")
+            version = self.con.execute("PRAGMA user_version").fetchone()[0]
+            if version > VERSION_ESQUEMA:
+                raise RuntimeError("Esta base de datos requiere una versión más reciente del programa.")
+            self.con.execute("PRAGMA synchronous = NORMAL")
+            if solo_lectura:
+                self.con.execute("PRAGMA query_only = ON")
+            else:
+                # Antes de cualquier DDL/PRAGMA persistente sobre una BD existente.
+                tiene_datos = self.con.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1"
+                ).fetchone() is not None
+                if version < VERSION_ESQUEMA and tiene_datos:
+                    crear_snapshot(self.db_path)
                 self.con.execute("PRAGMA journal_mode = WAL")
-            self._crear_esquema()
+                if version < VERSION_ESQUEMA:
+                    with self.transaccion():
+                        # Otra instancia puede haber migrado mientras se creaba la copia.
+                        version = self.con.execute("PRAGMA user_version").fetchone()[0]
+                        if version > VERSION_ESQUEMA:
+                            raise RuntimeError("La versión de la base de datos no es compatible.")
+                        if version < VERSION_ESQUEMA:
+                            self._crear_esquema()
+                            self.con.execute(f"PRAGMA user_version = {VERSION_ESQUEMA}")
+        except BaseException:
+            self.con.close()
+            raise
 
     def _confirmar(self) -> None:
         if self._nivel_transaccion == 0:
@@ -541,6 +570,7 @@ class Database:
         # Cartera + orden: listar 600 clientes de una cartera sin tabla temporal de ordenación
         cur.execute("CREATE INDEX IF NOT EXISTS ix_clientes_cartera_orden ON clientes(cartera,apellidos,nombre,id)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_clientes_tipo ON clientes(tipo_cliente)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_inmuebles_override ON inmuebles(cliente_id,manual_override,codigo)")
         for t in TABLAS.values():
             campos = {c.campo for c in t.columnas_bd}
             grupos = []

@@ -35,7 +35,7 @@ def construir(tmp_path):
     app.avisar = lambda mensaje: eventos.append(mensaje)
     app.aviso_actualizacion = AvisoActualizacion(ui.CLARO, app.comprobar_actualizacion,
                                                app.actualizar_aplicacion, app.cancelar_actualizacion)
-    contenido = b'instalador de prueba verificado' * 20000
+    contenido = b'MZ' + b'\0' * 58 + (64).to_bytes(4, 'little') + b'PE\0\0' + b'instalador de prueba verificado' * 20000
     pub = updater.Publicacion('1.0.2', 'https://github.com/deibyhenao/contabilidad-a-medida/releases/download/v1.0.2/ContabilidadAMedida-1.0.2-windows-x64-Setup.exe',
                              hashlib.sha256(contenido).hexdigest(), len(contenido), 'prueba')
     return app, trabajos, eventos, pub, contenido
@@ -50,9 +50,10 @@ def test_boton_busca_descarga_y_reinicia_en_orden(tmp_path, monkeypatch):
     monkeypatch.setattr(updater, 'comprobar', lambda: pub)
     monkeypatch.setattr(updater.app_paths, 'carpeta_actualizaciones', lambda: tmp_path)
     descargar = updater.descargar
-    monkeypatch.setattr(updater, 'descargar', lambda p, progreso, cancelar: descargar(
+    monkeypatch.setattr(updater, 'descargar', lambda p, progreso, cancelar, **kw: descargar(
         p, progreso, cancelar, carpeta=tmp_path, abrir=lambda _: io.BytesIO(contenido)))
-    def instalar(ruta, publicacion):
+    def instalar(ruta, publicacion, **kw):
+        assert kw["db_path"] == app.ctrl.lector.db_path
         assert ruta.read_bytes() == contenido and publicacion == pub
         eventos.append('instalador_preparado')
         return NS(poll=lambda: None, terminate=lambda: eventos.append('cancelado'))
@@ -92,7 +93,7 @@ def test_boton_cancelar_no_cierra_ni_instala(tmp_path, monkeypatch):
     app._update_publicacion = pub
     app.aviso_actualizacion.mostrar('disponible', version=pub.version)
     descargar = updater.descargar
-    monkeypatch.setattr(updater, 'descargar', lambda p, progreso, cancelar: descargar(
+    monkeypatch.setattr(updater, 'descargar', lambda p, progreso, cancelar, **kw: descargar(
         p, progreso, cancelar, carpeta=tmp_path, abrir=lambda _: io.BytesIO(contenido)))
     asyncio.run(pulsar_primario(app))
     app.aviso_actualizacion._acciones.controls[0].on_click(None)

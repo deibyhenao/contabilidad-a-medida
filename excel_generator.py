@@ -5,9 +5,10 @@ import os
 import json
 import shutil
 import tempfile
+import re
 from copy import copy
 from datetime import date, datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import openpyxl
 from openpyxl.formula.translate import Translator
@@ -19,6 +20,7 @@ import valores_inmuebles
 from carteras import NR, RES, cartera_de
 from database import Database, a_fecha
 from gastos import ejercicio_registrado, fraccion
+from rutas_seguras import sanitize_safe_path
 
 
 class ExcelBloqueadoError(Exception):
@@ -78,7 +80,13 @@ def _ruta(db: Database, cid: int, ruta: Path | None) -> Path:
     cliente = db.get_cliente(cid)
     if cliente is None:
         raise ValueError(f"Cliente inexistente: {cid}")
-    return Path(ruta) if ruta is not None else db.ruta_excel(cliente)
+    base = Path(cliente["carpeta"])
+    sanitize_safe_path(base, base.absolute())
+    destino = Path(ruta) if ruta is not None else db.ruta_excel(cliente)
+    # La exportación/importación explícita permite una copia elegida por el usuario.
+    # El destino automático siempre permanece dentro del expediente.
+    raiz = destino.absolute().parent if ruta is not None else base
+    return sanitize_safe_path(raiz, destino.absolute())
 
 
 # Tablas en las que una fila escrita a mano en el Excel (sin ID) es un alta y su ausencia, una baja
@@ -89,7 +97,7 @@ def _columnas(tabla):
     return [c for c in tabla.columnas_excel if c.tipo != "formula"]
 
 
-def _link(cell, valor) -> None:
+def _link(cell, valor, carpeta_cliente: Path | None = None) -> None:
     if valor in (None, ""):
         cell.value = None
         cell.hyperlink = None
@@ -97,7 +105,21 @@ def _link(cell, valor) -> None:
     relativo = str(valor).replace("\\", "/")
     cell.value = relativo.rstrip("/").rsplit("/", 1)[-1]
     cell.data_type = 's'  # El nombre es una etiqueta de archivo, nunca una fórmula.
-    cell.hyperlink = relativo
+    # El texto de una celda importada o extraída no concede permiso para
+    # convertir URLs, rutas UNC o archivos externos en vínculos ejecutables.
+    ruta = Path(relativo)
+    permitido = (not ruta.is_absolute() and not PureWindowsPath(relativo).drive
+                 and ".." not in ruta.parts and len(ruta.parts) == 2
+                 and ruta.parts[0] in {"Soportes_PDF", ".Papelera_Documentos"}
+                 and ruta.suffix.lower() == ".pdf")
+    if permitido:
+        try:
+            sanitize_safe_path(carpeta_cliente or Path.cwd(), relativo)
+        except ValueError:
+            permitido = False
+    cell.hyperlink = relativo if permitido else None
+    if not permitido:
+        return
     fuente = copy(cell.font)
     fuente.color = "0000FF"
     fuente.underline = "single"
@@ -129,6 +151,8 @@ def _ampliar_fila(ws, fila: int, tabla, limite: int) -> None:
 
 
 def _guardar_atomico(wb, destino: Path, carpeta_cliente: Path) -> None:
+    destino = sanitize_safe_path(destino.parent, destino.absolute())
+    carpeta_cliente = sanitize_safe_path(carpeta_cliente, carpeta_cliente.absolute())
     destino.parent.mkdir(parents=True, exist_ok=True)
     descriptor, nombre_tmp = tempfile.mkstemp(prefix=".nr_", suffix=".xlsx", dir=destino.parent)
     os.close(descriptor)
@@ -137,11 +161,23 @@ def _guardar_atomico(wb, destino: Path, carpeta_cliente: Path) -> None:
         wb.save(temporal)
         try:
             if destino.exists():
-                backups = carpeta_cliente / "_backups"
+                backups = sanitize_safe_path(carpeta_cliente, "_backups")
                 backups.mkdir(parents=True, exist_ok=True)
                 sello = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                shutil.copy2(destino, backups / f"{destino.stem}_{sello}.xlsx")
-                copias = sorted(backups.glob("*.xlsx"), key=lambda p: p.stat().st_mtime_ns, reverse=True)
+                copia = sanitize_safe_path(backups, backups / f"{destino.stem}_{sello}.xlsx")
+                shutil.copy2(destino, copia)
+                patron = re.compile(re.escape(destino.stem) + r"_\d{8}_\d{6}_\d{6}\.xlsx")
+                copias = []
+                for candidata in backups.glob("*.xlsx"):
+                    if not patron.fullmatch(candidata.name):
+                        continue
+                    try:
+                        candidata = sanitize_safe_path(backups, candidata)
+                    except ValueError:
+                        continue
+                    if candidata.is_file():
+                        copias.append(candidata)
+                copias.sort(key=lambda p: p.stat().st_mtime_ns, reverse=True)
                 for antigua in copias[10:]:
                     antigua.unlink()
             os.replace(temporal, destino)
@@ -334,7 +370,7 @@ def exportar_cliente(db: Database, cliente_id: int, ejercicio: int, destino: Pat
                     if nombre == "residencias" and col.campo == "codigo":
                         valor = int(datos.get("ejercicio") or datos["codigo"])
                     if col.tipo == "link":
-                        _link(celda, valor)
+                        _link(celda, valor, Path(cliente["carpeta"]))
                     else:
                         celda.value = _valor_excel(col, valor)
                         if isinstance(celda.value, str):

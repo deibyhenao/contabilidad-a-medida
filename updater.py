@@ -1,7 +1,7 @@
 """Actualizaciones de GitHub Releases: HTTPS, versión, tamaño y SHA-256 obligatorios.
 
-Nunca recibe ni abre una base de datos o una carpeta de clientes. El instalador
-per-user sustituye únicamente los archivos de la aplicación una vez cerrada.
+Las copias preventivas usan SQLite backup; el instalador sustituye únicamente
+los archivos del programa una vez cerrada la aplicación.
 """
 from __future__ import annotations
 
@@ -115,7 +115,35 @@ def comprobar(version_actual: str = VERSION, *, abrir=None) -> Publicacion | Non
         raise ErrorActualizacion("No se pudieron buscar actualizaciones. Comprueba la conexión e inténtalo de nuevo.") from exc
 
 
-def descargar(publicacion: Publicacion, progreso, cancelar: threading.Event, *, carpeta: Path | None = None, abrir=None) -> Path:
+def _snapshot_previo(db_path: Path | None) -> None:
+    if db_path is None and getattr(sys, "frozen", False):
+        db_path = app_paths.carpeta_datos() / "contabilidad.db"
+    if db_path is not None:
+        from persistencia import crear_snapshot
+        try:
+            crear_snapshot(db_path)
+        except Exception as exc:
+            raise ErrorActualizacion("No se pudo guardar la copia de seguridad. La actualización se ha detenido.") from exc
+
+
+def _validar_ejecutable(ruta: Path) -> None:
+    # MZ solo no basta: comprueba también el desplazamiento y la firma PE.
+    with ruta.open("rb") as archivo:
+        cabecera = archivo.read(64)
+        if len(cabecera) < 64 or cabecera[:2] != b"MZ":
+            raise ErrorActualizacion("El archivo descargado no es un ejecutable válido de Windows.")
+        offset = int.from_bytes(cabecera[60:64], "little")
+        if offset < 64 or offset > ruta.stat().st_size - 4:
+            raise ErrorActualizacion("La cabecera del instalador no es válida.")
+        archivo.seek(offset)
+        if archivo.read(4) != b"PE\x00\x00":
+            raise ErrorActualizacion("La firma del instalador no es válida.")
+
+
+def descargar(publicacion: Publicacion, progreso, cancelar: threading.Event, *, carpeta: Path | None = None, abrir=None, db_path: Path | None = None) -> Path:
+    if cancelar.is_set():
+        raise DescargaCancelada("Descarga cancelada.")
+    _snapshot_previo(db_path)
     abrir = abrir or _abrir
     base = Path(carpeta) if carpeta is not None else app_paths.carpeta_actualizaciones()
     base.mkdir(parents=True, exist_ok=True)
@@ -146,6 +174,7 @@ def descargar(publicacion: Publicacion, progreso, cancelar: threading.Event, *, 
             raise DescargaCancelada("Descarga cancelada.")
         if recibidos != publicacion.size or h.hexdigest() != publicacion.sha256:
             raise ErrorActualizacion("La descarga no supera la verificación de integridad. No se instalará.")
+        _validar_ejecutable(ruta)
         destino = ruta.with_suffix("")
         ruta.rename(destino)
         return destino
@@ -156,7 +185,7 @@ def descargar(publicacion: Publicacion, progreso, cancelar: threading.Event, *, 
         raise ErrorActualizacion("No se pudo descargar la actualización. Puedes volver a intentarlo.") from exc
 
 
-def preparar_instalacion(ruta: Path, publicacion: Publicacion) -> subprocess.Popen:
+def preparar_instalacion(ruta: Path, publicacion: Publicacion, *, db_path: Path | None = None) -> subprocess.Popen:
     """Arranca un auxiliar independiente y espera su acuse antes de cerrar la app.
 
     Disponible solo en la instalación de Windows. No hay comandos interpolados
@@ -177,6 +206,8 @@ def preparar_instalacion(ruta: Path, publicacion: Publicacion) -> subprocess.Pop
             huella.update(chunk)
     if ruta.stat().st_size != publicacion.size or huella.hexdigest() != publicacion.sha256:
         raise ErrorActualizacion("El instalador ha cambiado. Descarga la actualización otra vez.")
+    _validar_ejecutable(ruta)
+    _snapshot_previo(db_path)
     auxiliar = cache / ("aplicar-" + ruta.stem + ".ps1")
     with (app_paths.RECURSOS / "packaging" / "aplicar_actualizacion.ps1").open("rb") as origen, auxiliar.open("xb") as out:
         shutil.copyfileobj(origen, out)

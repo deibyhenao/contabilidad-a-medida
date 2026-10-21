@@ -207,12 +207,12 @@ def test_backups_limitados_a_diez(db, cliente):
     backups = ruta.parent / "_backups"
     backups.mkdir()
     for n in range(12):
-        copia = backups / f"anterior_{n:02}.xlsx"
+        copia = backups / f"{ruta.stem}_20260101_120000_{n:06d}.xlsx"
         copia.write_bytes(b"prueba")
         eg.os.utime(copia, (n + 1, n + 1))
     eg.exportar_cliente(db, cid, 2026)
     assert len(list(backups.glob("*.xlsx"))) == 10
-    assert not (backups / "anterior_00.xlsx").exists()
+    assert not (backups / f"{ruta.stem}_20260101_120000_000000.xlsx").exists()
     assert any(p.name.startswith(ruta.stem) for p in backups.glob("*.xlsx"))
 
 

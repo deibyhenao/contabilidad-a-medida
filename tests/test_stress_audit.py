@@ -352,7 +352,7 @@ def test_busqueda_asincrona_no_bloquea_y_descarta_resultado_antiguo(volumen,monk
     assert len(pintados) == 1 and pintados[0][0]['apellidos'] == 'Apellido000001'
 
 
-def test_archivar_con_raiz_alias_valida(db,tmp_path):
+def test_archivar_rechaza_raiz_alias(db,tmp_path):
     if os.name != 'nt':
         pytest.skip('Junction de Windows')
     c = db.crear_cliente('Cliente','Alias','A9-ALIAS')
@@ -360,8 +360,11 @@ def test_archivar_con_raiz_alias_valida(db,tmp_path):
     proceso = subprocess.run(['cmd','/c','mklink','/J',str(alias),str(base)],capture_output=True)
     assert proceso.returncode == 0
     try:
-        relativo,_ = pp.archivar_pdf(pdfs.recibo_ibi(tmp_path/'recibo.pdf'),alias,pp.TipoDocumento.CATASTRO_IBI,None)
-        assert relativo.startswith('Soportes_PDF/') and (base/relativo).is_file()
+        # El requisito de aislamiento prohíbe junctions aunque ahora apunten
+        # a una carpeta válida: podrían redirigirse a otro expediente.
+        with pytest.raises(ValueError):
+            pp.archivar_pdf(pdfs.recibo_ibi(tmp_path/'recibo.pdf'),alias,pp.TipoDocumento.CATASTRO_IBI,None)
+        assert not list((base/'Soportes_PDF').glob('*.pdf'))
     finally:
         os.rmdir(alias)
 

@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from carteras import RES, cartera_de
 from database import TABLAS, Columna, _normalizar, a_fecha, a_num, slug, componente_ruta, subcarpeta_cliente
+from rutas_seguras import sanitize_safe_path
 
 
 class TipoDocumento(str, Enum):
@@ -605,7 +606,8 @@ def _hash(ruta: Path) -> str:
 
 def archivar_pdf(ruta: Path, carpeta_cliente: Path, tipo: TipoDocumento, fecha: date | None,
                  huella_esperada: str | None = None) -> tuple[str, str]:
-    ruta, carpeta_cliente = Path(ruta), Path(carpeta_cliente).resolve()
+    ruta = Path(ruta)
+    carpeta_cliente = sanitize_safe_path(carpeta_cliente, Path(carpeta_cliente).absolute())
     soportes = subcarpeta_cliente(carpeta_cliente)
     soportes.mkdir(parents=True, exist_ok=True)
     huella, tamano = _hash(ruta), ruta.stat().st_size
@@ -618,7 +620,11 @@ def archivar_pdf(ruta: Path, carpeta_cliente: Path, tipo: TipoDocumento, fecha: 
         marca = re.search(r"__h_([a-f0-9]{16})(?:_\d+)?\.pdf$", previo.name)
         if marca and marca[1] != huella[:16]:
             continue
-        if previo.resolve().parent != soportes or not previo.is_file():
+        try:
+            previo = sanitize_safe_path(soportes, previo)
+        except ValueError:
+            continue
+        if not previo.is_file():
             continue
         if previo.stat().st_size == tamano and _hash(previo) == huella:
             return previo.relative_to(carpeta_cliente).as_posix(), huella
@@ -626,7 +632,7 @@ def archivar_pdf(ruta: Path, carpeta_cliente: Path, tipo: TipoDocumento, fecha: 
     limite = min(76, 248 - len(str(soportes)) - 1 - len("_9999.pdf"))
     if limite < 20:
         raise ValueError("La ruta del expediente es demasiado larga: elige una carpeta base más corta.")
-    texto_base = f"{(fecha or date.today()).isoformat()}_{tipo.value}_{slug(ruta.stem) or 'documento'}"
+    texto_base = f"{(fecha or date.today()).isoformat()}_{tipo.value}_{componente_ruta(ruta.stem)}"
     if limite >= 32:
         base = componente_ruta(texto_base, limite - 20) + "__h_" + huella[:16]
     else:
@@ -634,6 +640,7 @@ def archivar_pdf(ruta: Path, carpeta_cliente: Path, tipo: TipoDocumento, fecha: 
     destino = soportes / f"{base}.pdf"
     numero = 2
     while True:
+        destino = sanitize_safe_path(soportes, destino)
         try:
             salida = destino.open("xb")  # exclusivo: no sigue enlaces ni pisa otra importación
             break

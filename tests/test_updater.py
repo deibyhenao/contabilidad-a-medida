@@ -72,7 +72,7 @@ def test_timeout_error_local():
 
 
 def test_descarga_verificada_y_progreso(tmp_path):
-    contenido=b'x'*600000
+    contenido=b'MZ'+b'\0'*58+(64).to_bytes(4,'little')+b'PE\0\0'+b'x'*600000
     pub=consultar(asset(contenido)); estados=[]
     ruta=updater.descargar(pub,estados.append,threading.Event(),carpeta=tmp_path,abrir=lambda _:io.BytesIO(contenido))
     assert ruta.read_bytes()==contenido and ruta.suffix=='.exe'
@@ -189,7 +189,7 @@ def test_cierre_de_ventana_fallido_reabre_controlador(monkeypatch,tmp_path):
         window=Ventana()
         def update(self): pass
     anterior=Ctrl(); nuevo=Ctrl(); app.ctrl=anterior; app.page=Pagina()
-    monkeypatch.setattr(updater,'preparar_instalacion',lambda *a:Auxiliar())
+    monkeypatch.setattr(updater,'preparar_instalacion',lambda *a, **kw:Auxiliar())
     monkeypatch.setattr(main,'Controlador',lambda ruta:nuevo)
     asyncio.run(app.actualizar_aplicacion())
     assert eventos==['cerrado','auxiliar_cancelado']

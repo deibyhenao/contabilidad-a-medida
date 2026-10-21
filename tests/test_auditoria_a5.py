@@ -145,7 +145,7 @@ def test_a5_fallo_al_programar_borrado_libera_turno():
 def test_a5_error_de_carga_sustituye_splash_por_mensaje(monkeypatch):
     vistas, cola = [], []
     page = SimpleNamespace(platform_brightness=main.ft.Brightness.LIGHT, window=None,
-                           add=vistas.append, run_thread=cola.append, update=lambda: None)
+                           add=vistas.append, run_task=cola.append, update=lambda: None)
     monkeypatch.setattr(main, "preparar_pagina", lambda *_args: None)
     monkeypatch.setattr(main.time, "sleep", lambda _segundos: None)
 
@@ -154,7 +154,7 @@ def test_a5_error_de_carga_sustituye_splash_por_mensaje(monkeypatch):
 
     monkeypatch.setattr(main, "_cargar_modulos", fallar)
     main.main(page)
-    cola.pop()()
+    asyncio.run(cola.pop()())
     splash = vistas[0].controls[0]
     assert splash.opacity == 1
     assert splash.content.controls[1].value == "No se pudo iniciar la aplicación"

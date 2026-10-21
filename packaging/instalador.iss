@@ -38,7 +38,10 @@ Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
 Name: "desktopicon"; Description: "Crear acceso directo en el escritorio"; Flags: unchecked
 
 [Files]
-Source: "{#ProjectRoot}\dist\ContabilidadAMedida\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Nunca distribuir datos de trabajo. Solo se actualizan estas dos plantillas vacías.
+Source: "{#ProjectRoot}\dist\ContabilidadAMedida\*"; DestDir: "{app}"; Excludes: "*.db,*.db-*,*.sqlite*,*.pdf,*.xlsx,Clientes*,Backups_Seguridad*,.env*"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#ProjectRoot}\dist\ContabilidadAMedida\_internal\plantillas\Plantilla_Expediente_No_Residente_v2.xlsx"; DestDir: "{app}\_internal\plantillas"; Flags: ignoreversion
+Source: "{#ProjectRoot}\dist\ContabilidadAMedida\_internal\plantillas\Plantilla_Expediente_Residente_v1.xlsx"; DestDir: "{app}\_internal\plantillas"; Flags: ignoreversion
 
 [INI]
 Filename: "{app}\instalacion.ini"; Section: "Instalacion"; Key: "Version"; String: "{#AppVersion}"
@@ -59,6 +62,28 @@ var
 function EsActualizacion: Boolean;
 begin
   Result := ExpandConstant('{param:CAMUPDATE|0}') = '1';
+end;
+
+function GetFileAttributesW(lpFileName: String): LongWord;
+  external 'GetFileAttributesW@kernel32.dll stdcall';
+
+function SinEnlaces(Ruta: String): Boolean;
+var
+  Atributos: LongWord;
+  Padre: String;
+begin
+  Result := True;
+  Ruta := RemoveBackslashUnlessRoot(ExpandFileName(Ruta));
+  while Ruta <> '' do begin
+    Atributos := GetFileAttributesW(Ruta);
+    if (Atributos <> $FFFFFFFF) and ((Atributos and $400) <> 0) then begin
+      Result := False;
+      Exit;
+    end;
+    Padre := ExtractFileDir(Ruta);
+    if Padre = Ruta then Exit;
+    Ruta := Padre;
+  end;
 end;
 
 procedure InitializeWizard;
@@ -98,6 +123,10 @@ begin
   Result := '';
   Datos := AddBackslash(Lowercase(ExpandFileName(DatosPage.Values[0])));
   Programa := AddBackslash(Lowercase(ExpandFileName(WizardDirValue)));
+  if not SinEnlaces(DatosPage.Values[0]) or not SinEnlaces(WizardDirValue) or not SinEnlaces(ConfigPath) then begin
+    Result := 'Las carpetas del programa, los datos y la configuración no pueden ser enlaces.';
+    Exit;
+  end;
   if (Pos(Programa, Datos) = 1) or (Pos(Datos, Programa) = 1) then begin
     Result := 'La carpeta del programa y la de datos deben estar separadas.';
     Exit;
@@ -120,4 +149,5 @@ begin
   end;
 end;
 
+// Los datos no pertenecen al manifiesto de instalación/desinstalación.
 // No hay [InstallDelete], [UninstallDelete] ni limpieza de directorios de datos.
