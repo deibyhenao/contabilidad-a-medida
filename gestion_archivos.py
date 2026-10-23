@@ -9,16 +9,17 @@ from acciones_documentales import validar_nombre
 def preparar(db, cid, codigo, nombre):
     validar_nombre(nombre)
     doc = documentos._documento(db, cid, codigo)
+    validar_nombre(nombre, doc['ruta'])
     if doc['en_papelera']:
         raise ValueError('Restaura el documento antes de modificarlo.')
     origen = documentos._ruta(db, cid, doc['ruta'])
     relativa = 'Soportes_PDF/' + nombre
     destino = documentos._ruta(db, cid, relativa)
     if not origen.is_file():
-        raise ValueError('No se encuentra el PDF de origen.')
+        raise ValueError('No se encuentra el documento de origen.')
     huella = documentos._huella(origen)
     if doc.get('sha256') and doc['sha256'] != huella:
-        raise ValueError('El PDF cambió respecto al documento registrado.')
+        raise ValueError('El documento cambió respecto al documento registrado.')
     colision = any(f['codigo'] != codigo and str(f.get('ruta', '')).casefold() == relativa.casefold()
                    for f in db.iterar('documentos', cid, incluir_retirados=True))
     if destino != origen and (destino.exists() or colision):

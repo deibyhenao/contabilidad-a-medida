@@ -14,6 +14,8 @@ from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path, PureWindowsPath
 
+EXTENSIONES_SOPORTE = frozenset({".pdf", ".xlsx", ".xls", ".docx", ".csv"})
+
 
 def crear_esquema(db):
     db.con.execute('''CREATE TABLE IF NOT EXISTS documentos_operaciones (
@@ -121,9 +123,10 @@ def _ruta(db, cid, relativa, papelera=False):
         ruta = Path(str(relativa).replace("\\", "/"))
         if (ruta.is_absolute() or PureWindowsPath(str(relativa)).drive or len(ruta.parts) != 2
                 or ruta.parts[0] != ".Papelera_Documentos" or ruta.name in (".", "..")
-                or ruta.suffix.casefold() != ".pdf" or any(c in ruta.name for c in '<>:"|?*')):
+                or ruta.suffix.casefold() not in EXTENSIONES_SOPORTE or any(c in ruta.name for c in '<>:"|?*')):
             raise ValueError("Ruta de papelera inválida.")
-        destino = base / ruta
+        from rutas_seguras import sanitize_safe_path
+        destino = sanitize_safe_path(base, ruta)
     for parte in (destino, destino.parent):
         if parte.exists() and (parte.is_symlink() or getattr(parte.lstat(), "st_file_attributes", 0) & 1024):
             raise ValueError("La ruta del documento contiene un enlace o una junction.")
@@ -140,11 +143,11 @@ def _huella(ruta):
 
 def _copiar_seguro(origen, destino, huella):
     if not origen.is_file() or _huella(origen) != huella:
-        raise ValueError("El PDF de origen falta o su contenido ha cambiado; revisa el soporte.")
+        raise ValueError("El documento de origen falta o su contenido ha cambiado; revisa el soporte.")
     destino.parent.mkdir(parents=True, exist_ok=True)
     if destino.exists():
         if _huella(destino) != huella:
-            raise ValueError("Ya existe un PDF diferente en el destino; no se sobrescribe.")
+            raise ValueError("Ya existe un documento diferente en el destino; no se sobrescribe.")
         return False
     creado = False
     try:
@@ -154,7 +157,7 @@ def _copiar_seguro(origen, destino, huella):
             salida.flush()
             os.fsync(salida.fileno())
         if _huella(destino) != huella:
-            raise OSError("No se pudo verificar la copia del PDF.")
+            raise OSError("No se pudo verificar la copia del documento.")
     except BaseException:
         if creado:
             destino.unlink(missing_ok=True)
@@ -226,10 +229,13 @@ def _legado(db, cid, doc, guardar=False):
     """Sin historial solo se invalidan datos vinculados inequívocamente, sin fabricar un antes."""
     from database import TABLAS
     from pdf_processor import extraer_local, TipoDocumento
+    vinculos = list(_vinculos_legados(db, cid, doc))
+    if not vinculos:
+        return []
     ruta = _ruta(db, cid, doc["ruta"])
     ext = extraer_local(ruta) if ruta.is_file() else None
     cambios = []
-    for tabla, fila in _vinculos_legados(db, cid, doc):
+    for tabla, fila in vinculos:
         if tabla in ("m210_alquiler", "m210_imputacion", "patrimonio_714", "its_718", "modelos_presentados", "obligaciones"):
             continue
         permitidos = set((ext.campos if ext else {}))
@@ -369,14 +375,14 @@ def previsualizar(db, cid, codigo, accion, ejercicio_destino=None):
         _bloqueo_presentados(db, cid, ejercicios)
         ruta = _ruta(db, cid, doc["ruta_papelera"] if doc["en_papelera"] else doc["ruta"], papelera=doc["en_papelera"])
         if not ruta.is_file():
-            raise ValueError("No se encuentra el PDF. Recupera el archivo antes de continuar.")
+            raise ValueError("No se encuentra el documento. Recupera el archivo antes de continuar.")
         if doc.get("sha256") and _huella(ruta) != doc["sha256"]:
-            raise ValueError("El contenido del PDF ha cambiado respecto al documento registrado.")
+            raise ValueError("El contenido del documento ha cambiado respecto al documento registrado.")
         eventos = _eventos(db, cid, codigo)
         cambios = _cambios_previsibles(db, cid, doc, accion == "restaurar")
         if not eventos:
-            avisos.append("Documento antiguo sin historial de importación: solo se pueden revisar los datos vinculados a este PDF. No se conocen los valores anteriores; revisa los campos indicados y los datos manuales tras confirmar.")
-            avisos.append("Los datos distintos de los que se pueden comprobar en el PDF se conservan por posible corrección manual; revisa especialmente el país y los importes que queden sin soporte.")
+            avisos.append("Documento antiguo sin historial de importación: solo se pueden revisar los datos vinculados a este documento. No se conocen los valores anteriores; revisa los campos indicados y los datos manuales tras confirmar.")
+            avisos.append("Los datos distintos de los que se pueden comprobar en el documento se conservan por posible corrección manual; revisa especialmente el país y los importes que queden sin soporte.")
         elif len(cambios) < len({(e["tabla"], e["codigo"], e["campo"]) for e in eventos}):
             avisos.append("Se conservan los datos respaldados por otro documento o por una corrección manual posterior. Los importes manuales conservados pueden seguir influyendo en los cálculos; revísalos.")
         if "escritura" in str(doc.get("tipo", "")).casefold():
@@ -392,7 +398,7 @@ def previsualizar(db, cid, codigo, accion, ejercicio_destino=None):
         avisos.append(error)
     return {"titulo": {"retirar": "Mover documento a la papelera", "restaurar": "Restaurar documento",
                        "cambiar_ejercicio": "Corregir ejercicio del documento", "sustituir": "Sustituir documento"}[accion],
-            "descripcion": "Se conservará el PDF y se revisarán sus datos asociados respetando las correcciones manuales.",
+            "descripcion": "Se conservará el documento y se revisarán sus datos asociados respetando las correcciones manuales.",
             "advertencias": avisos, "ejercicio_origen": doc.get("ejercicio"),
             "ejercicio_destino": ejercicio_destino, "cambios": cambios, "confirmable": error is None}
 
@@ -505,7 +511,7 @@ def _plan_movimiento(db, cid, codigo, retirar):
     origen_rel = doc["ruta"] if retirar else doc["ruta_papelera"]
     origen_archivo = _ruta(db, cid, origen_rel, papelera=not retirar)
     huella = doc.get("sha256") or _huella(origen_archivo)
-    destino_rel = f".Papelera_Documentos/{codigo}_{huella[:16]}.pdf" if retirar else doc["ruta"]
+    destino_rel = f".Papelera_Documentos/{codigo}_{huella[:16]}{origen_archivo.suffix}" if retirar else doc["ruta"]
     return doc, origen_rel, origen_archivo, huella, destino_rel, _ruta(db, cid, destino_rel, papelera=retirar)
 
 
@@ -599,7 +605,7 @@ def cambiar_ejercicio(db, cid, codigo, nuevo_ejercicio):
         if not filas:
             filas = {(tabla, fila["codigo"]) for tabla, fila in _vinculos_legados(db, cid, doc) if tabla in tablas_factura}
         if len(filas) > 1:
-            raise ValueError("Hay varias facturas vinculadas a este PDF. Revisa sus fechas en la ficha antes de trasladarlo.")
+            raise ValueError("Hay varias facturas vinculadas a este documento. Revisa sus fechas en la ficha antes de trasladarlo.")
         factura_existente = next(iter(filas), None)
         for tabla, cod in filas:
             actual = db.get(tabla, cid, cod)
@@ -616,7 +622,7 @@ def cambiar_ejercicio(db, cid, codigo, nuevo_ejercicio):
                 try:
                     ext.campos[campo] = fecha.replace(year=nuevo_ejercicio).isoformat()
                 except ValueError:
-                    raise ValueError("La fecha del PDF no existe en el ejercicio destino. Corrígela antes de trasladarlo.") from None
+                    raise ValueError("La fecha del documento no existe en el ejercicio destino. Corrígela antes de trasladarlo.") from None
     elif ext.tipo not in (TipoDocumento.CERTIFICADO_RESIDENCIA, TipoDocumento.CATASTRO_IBI,
                           TipoDocumento.VALOR_REFERENCIA, TipoDocumento.MODELO_PRESENTADO, TipoDocumento.MODELO_210):
         raise ValueError("Este documento contiene fechas de vigencia. Corrige sus fechas en los datos del expediente; no basta con cambiar la etiqueta del ejercicio.")

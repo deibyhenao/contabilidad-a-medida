@@ -95,14 +95,23 @@ def test_ocr_fallido_advierte_y_ocr_disponible_recupera(monkeypatch, tmp_path):
             return object()
 
     class Documento:
+        needs_pass = False
+
+        def __len__(self):
+            return 1
+
+        def __iter__(self):
+            return iter([pagina])
+
         def __enter__(self):
-            return [pagina]
+            return self
 
         def __exit__(self, *args):
             pass
 
     pagina = Pagina()
     monkeypatch.setattr(pp.fitz, "open", lambda *args: Documento())
+    (tmp_path / "escaneado.pdf").write_bytes(b"%PDF-1.4 fixture OCR")
     ext = pp.extraer(tmp_path / "escaneado.pdf")
     assert ext.necesita_ocr and pp.AVISO_OCR in ext.avisos
     pagina.disponible = True

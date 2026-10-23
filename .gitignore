@@ -36,3 +36,8 @@ release/
 work/
 *.pfx
 *.p12
+
+# Material privado de auditoria: nunca distribuir con el codigo
+*.zip
+Backups_Seguridad/
+.tripartito/2026-10-23-multiformato/auditoria-cliente*

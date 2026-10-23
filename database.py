@@ -31,7 +31,7 @@ from app_paths import RECURSOS as RECURSOS_DIR, carpeta_datos
 from persistencia import crear_snapshot
 from rutas_seguras import sanitize_safe_path
 
-VERSION_ESQUEMA = 1
+VERSION_ESQUEMA = 2
 
 PROYECTO_DIR = carpeta_datos()
 DB_PATH_DEFECTO = PROYECTO_DIR / "contabilidad.db"
@@ -199,7 +199,7 @@ TABLAS: dict[str, TablaDef] = {
             _c("tipo", "E"), _c("descripcion", "F"), _c("estado", "G"), _c("fecha_documento", "H", "date"),
             _c("fecha_caducidad", "I", "date"), _c("ruta", "J", "link"), _c("ultima_revision", "K", "date"),
             _c("observaciones", "L"),
-            _c("sha256", None), _c("nombre_original", None),
+            _c("sha256", None), _c("nombre_original", None), _c("comentario_guia", None),
         )),
         TablaDef("obligaciones", "14_OBLIGACIONES", "OBL", (
             _c("codigo", "A"), _c("ejercicio", "B", "int"), _c("tipo", "C"), _c("inmueble", "D"),
@@ -362,7 +362,7 @@ def ruta_soporte(carpeta: Path, relativa: str) -> Path:
             or (candidato.exists() and getattr(candidato.lstat(), "st_file_attributes", 0) & 1024)):
         raise ValueError("Nombre reservado o enlace de PDF no permitido.")
     destino = candidato.resolve()
-    if destino.parent != soportes or destino.suffix.lower() != ".pdf":
+    if destino.parent != soportes or destino.suffix.lower() not in {".pdf", ".xlsx", ".xls", ".docx", ".csv"}:
         raise ValueError("La ruta del PDF sale de los soportes del cliente.")
     return destino
 

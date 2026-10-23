@@ -13,7 +13,7 @@ import unicodedata
 from datetime import date
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import fitz
 from pydantic import BaseModel, Field
@@ -34,7 +34,15 @@ class TipoDocumento(str, Enum):
     MODELO_036_037 = "MODELO_036_037"
     MODELO_PRESENTADO = "MODELO_PRESENTADO"
     FACTURA_GASTO = "FACTURA_GASTO"
+    RESUMEN_ALQUILER = "RESUMEN_ALQUILER"
+    RESOLUCION_ALQUILER = "RESOLUCION_ALQUILER"
     DESCONOCIDO = "DESCONOCIDO"
+
+
+class RegistroDocumento(BaseModel):
+    tabla: Literal["cobros", "gastos"]
+    campos: dict[str, Any]
+    evidencia: str = Field(min_length=1, max_length=500)
 
 
 class Extraccion(BaseModel):
@@ -44,6 +52,8 @@ class Extraccion(BaseModel):
     inquilinos: list[dict] = Field(default_factory=list)
     titulares: list[str] = Field(default_factory=list)
     avisos: list[str] = Field(default_factory=list)
+    comentario_guia: str = Field(default="", max_length=4000)
+    registros: list[RegistroDocumento] = Field(default_factory=list, max_length=500)
     necesita_ocr: bool = False
     texto: str = ""
     nombre_archivo: str
@@ -71,6 +81,8 @@ TIPOS_LEGIBLES = {
     TipoDocumento.MODELO_036_037: "Modelo 036/037",
     TipoDocumento.MODELO_PRESENTADO: "Modelo presentado",
     TipoDocumento.FACTURA_GASTO: "Factura / recibo de gasto",
+    TipoDocumento.RESUMEN_ALQUILER: "Relación de ingresos y gastos",
+    TipoDocumento.RESOLUCION_ALQUILER: "Resolución de contrato de alquiler",
     TipoDocumento.DESCONOCIDO: "Documento por revisar",
 }
 AVISO_OCR = "PDF escaneado sin OCR: revisa los campos a mano"
@@ -158,9 +170,19 @@ def _sumar_meses(inicio: date, meses: int) -> date:
 
 
 def extraer_texto(ruta: Path) -> tuple[str, bool]:
+    if Path(ruta).suffix.lower() != ".pdf":
+        from lectores_documentales import extraer_documento
+        documento = extraer_documento(Path(ruta))
+        return documento.texto, documento.escaneado
+    from lectores_documentales import MAX_ARCHIVO_PDF, MAX_PAGINAS, MAX_TEXTO, ErrorDocumento
+    if Path(ruta).stat().st_size > MAX_ARCHIVO_PDF:
+        raise ErrorDocumento("El PDF supera 32 MB.")
     textos = []
+    caracteres = 0
     necesita_ocr = False
     with fitz.open(str(ruta)) as doc:
+        if doc.needs_pass or len(doc) > MAX_PAGINAS:
+            raise ErrorDocumento("El PDF está cifrado o supera el límite de páginas.")
         for pagina in doc:
             texto = pagina.get_text()
             if len(texto.strip()) < 50:
@@ -174,6 +196,9 @@ def extraer_texto(ruta: Path) -> tuple[str, bool]:
                 except Exception:
                     # Tesseract es opcional. Un fallo OCR no impide revisión manual.
                     necesita_ocr = True
+            caracteres += len(texto)
+            if caracteres > MAX_TEXTO:
+                raise ErrorDocumento("El texto del PDF supera el límite permitido.")
             textos.append(unicodedata.normalize("NFC", texto))
     return "\n".join(textos), necesita_ocr
 
@@ -232,10 +257,16 @@ def clasificar(texto: str, nombre_archivo: str = "") -> tuple[TipoDocumento, flo
 def extraer_local(ruta: Path) -> Extraccion:
     """Lector local por patrones (sin internet). Respaldo de la IA."""
     ruta = Path(ruta)
-    texto, ocr = extraer_texto(ruta)
+    avisos_lector = []
+    if ruta.suffix.lower() == ".pdf":
+        texto, ocr = extraer_texto(ruta)
+    else:
+        from lectores_documentales import extraer_documento
+        lectura = extraer_documento(ruta)
+        texto, ocr, avisos_lector = lectura.texto, lectura.escaneado, lectura.avisos
     tipo, confianza = clasificar(texto, ruta.name)
     campos: dict[str, Any] = {}
-    avisos = [AVISO_OCR] if ocr else []
+    avisos = ([AVISO_OCR] if ocr else []) + avisos_lector
     titulares = []
     inquilinos = []
     referencia = _ref(texto)
@@ -470,7 +501,7 @@ def extraer_local(ruta: Path) -> Extraccion:
                                "tipo_persona": "Física", "pais": partes[2] if len(partes) > 2 else None})
     elif tipo == TipoDocumento.MODELO_210:
         renta = _dato(texto, "tipo de renta", "tipo renta")
-        m = re.search(r"\b(01|02|28)\b", renta or "")
+        m = re.search(r"\b(01|02|28|35)\b", renta or "")
         if m:
             campos["tipo_renta"] = m.group()
         for campo, etiquetas in {"base": ("base imponible", "base"), "cuota": ("cuota íntegra", "cuota"),
@@ -610,14 +641,17 @@ def archivar_pdf(ruta: Path, carpeta_cliente: Path, tipo: TipoDocumento, fecha: 
     carpeta_cliente = sanitize_safe_path(carpeta_cliente, Path(carpeta_cliente).absolute())
     soportes = subcarpeta_cliente(carpeta_cliente)
     soportes.mkdir(parents=True, exist_ok=True)
+    extension = ruta.suffix.lower()
+    if extension not in {".pdf", ".xlsx", ".xls", ".docx", ".csv"}:
+        raise ValueError("Formato documental no admitido.")
     huella, tamano = _hash(ruta), ruta.stat().st_size
     if huella_esperada is not None and huella != huella_esperada:
         raise ValueError("El PDF cambió después de revisarlo. Vuelve a seleccionarlo y comprueba sus datos.")
     # Mismo contenido renombrado también reutiliza el archivo, sin huérfanos.
-    for previo in sorted(soportes.glob("*.pdf")):
+    for previo in sorted(soportes.glob("*" )):
         # Los soportes nuevos llevan una huella en su nombre. No releer todos los PDFs
         # anteriores por cada factura; los nombres legados se siguen verificando.
-        marca = re.search(r"__h_([a-f0-9]{16})(?:_\d+)?\.pdf$", previo.name)
+        marca = re.search(r"__h_([a-f0-9]{16})(?:_\d+)?\.[^.]+$", previo.name)
         if marca and marca[1] != huella[:16]:
             continue
         try:
@@ -629,7 +663,7 @@ def archivar_pdf(ruta: Path, carpeta_cliente: Path, tipo: TipoDocumento, fecha: 
         if previo.stat().st_size == tamano and _hash(previo) == huella:
             return previo.relative_to(carpeta_cliente).as_posix(), huella
     # Deja margen para extensión y sufijo de colisión bajo MAX_PATH en Windows.
-    limite = min(76, 248 - len(str(soportes)) - 1 - len("_9999.pdf"))
+    limite = min(76, 248 - len(str(soportes)) - 1 - len("_9999" + extension))
     if limite < 20:
         raise ValueError("La ruta del expediente es demasiado larga: elige una carpeta base más corta.")
     texto_base = f"{(fecha or date.today()).isoformat()}_{tipo.value}_{componente_ruta(ruta.stem)}"
@@ -637,7 +671,7 @@ def archivar_pdf(ruta: Path, carpeta_cliente: Path, tipo: TipoDocumento, fecha: 
         base = componente_ruta(texto_base, limite - 20) + "__h_" + huella[:16]
     else:
         base = "__h_" + huella[:16]
-    destino = soportes / f"{base}.pdf"
+    destino = soportes / f"{base}{extension}"
     numero = 2
     while True:
         destino = sanitize_safe_path(soportes, destino)
@@ -645,7 +679,7 @@ def archivar_pdf(ruta: Path, carpeta_cliente: Path, tipo: TipoDocumento, fecha: 
             salida = destino.open("xb")  # exclusivo: no sigue enlaces ni pisa otra importación
             break
         except FileExistsError:
-            destino = soportes / f"{base}_{numero}.pdf"
+            destino = soportes / f"{base}_{numero}{extension}"
             numero += 1
     try:
         with salida, ruta.open("rb") as origen:
@@ -774,7 +808,7 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
         documento, nuevo = db.registrar_documento(cid, relativo, TIPOS_LEGIBLES[tipo], huella,
                                              Path(ruta_pdf).name, inmueble=inmueble, ejercicio=ej,
                                              fecha_documento=fecha_documento,
-                                             descripcion=ext.nombre_archivo,
+                                             descripcion=ext.nombre_archivo, comentario_guia=ext.comentario_guia,
                                              observaciones="; ".join(ext.avisos) or None)
     if not nuevo:
         previo = db.get("documentos", cid, documento)
@@ -833,6 +867,78 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
                 "origen": "pdf", "incluido_210": "Pendiente", "ruta": relativo,
             }, clave=f"BASURA|{inmueble}|{ej}", solo_si_vacio=("incluido_210",))
         afectados.add(ej)
+    elif tipo == TipoDocumento.RESOLUCION_ALQUILER:
+        inicio = a_fecha(c.get("fecha_inicio"))
+        fin = a_fecha(c.get("fecha_fin_real"))
+        candidatos = [fila for fila in db.listar("contratos", cid)
+                      if fila.get("inmueble") == inmueble and a_fecha(fila.get("fecha_inicio")) == inicio]
+        if not inmueble or not inicio or not fin or fin < inicio or len(candidatos) != 1:
+            raise ValueError("La resolución necesita inmueble, inicio y fin válidos de un contrato único.")
+        contrato = candidatos[0]["codigo"]
+        anterior_fin = a_fecha(candidatos[0].get("fecha_fin_real"))
+        if anterior_fin is not None and anterior_fin != fin:
+            raise ValueError("El contrato tiene otra fecha de fin corregida. Revisa el conflicto antes de cambiarla.")
+        db.upsert("contratos", cid, {"codigo": contrato, "fecha_fin_real": fin, "estado": "Rescindido"})
+        codigos["contrato"] = contrato
+        afectados.update(range(inicio.year, max(fin.year, ej) + 1))
+        mensajes.append("Resolución revisada: fecha de fin real aplicada al contrato identificado.")
+    elif tipo == TipoDocumento.RESUMEN_ALQUILER:
+        from ia_extractor import CAMPOS_REGISTRO
+        if ext.registros and not inmueble:
+            raise ValueError("Selecciona el inmueble para registrar los movimientos de la tabla.")
+        claves_filas = set()
+        for numero, registro in enumerate(ext.registros, 1):
+            tabla = registro.tabla
+            if set(registro.campos) - CAMPOS_REGISTRO[tabla]:
+                raise ValueError("La tabla contiene campos no permitidos.")
+            datos = _permitidos(tabla, registro.campos)
+            desde = a_fecha(datos.get("periodo_desde"))
+            hasta = a_fecha(datos.get("periodo_hasta"))
+            fecha_fila = a_fecha(datos.get("fecha_cobro") if tabla == "cobros" else datos.get("fecha"))
+            if not desde or not hasta or desde > hasta or desde.year != hasta.year:
+                raise ValueError("Cada fila necesita un periodo válido dentro del mismo ejercicio. Revísalo.")
+            ejercicio_fila = int(datos.get("ejercicio") or desde.year)
+            if ejercicio_fila != desde.year:
+                raise ValueError("El ejercicio de una fila no coincide con su periodo.")
+            importe = datos.get("importe_cobrado" if tabla == "cobros" else "total")
+            if importe is None:
+                raise ValueError("Cada movimiento necesita un importe explícito.")
+            datos.update(ejercicio=ejercicio_fila, inmueble=inmueble, ruta=relativo)
+            datos["observaciones"] = ((datos.get("observaciones") or "") + " · Fuente: " + registro.evidencia).strip(" ·")
+            if tabla == "cobros":
+                candidatos = [r for r in db.listar("contratos", cid) if r.get("inmueble") == inmueble
+                    and a_fecha(r.get("fecha_inicio")) and a_fecha(r["fecha_inicio"]) <= hasta
+                    and (a_fecha(r.get("fecha_fin_real") or r.get("fecha_fin_prevista")) or date.max) >= desde]
+                if len(candidatos) != 1:
+                    raise ValueError("No hay un contrato único para este cobro. Revisa contrato y periodo.")
+                contrato_fila = candidatos[0]["codigo"]
+                datos["contrato"] = contrato_fila
+                # Una fila mensual ya generada admite el cobrado; jamás cambiar su renta devengada.
+                clave = (f"COB|{contrato_fila}|{desde.year}-{desde.month:02d}" if desde.day == 1
+                         and hasta == date(desde.year, desde.month, calendar.monthrange(desde.year, desde.month)[1])
+                         else f"DOCFILA|{documento}|{numero}")
+                previo = db.get_por_clave("cobros", cid, clave)
+                if previo and previo.get("importe_cobrado") is not None and previo.get("ruta") != relativo:
+                    raise ValueError("Ya hay un cobro para ese periodo con otro soporte. Revisa la diferencia antes de sustituirlo.")
+            else:
+                if datos.get("n_factura"):
+                    anteriores = db.con.execute("SELECT * FROM gastos WHERE cliente_id=? AND n_factura=?",
+                                               (cid, datos["n_factura"])).fetchall()
+                    for anterior in anteriores:
+                        previo_gasto = dict(anterior)
+                        proveedor = datos.get("nif_proveedor") or datos.get("proveedor")
+                        otro_proveedor = previo_gasto.get("nif_proveedor") or previo_gasto.get("proveedor")
+                        if (not proveedor or not otro_proveedor or _normal(proveedor) == _normal(otro_proveedor)):
+                            raise ValueError("Esa factura ya consta en otro registro. Revisa los soportes antes de duplicarla.")
+                datos["categoria"] = categoria_gasto(datos.get("categoria"))
+                datos.update(origen="documento", incluido_210="Pendiente")
+                clave = f"DOCFILA|{documento}|{numero}"
+            if (tabla, clave) in claves_filas:
+                raise ValueError("Hay varios cobros para el mismo mes en este documento. Revisa el desglose antes de guardarlos.")
+            claves_filas.add((tabla, clave))
+            codigos[f"fila_{numero}"] = db.upsert(tabla, cid, datos, clave=clave)
+            afectados.add(ejercicio_fila)
+        mensajes.append("Movimientos revisados: los cobros no sustituyen la renta contractual ni una declaración presentada.")
     elif tipo == TipoDocumento.CONTRATO_ALQUILER:
         if inmueble and c.get("fecha_inicio"):
             inicio = a_fecha(c["fecha_inicio"])
@@ -855,10 +961,10 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
     elif tipo == TipoDocumento.MODELO_210:
         renta = str(c.get("tipo_renta") or "").zfill(2)
         periodo = str(c.get("periodo") or "0A")
-        if inmueble and renta in ("01", "02", "28"):
+        if inmueble and renta in ("01", "02", "28", "35"):
             datos = {k: c[k] for k in ("base", "cuota", "pagado", "nrc", "fecha_presentacion") if k in c}
             datos.update(ejercicio=ej, inmueble=inmueble, ruta=relativo, estado="Presentado")
-            if renta == "01":
+            if renta in ("01", "35"):
                 # La calculadora usa 'Anual'; el documento puede denominarlo '0A'.
                 periodo = "Anual" if periodo == "0A" else periodo
                 datos["periodo"] = periodo
@@ -877,7 +983,7 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
                 }, clave=f"VENTA|{inmueble}")
             afectados.add(ej)
         else:
-            mensajes.append("Modelo 210 sin inmueble identificado o tipo de renta 01/02/28: revisa los campos.")
+            mensajes.append("Modelo 210 sin inmueble identificado o tipo de renta 01/02/28/35: revisa los campos.")
     elif tipo == TipoDocumento.CERTIFICADO_RESIDENCIA:
         from tax_calculator import grupo_territorio
 
@@ -958,7 +1064,7 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
                                ejercicios_afectados=afectados, codigos=codigos, mensajes=mensajes)
 
 
-def extraer(ruta: Path, ajustes=None) -> Extraccion:
+def extraer(ruta: Path, ajustes=None, comentario_guia: str = "") -> Extraccion:
     """IA (Claude) si está activada y hay clave; si no o si falla, lector local.
 
     Con IA, los campos que la IA no encontró pero el lector local sí (mismo tipo) se añaden como respaldo.
@@ -966,11 +1072,20 @@ def extraer(ruta: Path, ajustes=None) -> Extraccion:
     import ia_extractor
 
     ruta = Path(ruta)
+    if not isinstance(comentario_guia, str) or len(comentario_guia) > 4000:
+        raise ValueError("El comentario debe tener como máximo 4.000 caracteres.")
+    from lectores_documentales import FORMATOS
+    if ruta.suffix.lower() not in FORMATOS:
+        raise ValueError("Formato documental no admitido.")
     local = extraer_local(ruta)
+    local.comentario_guia = comentario_guia
+    if ruta.suffix.lower() != ".pdf":
+        local.avisos.append("Tabla documental: confirma la interpretación con IA o completa los datos manualmente; no se infieren importes de columnas ambiguas.")
     if not ia_extractor.disponible(ajustes):
         return local
     try:
-        ext = ia_extractor.extraer(ruta, ajustes)
+        ext = ia_extractor.extraer(ruta, ajustes, **({"comentario_guia": comentario_guia} if comentario_guia else {}))
+        ext.comentario_guia = comentario_guia
     except ia_extractor.ErrorIA as exc:
         local.avisos.insert(0, f"Lectura con IA no disponible ({exc}). Se usó el lector local: revisa los campos.")
         return local
@@ -990,7 +1105,7 @@ def extraer(ruta: Path, ajustes=None) -> Extraccion:
     return ext
 
 
-def procesar_pdf(db, cid, ruta_pdf, confirmar=None, inmueble_destino=None, ejercicio=None) -> ResultadoAplicacion:
+def procesar_pdf(db, cid, ruta_pdf, confirmar=None, inmueble_destino=None, ejercicio=None, comentario_guia: str = "") -> ResultadoAplicacion:
     """Extrae, permite revisión y aplica. El controlador importa Excel antes.
 
     No recalcula ni exporta: el controlador coordina esos pasos según arquitectura.
@@ -998,11 +1113,12 @@ def procesar_pdf(db, cid, ruta_pdf, confirmar=None, inmueble_destino=None, ejerc
     import ia_extractor
 
     huella_revisada = _hash(Path(ruta_pdf))
-    ext = extraer(Path(ruta_pdf), ia_extractor.AjustesIA.desde_db(db))
+    ext = extraer(Path(ruta_pdf), ia_extractor.AjustesIA.desde_db(db), **({"comentario_guia": comentario_guia} if comentario_guia else {}))
     if confirmar is not None:
         ext = confirmar(ext)
         if not isinstance(ext, Extraccion):
             raise TypeError("confirmar debe devolver una Extraccion")
+    ext.comentario_guia = comentario_guia
     if _hash(Path(ruta_pdf)) != huella_revisada:
         raise ValueError("El PDF cambió durante la revisión. Selecciónalo de nuevo para comprobar sus datos.")
     return aplicar(db, cid, ext, Path(ruta_pdf), inmueble_destino, ejercicio, huella_esperada=huella_revisada)

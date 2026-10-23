@@ -472,7 +472,7 @@ class Controlador:
             if plan['accion'] == 'cambiar_ejercicio':
                 vista = documentos.previsualizar(self.db, cid, plan['codigo'], 'cambiar_ejercicio', plan['ejercicio_destino'])
                 documentos._exigir(vista)
-                nombre = f"{plan['ejercicio_destino']}_{plan['codigo']}.pdf"
+                nombre = f"{plan['ejercicio_destino']}_{plan['codigo']}{Path(doc['ruta']).suffix.lower()}"
             else:
                 vista = {'advertencias': [], 'ejercicio_origen': doc.get('ejercicio')}
                 nombre = plan['nombre']
@@ -490,7 +490,8 @@ class Controlador:
         codigo = plan['codigo']
         with self._lock:
             self._preparar_documento(cid, codigo, propuesta.version)
-            nombre = (f"{plan['ejercicio_destino']}_{codigo}.pdf" if plan['accion'] == 'cambiar_ejercicio' else plan['nombre'])
+            nombre = (f"{plan['ejercicio_destino']}_{codigo}{Path(self.db.get('documentos', cid, codigo)['ruta']).suffix.lower()}"
+                      if plan['accion'] == 'cambiar_ejercicio' else plan['nombre'])
             with gestion_archivos.proteger(self.db, cid, codigo, nombre) as copias, self.db.transaccion():
                 afectados = set()
                 if plan['accion'] == 'cambiar_ejercicio':
@@ -520,7 +521,7 @@ class Controlador:
                 raise ValueError("Has elegido el mismo PDF. El documento anterior sigue activo.")
             cliente = self.db.get_cliente(cid)
             soportes = database.subcarpeta_cliente(Path(cliente["carpeta"]))
-            anteriores = set(soportes.glob("*.pdf"))
+            anteriores = set(soportes.glob("*"))
             try:
                 with documentos.proteger_movimiento(self.db, cid, codigo, True) as copias, self.db.transaccion():
                     with documentos.conservar_correcciones(self.db, cid, codigo):
@@ -532,7 +533,7 @@ class Controlador:
                     calculo = self._recalcular_bd(cid, set(afectados) | set(resultado.ejercicios_afectados) | {int(ejercicio_activo)}, int(ejercicio_activo))
             except BaseException:
                 # Solo retirar copias nuevas creadas por esta importación fallida y verificadas por contenido.
-                for archivo in set(soportes.glob("*.pdf")) - anteriores:
+                for archivo in set(soportes.glob("*")) - anteriores:
                     relativo = archivo.relative_to(Path(cliente["carpeta"])).as_posix()
                     registrado = self.db.con.execute("SELECT 1 FROM documentos WHERE cliente_id=? AND ruta=?", (cid, relativo)).fetchone()
                     if not registrado and archivo.resolve().parent == soportes and pdf_processor._hash(archivo) == huella_nueva:
@@ -544,7 +545,7 @@ class Controlador:
         return pdf_processor.extraer(Path(ruta_pdf), self.ajustes_ia())
 
     def procesar_pdf(self, cid: int, ruta_pdf: Path | str, ejercicio: int, confirmar: ConfirmarFn | None = None,
-                     inmueble_destino: str | None = None) -> dict:
+                     inmueble_destino: str | None = None, comentario_guia: str = "") -> dict:
         with self._lock:
             ej = int(ejercicio)
             cliente = self.db.get_cliente(cid)
@@ -553,7 +554,8 @@ class Controlador:
             self.db.verificar_cartera(cliente)  # nunca se archiva un soporte fuera de la cartera del cliente
             self._importar(cid)
             resultado = pdf_processor.procesar_pdf(self.db, cid, Path(ruta_pdf), confirmar=confirmar,
-                                                   inmueble_destino=inmueble_destino, ejercicio=ej)
+                                                   inmueble_destino=inmueble_destino, ejercicio=ej,
+                                                   **({"comentario_guia": comentario_guia} if comentario_guia else {}))
             return {"resultado": resultado,
                     **self._recalcular_y_exportar(cid, set(resultado.ejercicios_afectados) | {ej}, ej)}
 
@@ -563,7 +565,8 @@ class Controlador:
             existentes = {int(f["ejercicio"]) for f in self.db.listar("m210_alquiler", cid) if f.get("ejercicio")}
             return self._recalcular_y_exportar(cid, existentes | {int(ejercicio)}, int(ejercicio))
 
-    def procesar_bandeja(self, cid: int, ejercicio: int, confirmar: ConfirmarFn | None = None) -> list[dict]:
+    def procesar_bandeja(self, cid: int, ejercicio: int, confirmar: ConfirmarFn | None = None,
+                         comentario_guia: str = "", rutas: list[Path] | None = None) -> list[dict]:
         with self._lock:
             cliente = self.db.get_cliente(cid)
             if cliente is None:
@@ -571,11 +574,14 @@ class Controlador:
             bandeja = database.subcarpeta_cliente(Path(cliente["carpeta"]), database.SUBCARPETA_ENTRADA)
             bandeja.mkdir(parents=True, exist_ok=True)
             resultados: list[dict] = []
+            elegidas = None if rutas is None else {Path(r).absolute() for r in rutas}
             for pdf_path in sorted(p for p in bandeja.iterdir() if p.is_file()
-                    and p.suffix.lower() == ".pdf" and p.resolve().parent == bandeja):
+                    and p.suffix.lower() in {".pdf", ".xlsx", ".xls", ".docx", ".csv"} and p.resolve().parent == bandeja
+                    and (elegidas is None or p.absolute() in elegidas)):
                 error_msg: Optional[str] = None
                 try:
-                    res = self.procesar_pdf(cid, pdf_path, ejercicio, confirmar=confirmar)
+                    res = self.procesar_pdf(cid, pdf_path, ejercicio, confirmar=confirmar,
+                                            **({"comentario_guia": comentario_guia} if comentario_guia else {}))
                     pdf_path.unlink(missing_ok=True)
                     resultados.append({**res, "archivo": pdf_path.name, "ok": True, "error": None})
                 except CanceladoPorUsuario:

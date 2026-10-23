@@ -112,7 +112,7 @@ def _link(cell, valor, carpeta_cliente: Path | None = None) -> None:
     permitido = (not ruta.is_absolute() and not PureWindowsPath(relativo).drive
                  and ".." not in ruta.parts and len(ruta.parts) == 2
                  and ruta.parts[0] in {"Soportes_PDF", ".Papelera_Documentos"}
-                 and ruta.suffix.lower() == ".pdf")
+                 and ruta.suffix.lower() in {".pdf", ".xlsx", ".xls", ".docx", ".csv"})
     if permitido:
         try:
             sanitize_safe_path(carpeta_cliente or Path.cwd(), relativo)

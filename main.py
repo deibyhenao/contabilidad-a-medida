@@ -9,6 +9,7 @@ bandeja ``_ARRASTRA_AQUI``. Todo el trabajo pesado corre fuera del hilo de la in
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import re
 import sys
@@ -21,6 +22,7 @@ from typing import Any, Callable, Optional
 import flet as ft
 
 import ui_estilo as ui
+import ui_adjuntos as adj
 from concurrencia import ejecutar_en_ui
 from version import VERSION
 from app_paths import AlmacenNoDisponible
@@ -79,6 +81,16 @@ SECCIONES_RES = ("Resumen", "Pendientes", "Emitidas", "Recibidas", "IVA 303", "I
 def _abrir_en_sistema(ruta: Path) -> None:
     if hasattr(os, "startfile") and Path(ruta).exists():
         os.startfile(str(ruta))  # type: ignore[attr-defined]
+
+
+def _admite_comentario(fn: Callable) -> bool:
+    """True si ``procesar_pdf`` acepta ``comentario_guia`` (o **kwargs). Un controlador antiguo o un doble de
+    test sin el parámetro sigue funcionando sin comentario."""
+    try:
+        parametros = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(x.name == "comentario_guia" or x.kind is inspect.Parameter.VAR_KEYWORD for x in parametros)
 
 
 def _texto_valor(col: database.Columna, valor: Any) -> str:
@@ -760,17 +772,17 @@ class App:
                 ft.Container(ft.Icon(I.UPLOAD_FILE, size=22, color=p.acento), width=40, height=40, border_radius=10,
                              bgcolor=p.acento_suave, alignment=ft.Alignment.CENTER),
                 ft.Column([
-                    ui.cuerpo("Añade facturas, el 036/037 o modelos presentados en PDF"
-                              if self._es_residente() else "Añade escrituras, IBI, contratos o modelos en PDF",
+                    ui.cuerpo("Añade facturas, el 036/037 o modelos presentados (PDF, Excel, Word o CSV)"
+                              if self._es_residente() else "Añade escrituras, IBI, contratos o modelos (PDF, Excel, Word o CSV)",
                               p, peso=ft.FontWeight.W_600),
                     ft.Row([punto, ui.leyenda(ia_texto, p)], spacing=6),
                 ], spacing=2, expand=True, tight=True),
-                ui.boton("Elegir PDFs", self.elegir_pdfs, p, I.ADD),
+                ui.boton("Elegir documentos", self.elegir_pdfs, p, I.ADD),
                 ui.boton("Abrir bandeja", self._abrir_bandeja, p, I.INBOX_OUTLINED, tipo="secundario"),
             ], spacing=14, vertical_alignment=ft.CrossAxisAlignment.CENTER),
             padding=ft.Padding.symmetric(horizontal=14, vertical=10), border_radius=14,
-            tooltip="Haz clic para elegirlos o arrástralos a la carpeta _ARRASTRA_AQUI del cliente. "
-                    "Se leen, se archivan y el Excel se actualiza solo.",
+            tooltip="Haz clic para elegir hasta 30 documentos y revisarlos antes de procesarlos. Para arrastrar PDF "
+                    "desde el Explorador, suéltalos en la carpeta _ARRASTRA_AQUI del cliente (Abrir bandeja).",
         )
         return ui.pulsable(zona, self.elegir_pdfs,
                            {"bgcolor": p.tarjeta, "border": ft.Border.all(1, p.separador)},
@@ -1356,6 +1368,7 @@ class App:
                         ft.Column([ui.cuerpo(d.get("tipo") or "Documento", p, peso=ft.FontWeight.W_600),
                                    ui.leyenda(detalle, p)], spacing=3, expand=True)], spacing=12),
                 *([ui.leyenda(d["descripcion"], p)] if d.get("descripcion") else []),
+                *([ui.leyenda("Comentario para la IA: " + d["comentario_guia"], p)] if d.get("comentario_guia") else []),
                 ft.Row(derecha, wrap=True, spacing=4, run_spacing=4),
             ], spacing=8), p, padding=16))
         selector = ft.Row([
@@ -1408,7 +1421,7 @@ class App:
         if self.ocupada():
             return
         archivos = await self.file_picker.pick_files(dialog_title="Elegir PDF de sustitución", allow_multiple=False,
-                                                     file_type=ft.FilePickerFileType.CUSTOM, allowed_extensions=["pdf"])
+                                                     file_type=ft.FilePickerFileType.CUSTOM, allowed_extensions=list(adj.EXTENSIONES))
         rutas = [Path(f.path) for f in (archivos or []) if f.path]
         if rutas and (cid, ej) == (self.cid, self.ejercicio):
             self.dialogo_documento(codigo, "sustituir", cid=cid, ejercicio=ej, ruta_pdf=rutas[0])
@@ -1976,34 +1989,127 @@ class App:
 
     # ================================================================== acciones
     async def elegir_pdfs(self, _e=None) -> None:
+        """Elige documentos (PDF, Excel, Word o CSV) y abre «Revisar documentos». El nombre se conserva por
+        compatibilidad con atajos y tests."""
         if not self.cid:
             self.avisar("Selecciona o crea un cliente primero.", True)
             return
+        if self.ocupada():
+            return
         cid, ej = self.cid, self.ejercicio
-        archivos = await self.file_picker.pick_files(dialog_title="Elegir PDFs", allow_multiple=True,
-                                                     file_type=ft.FilePickerFileType.CUSTOM, allowed_extensions=["pdf"])
-        rutas = [Path(f.path) for f in (archivos or []) if f.path]
-        if rutas and (cid, ej) == (self.cid, self.ejercicio):
-            self.procesar_pdfs(rutas)
-        elif rutas:
-            self.avisar("Has cambiado de expediente o ejercicio. Vuelve a elegir los PDFs en el destino correcto.")
+        archivos = await self.file_picker.pick_files(dialog_title="Elegir documentos", allow_multiple=True,
+                                                     file_type=ft.FilePickerFileType.CUSTOM,
+                                                     allowed_extensions=list(adj.EXTENSIONES))
+        if not archivos:
+            return
+        if (cid, ej) != (self.cid, self.ejercicio):
+            self.avisar("Has cambiado de expediente o ejercicio. Vuelve a elegir los documentos en el destino correcto.")
+            return
+        self.revisar_documentos(archivos, cid, ej)
 
-    def procesar_pdfs(self, rutas: list[Path]) -> None:
+    def revisar_documentos(self, archivos, cid: Optional[int] = None,
+                           ejercicio: Optional[int] = None) -> Optional[adj.RevisionDocumentos]:
+        """Diálogo previo al procesado: lista, destino fijo y comentario opcional para la IA. Cancelar no importa nada."""
+        if getattr(self, "_revision_abierta", False):
+            self.avisar("Termina o cancela la revisión de documentos abierta.")
+            return None
+        cid = self.cid if cid is None else cid
+        ej = self.ejercicio if ejercicio is None else ejercicio
+        lote = adj.preparar_lote(archivos)
+        if not lote.adjuntos:
+            self.avisar(" ".join(lote.avisos) or "No hay documentos que procesar.", True)
+            return None
+        cliente = self.ctrl.lector.get_cliente(cid) or {}
+        nombre = " ".join(x for x in (cliente.get("nombre"), cliente.get("apellidos")) if x)
+
+        def vigente() -> bool:
+            return not self.cerrando and (self.cid, self.ejercicio) == (cid, ej)
+
+        def procesar(rutas: list[Path], comentario: str) -> Optional[str]:
+            if not vigente():
+                return "El expediente o el ejercicio ha cambiado. Cancela y vuelve a elegir los documentos."
+            if comentario and not _admite_comentario(self.ctrl.procesar_pdf):
+                return "Esta versión no puede enviar comentarios a la IA. Borra el comentario para continuar."
+            if self._turno.locked():
+                return "Hay una tarea en curso. Espera a que termine y pulsa Procesar de nuevo."
+            self._revision_abierta = False
+            self.page.pop_dialog()
+            self.procesar_pdfs(rutas, comentario_guia=comentario)
+            return None
+
+        def cancelar_revision(_e=None):
+            self._revision_abierta = False
+            self.cerrar_dialogo(_e)
+        self._revision_abierta = True
+        revision = adj.RevisionDocumentos(self.p, lote.adjuntos, adj.Destino(nombre, cliente.get("nif") or "", ej),
+                                          procesar, cancelar_revision, destino_vigente=vigente,
+                                          refrescar=self.page.update, avisos=lote.avisos)
+        dlg = self._dialogo(adj.RevisionDocumentos.TITULO, revision.contenido, revision.acciones, ancho=640,
+                            icono=I.FACT_CHECK_OUTLINED)
+        if dlg is not None:
+            def al_cerrar_revision(e):
+                self._revision_abierta = False
+                revision.descartar(e)
+            dlg.on_dismiss = al_cerrar_revision
+        else:
+            self._revision_abierta = False
+        return revision
+
+    def procesar_pdfs(self, rutas: list[Path], comentario_guia: str = "") -> None:
+        """Procesa el lote fuera del hilo UI (PDF, Excel, Word o CSV; el nombre se conserva por compatibilidad).
+        Un fallo en un archivo se avisa y el lote sigue; nunca se anuncia como archivado lo que no lo está."""
         cid, ej = self.cid, self.ejercicio
+        rutas = [Path(r) for r in rutas]
+        comentario_guia = adj.normalizar_comentario(comentario_guia)
+        admite = _admite_comentario(self.ctrl.procesar_pdf)
+        if comentario_guia and not admite:
+            self.avisar("Esta versión no puede enviar comentarios a la IA. No se ha procesado nada.", True)
+            return
+        extra = {"comentario_guia": comentario_guia} if admite else {}
+
+        def en_ui(fn: Callable[[], None]) -> None:
+            ejecutar_en_ui(self.page, lambda: fn() if not self.cerrando else None)
 
         def trabajo():
             res: dict = {}
+            fallos: list[str] = []
+            total = len(rutas)
             for i, ruta in enumerate(rutas, 1):
-                self.set_ocupado(True, f"Leyendo {ruta.name} ({i}/{len(rutas)})…")
+                if self.cerrando:
+                    break
+                if (self.cid, self.ejercicio) != (cid, ej):
+                    en_ui(lambda n=total-i+1: self.avisar(f"Lote detenido por cambio de expediente. Quedan {n} documentos sin procesar."))
+                    break
+                en_ui(lambda t=f"Leyendo {ruta.name} ({i}/{total})…": self.set_ocupado(True, t))
                 try:
-                    res = self.ctrl.procesar_pdf(cid, ruta, ej, confirmar=lambda ext: self.revisar_extraccion(ext, cid, ej))
-                    r = res["resultado"]
-                    self.avisar(f"Ya estaba archivado como {r.documento}." if r.duplicado
-                                else f"{ruta.name} archivado como {r.documento}. Excel actualizado.")
+                    actual = self.ctrl.procesar_pdf(cid, ruta, ej, confirmar=lambda ext: self.revisar_extraccion(ext, cid, ej),
+                                                    **extra)
                 except CanceladoPorUsuario:
-                    self.avisar(f"Descartado: {ruta.name}")
+                    en_ui(lambda n=ruta.name: self.avisar(f"Descartado: {n}"))
+                    continue
+                except excel_generator.ExcelConflictoImportacion:
+                    raise  # afecta a todo el Excel del cliente: se detiene el lote y se muestra la revisión
+                except Exception as exc:
+                    fallos.append(ruta.name)
+                    en_ui(lambda n=ruta.name, m=str(exc) or exc.__class__.__name__:
+                          self.avisar(f"No se pudo procesar {n}: {m}", True))
+                    continue
+                r = (actual or {}).get("resultado")
+                if r is None:
+                    fallos.append(ruta.name)
+                    en_ui(lambda n=ruta.name: self.avisar(f"No se pudo procesar {n}: no se obtuvo ningún resultado.", True))
+                    continue
+                res = actual
+                en_ui(lambda n=ruta.name, r=r: self.avisar(
+                    f"Ya estaba archivado como {r.documento}." if getattr(r, "duplicado", False)
+                    else f"{n} archivado como {r.documento}. Excel actualizado."))
+            if fallos and total > 1:
+                nombres = ", ".join(fallos[:3]) + (f" y {len(fallos) - 3} más" if len(fallos) > 3 else "")
+                resto = " El resto del lote siguió adelante." if len(fallos) < total else ""
+                en_ui(lambda: self.avisar(f"{len(fallos)} de {total} documentos no se pudieron procesar: {nombres}."
+                                          + resto, True))
             return res
-        self.en_segundo_plano("Procesando PDFs…", trabajo)
+        self.en_segundo_plano("Procesando documentos…", trabajo)
 
     def sincronizar(self, _e=None) -> None:
         self.en_segundo_plano("Sincronizando Excel…", lambda cid=self.cid, ej=self.ejercicio: self.ctrl.sincronizar(cid, ej),
@@ -2056,6 +2162,11 @@ class App:
             ui.cuerpo(identidad or "Cliente seleccionado", p, peso=ft.FontWeight.W_600),
             ui.leyenda(f"NIF/NIE: {cliente_revision.get('nif') or 'sin indicar'} · Ejercicio abierto: {ej_abierto}", p),
         ], spacing=4, tight=True), p, padding=12)
+        comentario = str(getattr(ext, "comentario_guia", "") or "").strip()  # lo adjunta el backend si lo usó
+        comentario_revision = [ft.Container(ft.Column([
+            ui.leyenda("TU COMENTARIO PARA LA IA", p),
+            ui.cuerpo(comentario, p, p.texto2, 13, max_lines=4),
+        ], spacing=4, tight=True), bgcolor=p.campo, border_radius=12, padding=12)] if comentario else []
         ejercicio_detectado = ext.campos.get("ejercicio")
         if ext.tipo == pdf_processor.TipoDocumento.FACTURA_GASTO and not ejercicio_detectado and ext.campos.get("fecha"):
             try:
@@ -2161,6 +2272,9 @@ class App:
                 except (ValueError, TypeError):
                     mostrar_error(f"Revisa «{ETIQUETAS_EXTRACCION.get(k, k.replace('_', ' ').capitalize())}»: formato no válido.", tf)
                     return
+            if ext.registros and not revisar_movimientos.value:
+                mostrar_error("Revisa y confirma los movimientos propuestos antes de guardarlos.")
+                return
             tipo_elegido = pdf_processor.TipoDocumento(dd_tipo.value)
             if tipo_elegido == pdf_processor.TipoDocumento.FACTURA_GASTO and nuevos.get("fecha"):
                 if a_fecha(nuevos["fecha"]).year != destino:
@@ -2188,8 +2302,35 @@ class App:
                 self.page.pop_dialog()
             evento.set()
 
+        movimientos = []
+        revisar_movimientos = ft.Checkbox(label="He revisado los movimientos propuestos", value=False,
+                                          visible=bool(ext.registros), active_color=p.acento)
+        if ext.registros:
+            for numero, registro in enumerate(ext.registros, 1):
+                datos_fila = registro.campos
+                importe = datos_fila.get("importe_cobrado") if registro.tabla == "cobros" else datos_fila.get("total")
+                def fecha_visible(valor):
+                    try:
+                        return a_fecha(valor).strftime("%d/%m/%Y") if valor else "Sin indicar"
+                    except (ValueError, TypeError):
+                        return str(valor)
+                texto_fila = (f"{numero}. {'Cobro' if registro.tabla == 'cobros' else 'Gasto'} · "
+                              f"{fecha_visible(datos_fila.get('periodo_desde'))} — "
+                              f"{fecha_visible(datos_fila.get('periodo_hasta'))} · {ui.eur(importe) if importe is not None else 'Importe sin indicar'}")
+                movimientos.append(ft.Column([ui.cuerpo(texto_fila, p), ui.leyenda(registro.evidencia, p),
+                    *[ui.leyenda(f"{ETIQUETAS_EXTRACCION.get(campo, campo.replace('_', ' ').capitalize())}: {fecha_visible(valor) if campo in {'fecha', 'fecha_cobro'} else ui.eur(valor) if campo in {'base', 'iva'} else valor}", p)
+                      for campo, valor in datos_fila.items()
+                      if valor not in (None, "") and campo not in {"periodo_desde", "periodo_hasta", "importe_cobrado", "total"}]], spacing=2))
+        bloque_movimientos = ft.Column([
+            ui.leyenda(f"{len(ext.registros)} MOVIMIENTOS PROPUESTOS", p),
+            ui.leyenda("Comprueba importes, periodos y fuentes. Si hay errores, descarta y ajusta el comentario; "
+                       "también podrás corregir las filas guardadas en Cobros o Gastos.", p),
+            ft.Column(movimientos, spacing=10),
+            revisar_movimientos], visible=bool(ext.registros), spacing=8)
         contenido = ft.Column([
             destino_revision,
+            *([bloque_movimientos] if ext.registros else []),
+            *comentario_revision,
             ft.Row([motor, ui.leyenda(f"Confianza {round(ext.confianza * 100)} %", p, conf_color)], spacing=10),
             *avisos,
             ft.Row([dd_tipo, dd_inm], spacing=10),
@@ -2639,17 +2780,69 @@ class App:
             ancho=520, icono=I.TUNE)
 
     # ================================================================== bandeja vigilada
+    def _revisar_lote_bandeja(self, cid: int, ej: int, rutas: list[Path]):
+        """El vigilante espera la nota del asesor ANTES de extraer o enviar documentos."""
+        evento = threading.Event()
+        decision = {"rutas": None, "comentario": "", "cancelado": False, "abierta": False}
+        self._evento_dialogo = evento
+        def mostrar():
+            if self.cerrando or (self.cid, self.ejercicio) != (cid, ej) or getattr(self, "_revision_abierta", False):
+                evento.set()
+                return
+            self._revision_abierta = True
+            decision["abierta"] = True
+            cliente = self.ctrl.lector.get_cliente(cid) or {}
+            nombre = " ".join(str(cliente.get(k) or "") for k in ("nombre", "apellidos")).strip()
+            lote = adj.preparar_lote(rutas)
+            def aceptar(elegidas, comentario):
+                if self.cerrando or (self.cid, self.ejercicio) != (cid, ej):
+                    return "El expediente cambió. Cancela y selecciona el destino correcto."
+                decision.update(rutas=elegidas, comentario=comentario)
+                self.page.pop_dialog()
+                evento.set()
+            def cancelar(_e=None):
+                decision["cancelado"] = True
+                self.page.pop_dialog()
+                evento.set()
+            revision = adj.RevisionDocumentos(self.p, lote.adjuntos, adj.Destino(nombre, cliente.get("nif") or "", ej),
+                aceptar, cancelar, destino_vigente=lambda: not self.cerrando and (self.cid, self.ejercicio) == (cid, ej),
+                refrescar=self.page.update, avisos=lote.avisos + [
+                    "Documentos de la bandeja. Si cancelas, quedan aquí; podrás elegirlos después con Elegir documentos."])
+            dlg = self._dialogo("Revisar documentos de la bandeja", revision.contenido, revision.acciones,
+                                ancho=640, icono=I.FACT_CHECK_OUTLINED)
+            if dlg is not None:
+                def descartado(_e):
+                    if decision["rutas"] is None:
+                        decision["cancelado"] = True
+                    evento.set()
+                dlg.on_dismiss = descartado
+            else:
+                evento.set()
+        try:
+            ejecutar_en_ui(self.page, mostrar)
+            while not self.cerrando and not evento.wait(.25):
+                pass
+            return decision if not self.cerrando else None
+        finally:
+            if decision["abierta"]:
+                self._revision_abierta = False
+            if self._evento_dialogo is evento:
+                self._evento_dialogo = None
+
     def _vigilante_bandeja(self) -> None:
         while not self.cerrando:
             time.sleep(2.0)
             cid, ej = self.cid, self.ejercicio
-            if self.cerrando or not cid or self._turno.locked():
+            if self.cerrando or not cid or self._turno.locked() or getattr(self, "_revision_abierta", False):
                 continue
             try:
                 cliente = self.ctrl.lector.get_cliente(cid)
                 bandeja = database.subcarpeta_cliente(Path(cliente["carpeta"]), database.SUBCARPETA_ENTRADA) if cliente else None
-                hay_pdfs = bandeja and bandeja.is_dir() and any(
-                    x.suffix.lower() == ".pdf" for x in bandeja.iterdir() if x.is_file())
+                pendientes = sorted((x for x in bandeja.iterdir() if x.is_file() and not x.is_symlink()
+                    and x.suffix.lower().lstrip(".") in adj.EXTENSIONES and x.resolve().parent == bandeja), key=lambda x:x.name) if bandeja and bandeja.is_dir() else []
+                firma = tuple((x.name, x.stat().st_size, x.stat().st_mtime_ns) for x in pendientes)
+                pospuestas = getattr(self, "_bandejas_pospuestas", {})
+                hay_pdfs = bool(pendientes) and pospuestas.get(cid) != firma
             except Exception:
                 continue
             if not hay_pdfs or not self._turno.acquire(blocking=False):
@@ -2677,10 +2870,20 @@ class App:
                     self._pintar_principal()
 
             try:
-                ejecutar_en_ui(self.page, lambda: self.set_ocupado(True, "Procesando PDFs de la bandeja…")
+                seleccion = self._revisar_lote_bandeja(cid, ej, pendientes[:adj.MAX_ARCHIVOS])
+                if not seleccion or not seleccion["rutas"]:
+                    if seleccion and seleccion["cancelado"]:
+                        self._bandejas_pospuestas = {**pospuestas, cid: firma}
+                    continue
+                ejecutar_en_ui(self.page, lambda: self.set_ocupado(True, "Procesando documentos de la bandeja…")
                                if not self.cerrando else None)
-                for r in self.ctrl.procesar_bandeja(cid, ej, confirmar=lambda ext: self.revisar_extraccion(ext, cid, ej)):
+                for r in self.ctrl.procesar_bandeja(cid, ej, confirmar=lambda ext: self.revisar_extraccion(ext, cid, ej),
+                                                   comentario_guia=seleccion["comentario"], rutas=seleccion["rutas"]):
                     ejecutar_en_ui(self.page, lambda resultado=r: mostrar_resultado(resultado))
+                retiradas = set(pendientes[:adj.MAX_ARCHIVOS]) - set(seleccion["rutas"])
+                if retiradas:
+                    firma_retiradas = tuple((x.name,x.stat().st_size,x.stat().st_mtime_ns) for x in sorted(retiradas) if x.is_file())
+                    self._bandejas_pospuestas = {**pospuestas, cid: firma_retiradas}
             except Exception as exc:
                 mensaje = f"Bandeja: {exc}"
                 ejecutar_en_ui(self.page, lambda texto=mensaje: self.avisar(texto, True) if not self.cerrando else None)

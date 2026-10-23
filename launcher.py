@@ -30,6 +30,15 @@ def diagnostico(salida: Path) -> None:
         import flet
         import ui_actualizaciones
         import updater
+        import ui_adjuntos
+        import lectores_documentales
+        import docx
+        import xlrd
+        prueba_word = raiz / "prueba.docx"
+        documento_word = docx.Document()
+        documento_word.add_paragraph("Prueba de lectura local sin datos reales")
+        documento_word.save(prueba_word)
+        assert "Prueba de lectura" in lectores_documentales.extraer_documento(prueba_word).texto
         from version import VERSION
         from openpyxl import load_workbook
         assert app_paths.carpeta_datos() == datos

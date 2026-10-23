@@ -236,13 +236,17 @@ class ValorPatrimonial:
 
 def valor_patrimonial(inm: dict, cat: Optional[dict]) -> ValorPatrimonial:
     """Regla de los 3 valores (art. 10 Ley 19/1991): el MAYOR de
-    1) valor catastral, 2) precio de escritura de compra, 3) valor de referencia / comprobado por la Administración."""
+    1) valor catastral, 2) valor de adquisición con gastos inherentes, 3) valor de referencia / comprobado por la Administración."""
     catastral = float((cat or {}).get("valor_catastral") or 0)
     escritura = float(inm.get("precio_escritura") or 0)
     referencia = float((cat or {}).get("valor_referencia") or inm.get("valor_referencia") or 0)
     comprobado = float(inm.get("valor_comprobado") or 0)
-    candidatos = [("Valor catastral", catastral), ("Valor escritura", escritura),
-                  ("Valor referencia", referencia), ("Valor comprobado", comprobado)]
+    candidatos = [("Valor catastral", r2(catastral)), ("Valor escritura", r2(escritura)),
+                  ("Valor referencia", r2(referencia)), ("Valor comprobado", r2(comprobado))]
+    # Gastos/tributos inherentes documentados; la escritura conserva su valor bruto.
+    # No crear una adquisición compuesta solo de gastos ni estimar partidas ausentes.
+    if escritura > 0:
+        candidatos.append(("Valor adquisición", valor_adquisicion_total(inm)))
     fuente, valor = max(candidatos, key=lambda kv: kv[1])
     return ValorPatrimonial(r2(valor), fuente if valor > 0 else "Sin valores", catastral, escritura, referencia,
                             comprobado)
