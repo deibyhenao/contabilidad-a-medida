@@ -208,3 +208,27 @@ def test_oraculo_condicionado_alquiler_ue_extraue(pais,tasa,amortiza):
     assert r.ingresos==16800 and r.tipo==tasa
     assert r.gastos==(2110.68 if amortiza else 0)
     assert r.cuota==(2790.97 if amortiza else 4032)
+
+
+def test_guia_no_reintroduce_campos_omitidos_por_ia(tmp_path,monkeypatch):
+    archivo=tmp_path/"datos.csv";archivo.write_text("datos",encoding="utf-8")
+    def local(_):
+        return pp.Extraccion(tipo=pp.TipoDocumento.CATASTRO_IBI,confianza=.95,nombre_archivo=archivo.name,
+                             campos={"valor_catastral":90000,"ejercicio":2025})
+    monkeypatch.setattr(pp,"extraer_local",local)
+    monkeypatch.setattr(ia,"disponible",lambda _:True)
+    monkeypatch.setattr(ia,"extraer",lambda *a,**kw:pp.Extraccion(tipo=pp.TipoDocumento.CATASTRO_IBI,confianza=.95,
+        nombre_archivo=archivo.name,campos={"ejercicio":2025}))
+    con_guia=pp.extraer(archivo,ia.AjustesIA(),comentario_guia="Ignora la hoja con el valor catastral antiguo")
+    assert "valor_catastral" not in con_guia.campos
+    assert not any("lector local cree" in a.lower() for a in con_guia.avisos)
+    sin_guia=pp.extraer(archivo,ia.AjustesIA())
+    assert sin_guia.campos["valor_catastral"]==90000
+
+
+def test_sin_ia_avisa_que_guia_necesita_revision_manual(tmp_path,monkeypatch):
+    archivo=tmp_path/"ingresos.csv";archivo.write_text("mes;importe\njunio;1200",encoding="utf-8")
+    monkeypatch.setattr(ia,"disponible",lambda _:False)
+    ext=pp.extraer(archivo,ia.AjustesIA(),comentario_guia="Ignora hoja2")
+    assert ext.comentario_guia=="Ignora hoja2"
+    assert any("no interpreta instrucciones" in x for x in ext.avisos)

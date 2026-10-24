@@ -1067,7 +1067,8 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
 def extraer(ruta: Path, ajustes=None, comentario_guia: str = "") -> Extraccion:
     """IA (Claude) si está activada y hay clave; si no o si falla, lector local.
 
-    Con IA, los campos que la IA no encontró pero el lector local sí (mismo tipo) se añaden como respaldo.
+    Sin comentario guía, los campos ausentes en IA y detectados localmente (mismo tipo) se añaden como respaldo.
+    Con guía, se respeta la selección de la IA: no reintroducir campos de hojas o zonas que el asesor excluyó.
     """
     import ia_extractor
 
@@ -1079,6 +1080,8 @@ def extraer(ruta: Path, ajustes=None, comentario_guia: str = "") -> Extraccion:
         raise ValueError("Formato documental no admitido.")
     local = extraer_local(ruta)
     local.comentario_guia = comentario_guia
+    if comentario_guia:
+        local.avisos.append("El comentario se conserva, pero el lector local no interpreta instrucciones. Revisa sus propuestas manualmente.")
     if ruta.suffix.lower() != ".pdf":
         local.avisos.append("Tabla documental: confirma la interpretación con IA o completa los datos manualmente; no se infieren importes de columnas ambiguas.")
     if not ia_extractor.disponible(ajustes):
@@ -1091,7 +1094,7 @@ def extraer(ruta: Path, ajustes=None, comentario_guia: str = "") -> Extraccion:
         return local
     ext.texto = local.texto
     ext.necesita_ocr = False  # la IA lee el PDF como imagen
-    if ext.tipo == local.tipo:
+    if ext.tipo == local.tipo and not comentario_guia:
         for campo, valor in local.campos.items():
             if campo not in ext.campos:
                 ext.campos[campo] = valor
@@ -1100,7 +1103,7 @@ def extraer(ruta: Path, ajustes=None, comentario_guia: str = "") -> Extraccion:
             ext.inquilinos = local.inquilinos
         if not ext.titulares and local.titulares:
             ext.titulares = local.titulares
-    elif local.tipo != TipoDocumento.DESCONOCIDO and local.confianza >= 0.8:
+    elif ext.tipo != local.tipo and local.tipo != TipoDocumento.DESCONOCIDO and local.confianza >= 0.8:
         ext.avisos.append(f"El lector local cree que es {TIPOS_LEGIBLES[local.tipo]}: confirma el tipo.")
     return ext
 
