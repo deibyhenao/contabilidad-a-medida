@@ -32,6 +32,8 @@ video/contabilidad-keynote/.hyperframes/
 build/
 dist/
 release/
+PARA_ENVIAR_AL_CLIENTE_*/
+ContabilidadAMedida-*-Setup.exe
 .venv-build/
 work/
 *.pfx
