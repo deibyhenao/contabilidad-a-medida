@@ -7,9 +7,12 @@ from __future__ import annotations
 
 import calendar
 import hashlib
+import math
 import re
 import shutil
 import unicodedata
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date
 from enum import Enum
 from pathlib import Path
@@ -20,7 +23,9 @@ from pydantic import BaseModel, Field
 
 from carteras import RES, cartera_de
 from database import TABLAS, Columna, _normalizar, a_fecha, a_num, slug, componente_ruta, subcarpeta_cliente
+from database import ESTADOS_COBRO
 from rutas_seguras import sanitize_safe_path
+from validacion_catastro import PENDIENTE_REVISION, revision_acreditada
 
 
 class TipoDocumento(str, Enum):
@@ -40,7 +45,7 @@ class TipoDocumento(str, Enum):
 
 
 class RegistroDocumento(BaseModel):
-    tabla: Literal["cobros", "gastos"]
+    tabla: Literal["cobros", "gastos", "catastro"]
     campos: dict[str, Any]
     evidencia: str = Field(min_length=1, max_length=500)
 
@@ -58,7 +63,12 @@ class Extraccion(BaseModel):
     texto: str = ""
     nombre_archivo: str
     motor: str = "local"                                   # "ia" | "local"
+    revision_confirmada: bool = False  # Solo la revisión humana; no forma parte del esquema de la API.
     evidencias: dict[str, str] = Field(default_factory=dict)  # campo -> frase del documento (solo IA)
+    coste_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    coste_incompleto: bool = False
+    modelo_ia: str | None = None  # Modelo de la lectura elegida; no el configurado.
+    lecturas_ia: list[dict[str, Any]] = Field(default_factory=list, max_length=2)
 
 
 class ResultadoAplicacion(BaseModel):
@@ -635,6 +645,40 @@ def _hash(ruta: Path) -> str:
     return h.hexdigest()
 
 
+_archivos_nuevos: ContextVar[list | None] = ContextVar("archivos_importacion", default=None)
+
+
+@contextmanager
+def archivos_importacion():
+    """Revierte únicamente las copias creadas por este lote, nunca soportes reutilizados."""
+    if _archivos_nuevos.get() is not None:
+        yield
+        return
+    creados = []
+    token = _archivos_nuevos.set(creados)
+    try:
+        yield
+    except BaseException as exc:
+        pendientes = []
+        for ruta, carpeta, huella in reversed(creados):
+            try:
+                segura = sanitize_safe_path(carpeta, ruta)
+                if ruta.is_symlink() or segura != ruta:
+                    raise ValueError("El soporte cambió de destino.")
+                if ruta.exists():
+                    if _hash(ruta) != huella:
+                        raise ValueError("El soporte fue modificado por otro proceso.")
+                    ruta.unlink()
+            except (OSError, ValueError):
+                pendientes.append(ruta.name)
+        if pendientes:
+            raise RuntimeError(f"{exc} Los datos se han revertido, pero no se pudo retirar "
+                               "una copia de soporte; revisa Soportes_PDF antes de reintentar.") from exc
+        raise
+    finally:
+        _archivos_nuevos.reset(token)
+
+
 def archivar_pdf(ruta: Path, carpeta_cliente: Path, tipo: TipoDocumento, fecha: date | None,
                  huella_esperada: str | None = None) -> tuple[str, str]:
     ruta = Path(ruta)
@@ -690,6 +734,8 @@ def archivar_pdf(ruta: Path, carpeta_cliente: Path, tipo: TipoDocumento, fecha: 
     except Exception:
         destino.unlink(missing_ok=True)  # solo el archivo que acaba de crear esta llamada
         raise
+    if _archivos_nuevos.get() is not None:
+        _archivos_nuevos.get().append((destino, soportes, huella))
     return destino.relative_to(carpeta_cliente).as_posix(), huella
 
 
@@ -751,10 +797,10 @@ def aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | No
             ejercicio: int | None = None, huella_esperada: str | None = None) -> ResultadoAplicacion:
     """Aplica todos los datos en un lote; un fallo permite reintentar sin altas parciales.
 
-    El soporte copiado se conserva para el reintento, que lo reutiliza por su huella.
+    Un fallo revierte la BD y las copias nuevas. Los soportes anteriores se conservan.
     El controlador mantiene su bloqueo durante esta operación.
     """
-    with db.transaccion():
+    with archivos_importacion(), db.transaccion():
         from documentos import origen
         with origen(db, cid):
             return _aplicar(db, cid, ext, ruta_pdf, inmueble_destino, ejercicio, huella_esperada=huella_esperada)
@@ -767,6 +813,12 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
         raise ValueError(f"Cliente inexistente: {cid}")
     c = dict(ext.campos)
     tipo = ext.tipo
+    if ext.registros:
+        from ia_extractor import CAMPOS_REGISTRO
+        permitidas = ({"catastro"} if tipo == TipoDocumento.ESCRITURA_COMPRA else
+                      {"cobros", "gastos"} if tipo == TipoDocumento.RESUMEN_ALQUILER else set())
+        if any(r.tabla not in permitidas or set(r.campos) - CAMPOS_REGISTRO[r.tabla] for r in ext.registros):
+            raise ValueError("El documento contiene tablas o campos incompatibles con su tipo.")
     if tipo == TipoDocumento.FACTURA_GASTO:
         identificados = [c.get("nif_proveedor"), c.get("nif_receptor")]
         if all(identificados) and not any(_mismo_nif(nif, cliente.get("nif")) for nif in identificados):
@@ -779,6 +831,8 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
     fechas = ("fecha_adquisicion", "fecha_venta", "fecha_inicio", "fecha_presentacion", "fecha_certificado", "fecha_alta",
               "fecha", "periodo_desde")
     fecha_documento = next((a_fecha(c[f]) for f in fechas if c.get(f)), None)
+    if tipo == TipoDocumento.CATASTRO_IBI and not c.get("ejercicio"):
+        raise ValueError("Catastro / IBI necesita un ejercicio explícito: comprueba el año del valor en el PDF.")
     ej = int(c.get("ejercicio") or ejercicio or (fecha_documento.year if fecha_documento else date.today().year))
     if tipo == TipoDocumento.FACTURA_GASTO and fecha_documento:
         if c.get("ejercicio") and int(c["ejercicio"]) != fecha_documento.year:
@@ -838,6 +892,55 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
             datos["estado"] = "Activo"
         inmueble = db.upsert("inmuebles", cid, datos)
         afectados.add((a_fecha(c.get("fecha_adquisicion")) or date(ej, 1, 1)).year)
+        # Un anexo acreditado conserva su propio ejercicio, no el abierto en pantalla.
+        referencia = re.sub(r"\s", "", str((db.get("inmuebles", cid, inmueble) or {}).get("ref_catastral") or "")).upper()
+        vistos = set()
+        for numero, registro in enumerate(ext.registros, 1):
+            anexo = dict(registro.campos)
+            ref_anexo = re.sub(r"\s", "", str(anexo.pop("ref_catastral", ""))).upper()
+            anio = anexo.get("ejercicio")
+            if not ref_anexo or ref_anexo != referencia or anio is None:
+                raise ValueError("El anexo catastral necesita referencia del inmueble y ejercicio acreditados.")
+            anio = int(anio)
+            date(anio, 1, 1)
+            if anio in vistos or not any(anexo.get(k) is not None for k in
+                                      ("valor_catastral", "valor_suelo", "valor_construccion")):
+                raise ValueError("El anexo catastral está repetido o no contiene valores acreditados.")
+            valores = [a_num(anexo.get(k)) for k in ("valor_catastral", "valor_suelo", "valor_construccion")]
+            for campo, valor in zip(("valor_catastral", "valor_suelo", "valor_construccion"), valores):
+                if campo in anexo:
+                    anexo[campo] = valor
+            if any(v is not None and v < 0 for v in valores):
+                raise ValueError("El anexo catastral contiene un valor negativo.")
+            if valores[0] is not None and any(v is not None and v > valores[0] + .02 for v in valores[1:]):
+                raise ValueError("Un componente catastral supera el total. Revisa el anexo.")
+            if all(v is not None for v in valores) and abs(valores[0] - valores[1] - valores[2]) > .02:
+                raise ValueError("El total catastral no coincide con suelo y construcción. Revisa el anexo.")
+            if not revision_acreditada(anexo.get("anio_revision"), anio, registro.evidencia, ext.texto):
+                anexo.pop("anio_revision", None)
+                anexo["revision_pendiente"] = 1
+                mensajes.append(f"Catastro {anio}: {PENDIENTE_REVISION}. El año del valor no acredita la revisión.")
+            vistos.add(anio)
+            anexo.update(ejercicio=anio, inmueble=inmueble, ruta=relativo,
+                         observaciones="Anexo de escritura · " + registro.evidencia +
+                         ("; " + PENDIENTE_REVISION if not anexo.get("anio_revision") else ""))
+            previo_cat = db.get_por_clave("catastro", cid, f"CAT|{inmueble}|{anio}")
+            financieros = ("valor_catastral", "valor_suelo", "valor_construccion")
+            if (previo_cat and any(previo_cat.get(k) is not None for k in financieros)
+                    and any(k in anexo and previo_cat.get(k) != anexo[k] for k in financieros)):
+                mensajes.append(f"Catastro {anio}: se conservan los valores existentes; revisa la diferencia con el anexo.")
+                # No mezclar el total anterior con componentes de otra valoración.
+                codigos[f"catastro_{numero}"] = previo_cat["codigo"]
+                afectados.add(anio)
+                continue
+            if previo_cat and anexo.get("revision_pendiente"):
+                notas = str(previo_cat.get("observaciones") or "")
+                db.upsert("catastro", cid, {"codigo": previo_cat["codigo"], "revision_pendiente": 1,
+                    "observaciones": notas if PENDIENTE_REVISION in notas else "; ".join(
+                        filter(None, [notas, PENDIENTE_REVISION]))})
+            codigos[f"catastro_{numero}"] = db.upsert("catastro", cid, anexo, clave=f"CAT|{inmueble}|{anio}",
+                                                     solo_si_vacio=tuple(anexo))
+            afectados.add(anio)
     elif tipo == TipoDocumento.ESCRITURA_VENTA:
         if inmueble:
             db.upsert("inmuebles", cid, {"codigo": inmueble, "estado": "Vendido",
@@ -851,6 +954,15 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
                                                    "direccion": c.get("direccion"), "estado": "En revisión"})
             mensajes.append("Se creó un inmueble mínimo En revisión: completa los datos de adquisición y titularidad.")
         datos = _permitidos("catastro", c)
+        if tipo == TipoDocumento.CATASTRO_IBI and not revision_acreditada(
+                c.get("anio_revision"), ej, ext.evidencias.get("anio_revision"), ext.texto, ext.revision_confirmada):
+            datos.pop("anio_revision", None)
+            datos["revision_pendiente"] = 1
+            previo_cat = db.get_por_clave("catastro", cid, f"CAT|{inmueble}|{ej}") or {}
+            notas = str(previo_cat.get("observaciones") or datos.get("observaciones") or "")
+            datos["observaciones"] = notas if PENDIENTE_REVISION in notas else "; ".join(
+                filter(None, [notas, PENDIENTE_REVISION]))
+            mensajes.append(PENDIENTE_REVISION + ". Cálculo provisional; revisa Catastro antes de presentar.")
         datos.update(ejercicio=ej, inmueble=inmueble, ruta=relativo)
         codigo = db.upsert("catastro", cid, datos, clave=f"CAT|{inmueble}|{ej}")
         codigos["catastro"] = codigo
@@ -878,7 +990,7 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
         anterior_fin = a_fecha(candidatos[0].get("fecha_fin_real"))
         if anterior_fin is not None and anterior_fin != fin:
             raise ValueError("El contrato tiene otra fecha de fin corregida. Revisa el conflicto antes de cambiarla.")
-        db.upsert("contratos", cid, {"codigo": contrato, "fecha_fin_real": fin, "estado": "Rescindido"})
+        db.upsert("contratos", cid, {"codigo": contrato, "fecha_fin_real": fin, "estado": "Rescindido anticipadamente"})
         codigos["contrato"] = contrato
         afectados.update(range(inicio.year, max(fin.year, ej) + 1))
         mensajes.append("Resolución revisada: fecha de fin real aplicada al contrato identificado.")
@@ -892,9 +1004,36 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
             if set(registro.campos) - CAMPOS_REGISTRO[tabla]:
                 raise ValueError("La tabla contiene campos no permitidos.")
             datos = _permitidos(tabla, registro.campos)
+            if tabla == "cobros" and datos.get("estado") not in (None, *ESTADOS_COBRO):
+                # La IA puede describir el estado con texto libre («NO», «Contradictorio…»): no es un estado válido
+                estado = datos.pop("estado")
+                if str(estado).strip():
+                    mensajes.append(f"Fila {numero}: estado «{estado}» no válido; queda Pendiente.")
             desde = a_fecha(datos.get("periodo_desde"))
             hasta = a_fecha(datos.get("periodo_hasta"))
             fecha_fila = a_fecha(datos.get("fecha_cobro") if tabla == "cobros" else datos.get("fecha"))
+            if tabla == "cobros" and not desde and not hasta:
+                if not fecha_fila and not datos.get("periodo_desde") and not datos.get("periodo_hasta"):
+                    # Total sin fecha ni periodo (p. ej. «cobrado en 2025» de un Excel del cliente): no es un movimiento
+                    # registrable, pero no debe tumbar el documento entero.
+                    importe = datos.get("importe_cobrado")
+                    mensajes.append(f"Fila {numero}: cobro{f' de {importe:.2f} €' if importe else ''} sin fecha ni periodo; "
+                                    "no se registra. Contrástalo con el extracto o anótalo a mano.")
+                    continue
+                if not fecha_fila or datos.get("periodo_desde") or datos.get("periodo_hasta"):
+                    raise ValueError("Un cobro sin periodo necesita una fecha de cobro válida.")
+                ejercicio_fila = int(datos.get("ejercicio") or fecha_fila.year)
+                if ejercicio_fila != fecha_fila.year:
+                    raise ValueError("El ejercicio del cobro no coincide con su fecha.")
+                if datos.get("importe_cobrado") is None:
+                    raise ValueError("Cada movimiento necesita un importe explícito.")
+                datos.update(ejercicio=ejercicio_fila, inmueble=inmueble, ruta=relativo, estado="Pendiente",
+                             observaciones="Pendiente de asignar periodo de devengo y contrato. "
+                             + (datos.get("observaciones") or "") + " · Fuente: " + registro.evidencia)
+                codigos[f"fila_{numero}"] = db.upsert("cobros", cid, datos, clave=f"DOCFILA|{documento}|{numero}")
+                afectados.add(ejercicio_fila)
+                mensajes.append(f"Cobro {numero} guardado pendiente de asignar periodo; no modifica la renta devengada.")
+                continue
             if not desde or not hasta or desde > hasta or desde.year != hasta.year:
                 raise ValueError("Cada fila necesita un periodo válido dentro del mismo ejercicio. Revísalo.")
             ejercicio_fila = int(datos.get("ejercicio") or desde.year)
@@ -959,6 +1098,7 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
         else:
             mensajes.append("Contrato sin inmueble identificado o sin fecha de inicio: revisa y aplica los datos manualmente.")
     elif tipo == TipoDocumento.MODELO_210:
+        from tax_calculator import completar_pago_210_nrc, pago_inferido_por_nrc, _anadir_nota_nrc
         renta = str(c.get("tipo_renta") or "").zfill(2)
         periodo = str(c.get("periodo") or "0A")
         if inmueble and renta in ("01", "02", "28", "35"):
@@ -969,18 +1109,30 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
                 periodo = "Anual" if periodo == "0A" else periodo
                 datos["periodo"] = periodo
                 codigos["210_alquiler"] = db.upsert("m210_alquiler", cid, datos,
-                                                    clave=f"210A|{ej}|{inmueble}|{periodo}")
+                                                    clave=f"210A|{ej}|{inmueble}|{periodo}", solo_si_vacio=("pagado",))
+                completar_pago_210_nrc(db, cid, "m210_alquiler", codigos["210_alquiler"])
             elif renta == "02":
                 datos.pop("base", None)
                 datos["renta_imputada"] = c.get("base")
                 codigos["210_imputacion"] = db.upsert("m210_imputacion", cid, datos,
-                                                      clave=f"210I|{ej}|{inmueble}")
+                                                      clave=f"210I|{ej}|{inmueble}", solo_si_vacio=("pagado",))
+                completar_pago_210_nrc(db, cid, "m210_imputacion", codigos["210_imputacion"])
             else:
+                previa = db.get_por_clave("obligaciones", cid, f"VENTA|{inmueble}") or {}
+                pago = previa.get("pagado") if previa.get("pagado") not in (None, "") else c.get("pagado")
+                inferido = pago_inferido_por_nrc({**datos, "pagado": pago})
+                detalle = f"Modelo 210 renta 28 presentado. Base {c.get('base')}; cuota {c.get('cuota')}; PDF {relativo}"
+                nota = previa.get("notas") or ""
+                if detalle not in nota:
+                    nota = (nota + "; " if nota else "") + detalle
+                if inferido is not None:
+                    pago = inferido
+                    nota = _anadir_nota_nrc(nota)
                 codigos["venta"] = db.upsert("obligaciones", cid, {
                     "ejercicio": ej, "inmueble": inmueble, "tipo": "Otra", "estado": "Presentado",
-                    "fecha_presentacion": c.get("fecha_presentacion"), "pagado": c.get("pagado"),
-                    "notas": f"Modelo 210 renta 28 presentado. Base {c.get('base')}; cuota {c.get('cuota')}; PDF {relativo}",
-                }, clave=f"VENTA|{inmueble}")
+                    "fecha_presentacion": c.get("fecha_presentacion"), "pagado": pago,
+                    "notas": nota,
+                }, clave=f"VENTA|{inmueble}", solo_si_vacio=("pagado",))
             afectados.add(ej)
         else:
             mensajes.append("Modelo 210 sin inmueble identificado o tipo de renta 01/02/28/35: revisa los campos.")
@@ -1064,7 +1216,33 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
                                ejercicios_afectados=afectados, codigos=codigos, mensajes=mensajes)
 
 
+def _resumen_uso_ia(lecturas: list[dict]) -> dict:
+    costes = [u["coste"] for u in lecturas if type(u.get("coste")) in (int, float)
+              and math.isfinite(u["coste"]) and u["coste"] >= 0]
+    return {"coste_usd": round(sum(costes), 8) if costes or not lecturas else None,
+            "coste_incompleto": len(costes) != len(lecturas), "lecturas_ia": [dict(u) for u in lecturas]}
+
+
 def extraer(ruta: Path, ajustes=None, comentario_guia: str = "") -> Extraccion:
+    """Conserva el consumo de todas las lecturas, no solo el de la respuesta elegida."""
+    import ia_extractor
+    with ia_extractor.medir_lecturas_documento() as lecturas:
+        try:
+            ext = _extraer_con_respaldo(ruta, ajustes, comentario_guia)
+        except Exception as exc:
+            # La UI puede conservar coste/uso incluso si el error impide llegar a la revisión.
+            try:
+                for campo, valor in _resumen_uso_ia(lecturas).items():
+                    setattr(exc, campo, valor)
+            except Exception:
+                pass  # Nunca sustituir el error original por un fallo de instrumentación.
+            raise
+        for campo, valor in _resumen_uso_ia(lecturas).items():
+            setattr(ext, campo, valor)
+        return ext
+
+
+def _extraer_con_respaldo(ruta: Path, ajustes=None, comentario_guia: str = "") -> Extraccion:
     """IA (Claude) si está activada y hay clave; si no o si falla, lector local.
 
     Sin comentario guía, los campos ausentes en IA y detectados localmente (mismo tipo) se añaden como respaldo.
@@ -1090,8 +1268,14 @@ def extraer(ruta: Path, ajustes=None, comentario_guia: str = "") -> Extraccion:
         ext = ia_extractor.extraer(ruta, ajustes, **({"comentario_guia": comentario_guia} if comentario_guia else {}))
         ext.comentario_guia = comentario_guia
     except ia_extractor.ErrorIA as exc:
-        local.avisos.insert(0, f"Lectura con IA no disponible ({exc}). Se usó el lector local: revisa los campos.")
-        return local
+        # Negativa o respuesta fuera del esquema: es justo el caso que el modelo de respaldo puede resolver.
+        ext = _lectura_respaldo(ruta, ajustes, comentario_guia) if exc.admite_respaldo else None
+        if ext is None:
+            local.avisos.insert(0, f"Lectura con IA no disponible ({exc}). Se usó el lector local: revisa los campos.")
+            return local
+        ext.avisos.insert(0, f"La primera lectura falló ({exc}): releído con {ajustes.respaldo}.")
+    else:
+        ext = _segunda_lectura(ruta, ajustes, ext, comentario_guia)
     ext.texto = local.texto
     ext.necesita_ocr = False  # la IA lee el PDF como imagen
     if ext.tipo == local.tipo and not comentario_guia:
@@ -1108,11 +1292,48 @@ def extraer(ruta: Path, ajustes=None, comentario_guia: str = "") -> Extraccion:
     return ext
 
 
-def procesar_pdf(db, cid, ruta_pdf, confirmar=None, inmueble_destino=None, ejercicio=None, comentario_guia: str = "") -> ResultadoAplicacion:
-    """Extrae, permite revisión y aplica. El controlador importa Excel antes.
+def _lectura_respaldo(ruta: Path, ajustes, comentario_guia: str, avisos: list | None = None) -> Extraccion | None:
+    """Lectura con el modelo de respaldo, o None si no hay respaldo o falla (el fallo se anota en ``avisos``)."""
+    import dataclasses
+    import ia_extractor
+    respaldo = getattr(ajustes, "respaldo", "") if ajustes is not None else ""
+    if not respaldo or respaldo == getattr(ajustes, "modelo", None):
+        return None
+    try:
+        otra = ia_extractor.extraer(ruta, dataclasses.replace(ajustes, modelo=respaldo, respaldo="", permitir_respaldo_servidor=False,
+                                                                cachear=False),
+                                    **({"comentario_guia": comentario_guia} if comentario_guia else {}))
+    except Exception as exc:  # incluido un esquema inválido: la segunda lectura nunca hace perder la primera
+        if avisos is not None:
+            detalle = str(exc) if isinstance(exc, ia_extractor.ErrorIA) else exc.__class__.__name__
+            avisos.append(f"La segunda lectura con {respaldo} no estuvo disponible ({detalle}): revisa los datos.")
+        return None
+    otra.comentario_guia = comentario_guia
+    return otra
 
-    No recalcula ni exporta: el controlador coordina esos pasos según arquitectura.
-    """
+
+def _segunda_lectura(ruta: Path, ajustes, ext: Extraccion, comentario_guia: str) -> Extraccion:
+    """Enrutado de calidad: si el modelo barato no reconoce el documento o duda, se relee SOLO ese archivo con el
+    modelo de respaldo (Sonnet) y se queda la lectura mejor. Un fallo de la segunda lectura no pierde la primera."""
+    import ia_extractor
+    respaldo = getattr(ajustes, "respaldo", "") if ajustes is not None else ""
+    dudosa = ext.tipo == TipoDocumento.DESCONOCIDO or float(ext.confianza or 0) < ia_extractor.UMBRAL_RESPALDO
+    if not dudosa or not respaldo or respaldo == getattr(ajustes, "modelo", None):
+        return ext
+    otra = _lectura_respaldo(ruta, ajustes, comentario_guia, ext.avisos)
+    if otra is None:
+        return ext
+    mejor = (otra.tipo != TipoDocumento.DESCONOCIDO and (ext.tipo == TipoDocumento.DESCONOCIDO
+             or float(otra.confianza or 0) >= float(ext.confianza or 0)))
+    elegida = otra if mejor else ext
+    elegida.comentario_guia = comentario_guia
+    elegida.avisos.insert(0, f"Primera lectura dudosa (confianza {float(ext.confianza or 0):.0%}): releído con "
+                             f"{respaldo}; " + ("se usa esa lectura." if mejor else "se mantiene la primera."))
+    return elegida
+
+
+def preparar_pdf(db, ruta_pdf, confirmar=None, comentario_guia: str = "") -> tuple[Extraccion, str]:
+    """Extrae y revisa sin abrir una transacción de escritura durante la red o el diálogo."""
     import ia_extractor
 
     huella_revisada = _hash(Path(ruta_pdf))
@@ -1124,4 +1345,10 @@ def procesar_pdf(db, cid, ruta_pdf, confirmar=None, inmueble_destino=None, ejerc
     ext.comentario_guia = comentario_guia
     if _hash(Path(ruta_pdf)) != huella_revisada:
         raise ValueError("El PDF cambió durante la revisión. Selecciónalo de nuevo para comprobar sus datos.")
-    return aplicar(db, cid, ext, Path(ruta_pdf), inmueble_destino, ejercicio, huella_esperada=huella_revisada)
+    return ext, huella_revisada
+
+
+def procesar_pdf(db, cid, ruta_pdf, confirmar=None, inmueble_destino=None, ejercicio=None, comentario_guia: str = "") -> ResultadoAplicacion:
+    """Extrae, permite revisión y aplica. El controlador coordina recálculo y exportación."""
+    ext, huella = preparar_pdf(db, ruta_pdf, confirmar=confirmar, comentario_guia=comentario_guia)
+    return aplicar(db, cid, ext, Path(ruta_pdf), inmueble_destino, ejercicio, huella_esperada=huella)

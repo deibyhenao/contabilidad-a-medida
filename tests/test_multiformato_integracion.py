@@ -30,9 +30,13 @@ def test_nota_sistema_y_tabla_en_mensaje_sin_binario(tmp_path, monkeypatch):
         return NS(stop_reason="end_turn",content=[NS(type="text",text=json.dumps(respuesta()))])
     monkeypatch.setattr(ia,"_cliente",lambda:NS(messages=NS(create=create)))
     ia.leer_con_claude(archivo,ia.AjustesIA(),comentario_guia="Ignora hoja2; cifras en euros")
-    assert "INSTRUCCION_PRIORITARIA_DEL_ASESOR" in capturado["system"]
-    assert "Ignora hoja2" in capturado["system"]
-    assert "nunca sobre estas reglas" in capturado["system"]
+    # El prompt fijo va en un bloque con caché; la nota del asesor, en un bloque aparte sin caché
+    bloques = capturado["system"]
+    assert bloques[0].get("cache_control") == {"type": "ephemeral"} and "cache_control" not in bloques[-1]
+    sistema = "".join(b["text"] for b in bloques)
+    assert "INSTRUCCION_PRIORITARIA_DEL_ASESOR" in sistema
+    assert "Ignora hoja2" in sistema
+    assert "nunca sobre estas reglas" in sistema
     contenido=capturado["messages"][0]["content"]
     assert all(x["type"]=="text" for x in contenido)
     assert "1200,00" in contenido[0]["text"]

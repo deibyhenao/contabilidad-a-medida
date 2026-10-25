@@ -23,6 +23,7 @@ import flet as ft
 
 import ui_estilo as ui
 import ui_adjuntos as adj
+import cola_documentos as cola_doc
 from concurrencia import ejecutar_en_ui
 from version import VERSION
 from app_paths import AlmacenNoDisponible
@@ -58,6 +59,7 @@ if __name__ != "__main__":
     _cargar_modulos()
 
 I = ft.Icons
+ANIM_COLA = ft.Animation(220, ft.AnimationCurve.EASE_OUT_CUBIC)  # aparición y cambios de la vista del lote
 # Etiquetas legibles (con tildes) de los campos del diálogo de revisión; el resto se derivan de la clave
 ETIQUETAS_EXTRACCION = {
     "direccion": "Dirección", "cp": "Código postal", "ref_catastral": "Ref. catastral",
@@ -65,7 +67,7 @@ ETIQUETAS_EXTRACCION = {
     "pct_titularidad": "% titularidad", "tipo_adquisicion": "Tipo de adquisición", "n_protocolo": "Nº de protocolo",
     "valor_referencia": "Valor de referencia", "itp_iva_ajd": "ITP / IVA / AJD", "notaria": "Notaría",
     "valor_catastral": "Valor catastral", "valor_suelo": "Valor del suelo", "valor_construccion": "Valor de construcción",
-    "anio_revision": "Año de revisión", "ibi_ejercicio": "Cuota IBI", "fecha_inicio": "Fecha de inicio",
+    "anio_revision": "Año de revisión catastral colectiva", "ibi_ejercicio": "Cuota IBI", "fecha_inicio": "Fecha de inicio",
     "fecha_fin_prevista": "Fecha de fin prevista", "renta_inicial": "Renta mensual", "nrc": "NRC",
     "fecha_presentacion": "Fecha de presentación", "pais": "País", "fecha_certificado": "Fecha del certificado",
     "valido_hasta": "Válido hasta", "nif_extranjero": "NIF extranjero", "epigrafe_iae": "Epígrafe IAE",
@@ -108,6 +110,11 @@ def _texto_valor(col: database.Columna, valor: Any) -> str:
 
 
 class App:
+    # Vista del lote: valores por defecto también para instancias montadas sin iniciar() (tests)
+    _cola: Optional[cola_doc.ColaDocumentos] = None
+    _cola_cid: Optional[int] = None
+    _cola_tiempo: Optional[ft.Text] = None
+
     def __init__(self, page: ft.Page, ctrl: Optional[Controlador] = None):
         self.page = page
         self.ctrl = ctrl or Controlador()
@@ -170,6 +177,11 @@ class App:
                                              switch_in_curve=ft.AnimationCurve.EASE_OUT_CUBIC,
                                              switch_out_curve=ft.AnimationCurve.EASE_OUT_CUBIC)
         self.zona_principal = ft.Container(expand=True)
+        # Vista del lote «Leyendo N documentos»: aparece al procesar y se queda con el resumen hasta cerrarla
+        self._cola: Optional[cola_doc.ColaDocumentos] = None
+        self._cola_cid: Optional[int] = None
+        self._cola_tiempo: Optional[ft.Text] = None
+        self._cola_caja = ft.Container(visible=False, opacity=0, animate_opacity=ANIM_COLA, animate_size=ANIM_COLA)
 
         lec = self.ctrl.lector
         self.cartera = RES if not lec.contar_clientes(NR) and lec.contar_clientes(RES) else NR
@@ -707,7 +719,8 @@ class App:
         self._columna_ficha = ft.Column([
             self._cabecera(cliente),
             ft.Container(
-                ft.Column([self._zona_pdfs(), self._selector_secciones(), self.contenido], spacing=16),
+                ft.Column([self._zona_pdfs(), self._caja_cola_de(cliente), self._selector_secciones(), self.contenido],
+                          spacing=16),
                 padding=ft.Padding.only(left=28, right=28, bottom=40)),
         ], spacing=0, expand=True, scroll=ft.ScrollMode.AUTO)
         self.zona_principal.content = self._columna_ficha
@@ -787,6 +800,134 @@ class App:
         return ui.pulsable(zona, self.elegir_pdfs,
                            {"bgcolor": p.tarjeta, "border": ft.Border.all(1, p.separador)},
                            {"bgcolor": p.tarjeta, "border": ft.Border.all(1, p.borde_activo)}, escala=0.995)
+
+    # ================================================================== vista del lote
+    def _caja_cola_de(self, cliente: dict) -> ft.Container:
+        """La tarjeta del lote solo se ve en el expediente al que pertenece."""
+        if not hasattr(self, "_cola_caja"):
+            self._cola_caja = ft.Container(visible=False, opacity=0, animate_opacity=ANIM_COLA, animate_size=ANIM_COLA)
+        if self._cola is not None and self._cola_cid != cliente.get("id"):
+            self._cola, self._cola_caja.visible, self._cola_caja.opacity = None, False, 0
+        return self._cola_caja
+
+    def _pintar_cola(self) -> None:
+        caja = self._cola_caja
+        if self._cola is None:
+            caja.opacity = 0
+            self.page.update()
+            caja.visible, caja.content = False, None
+        else:
+            caja.content = self._vista_cola()
+            if not caja.visible:  # aparece con un fundido corto, sin rebote
+                caja.visible = True
+                self.page.update()
+            caja.opacity = 1
+        self.page.update()
+
+    def _cerrar_cola(self, _e=None) -> None:
+        if self._cola is not None and self._cola.activo:
+            return
+        self._cola = None
+        self._pintar_cola()
+
+    def _modelo_cola(self) -> str:
+        """Los modelos que han leído de verdad; antes de la primera lectura, el configurado."""
+        def corto(modelo: str) -> str:
+            return next((n for n in ("Haiku", "Sonnet", "Opus", "Fable") if n.lower() in modelo), modelo)
+        usados = self._cola.modelos_usados() if self._cola is not None else []
+        if usados:
+            return "Claude " + " + ".join(dict.fromkeys(corto(m) for m in usados))
+        if self._cola is not None and not self._cola.activo:
+            return "Modelo no disponible" if self._cola.coste_incompleto else "Lector local"
+        ia_ok, _ = self.ctrl.estado_ia()
+        return f"Claude {corto(self.ctrl.ajustes_ia().modelo)}" if ia_ok else "Lector local"
+
+    def _vista_cola(self) -> ft.Control:
+        p, cola = self.p, self._cola
+        terminado = not cola.activo
+        errores, guardados = cola.contar(cola_doc.ERROR), cola.contar(cola_doc.ARCHIVADO) + cola.contar(cola_doc.DUPLICADO)
+        # Rojo solo si no se guardó nada; un fallo suelto en un lote bueno se marca en su fila, no alarma toda la barra
+        color_barra = (p.acento if not terminado else p.rojo if errores and not guardados
+                       else p.naranja if errores else p.verde)
+        self._cola_tiempo = ft.Text(cola.tiempo(), size=15, weight=ft.FontWeight.W_600, color=p.texto,
+                                    font_family=ui.FUENTE_TITULO)
+        cabecera = ft.Row([
+            ft.Icon(I.TASK_ALT if terminado else I.AUTO_AWESOME_OUTLINED, size=18,
+                    color=color_barra if terminado else p.acento),
+            ft.Text(cola.titulo(), size=15, weight=ft.FontWeight.W_600, color=p.texto, font_family=ui.FUENTE_TITULO),
+            ui.pastilla(self._modelo_cola(), p.acento, p.acento_suave),
+            ft.Container(expand=True),
+            ui.leyenda("tiempo", p, p.texto3),
+            self._cola_tiempo,
+        ], spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+        barra = ft.ProgressBar(value=cola.progreso, bar_height=4, border_radius=2, color=color_barra,
+                               bgcolor=p.separador,
+                               semantics_label=f"Progreso del lote: {cola.terminados} de {cola.total} documentos")
+        filas = ft.ResponsiveRow([ft.Container(self._fila_cola(f), col={"xs": 12, "md": 6}) for f in cola.filas],
+                                 spacing=8, run_spacing=8)
+        coste = cola.coste_usd
+        if coste is None:
+            texto_coste = "Coste IA no disponible" if cola.coste_incompleto else ""
+        else:  # con alguna lectura sin uso registrado, el total es un mínimo
+            signo = "≥" if cola.coste_incompleto else "≈"
+            texto_coste = (f"Coste IA {signo} {coste:.4f} $ · {coste * ia_extractor.EUR_POR_USD:.4f} €"
+                           .replace(".", ",") + (" (parcial)" if cola.coste_incompleto else ""))
+        if terminado:
+            pie = ft.Row([ui.leyenda(cola.resumen(), p, p.texto2), ft.Container(expand=True),
+                          ui.leyenda(texto_coste, p, p.texto3),
+                          ui.boton_icono(I.CLOSE, self._cerrar_cola, p, "Cerrar resumen del lote")],
+                         spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+        else:
+            pie = ft.Row([ui.leyenda(f"{cola.terminados} de {cola.total} · cada documento se para en revisión "
+                                     "antes de guardarse", p, p.texto3),
+                          ft.Container(expand=True), ui.leyenda(texto_coste, p, p.texto3)], spacing=10)
+        return ui.tarjeta(ft.Column([cabecera, barra, filas, pie], spacing=12), p, padding=16)
+
+    def _fila_cola(self, f: cola_doc.FilaCola) -> ft.Control:
+        p = self.p
+        e = f.estado
+        if e == cola_doc.LEYENDO:
+            color, adorno = p.acento, ft.ProgressRing(width=12, height=12, stroke_width=2, color=p.acento)
+        elif e == cola_doc.REVISION:
+            color, adorno = p.acento, ft.Icon(I.RATE_REVIEW_OUTLINED, size=14, color=p.acento)
+        elif e == cola_doc.ARCHIVADO:
+            color, adorno = p.verde, ft.Icon(I.CHECK, size=14, color=p.verde)
+        elif e == cola_doc.ERROR:
+            color, adorno = p.rojo, ft.Icon(I.ERROR_OUTLINE, size=14, color=p.rojo)
+        else:  # en cola, ya archivado antes, descartado
+            color, adorno = (p.texto2 if e == cola_doc.DUPLICADO else p.texto3), None
+        texto = {cola_doc.ARCHIVADO: f.detalle or "Archivado",
+                 cola_doc.DUPLICADO: f"Ya estaba · {f.detalle}" if f.detalle else e}.get(e, e)
+        estado = ft.Row([x for x in (adorno, ft.Text(texto, size=12, weight=ft.FontWeight.W_600, color=color,
+                                                     font_family=ui.FUENTE)) if x is not None],
+                        spacing=6, tight=True, key=f"{e}|{texto}")
+        ext = f.extension
+        tinte = {"PDF": p.rojo, "XLSX": p.verde, "XLS": p.verde, "CSV": p.verde, "DOCX": p.acento, "DOC": p.acento}
+        insignia = ft.Container(ft.Text(ext, size=10, weight=ft.FontWeight.W_700, color=tinte.get(ext, p.texto2),
+                                        font_family=ui.FUENTE), width=38)
+        nombre = ft.Text(f.nombre, size=13, color=p.texto, font_family=ui.FUENTE, max_lines=1,
+                         overflow=ft.TextOverflow.ELLIPSIS, expand=True, tooltip=f.nombre)
+        cambio = ft.AnimatedSwitcher(estado, duration=200, reverse_duration=120,
+                                     transition=ft.AnimatedSwitcherTransition.FADE,
+                                     switch_in_curve=ft.AnimationCurve.EASE_OUT_CUBIC,
+                                     switch_out_curve=ft.AnimationCurve.EASE_OUT_CUBIC)
+        return ft.Container(
+            ft.Row([insignia, nombre, cambio], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            bgcolor=p.campo, border_radius=10, padding=ft.Padding.symmetric(horizontal=12, vertical=9),
+            opacity=0.62 if e == cola_doc.EN_COLA else 1, animate_opacity=ANIM_COLA,
+            tooltip=f.detalle if e == cola_doc.ERROR and f.detalle else None)
+
+    def _reloj_cola(self, cola: cola_doc.ColaDocumentos) -> None:
+        """Avanza el contador «tiempo» cada segundo mientras el lote sigue vivo (solo ese texto, no toda la vista)."""
+        def latido():
+            while not self.cerrando and self._cola is cola and cola.activo:
+                time.sleep(1)
+                def tic():
+                    if not self.cerrando and self._cola is cola and cola.activo and self._cola_tiempo is not None:
+                        self._cola_tiempo.value = cola.tiempo()
+                        self._cola_tiempo.update()
+                ejecutar_en_ui(self.page, tic)
+        threading.Thread(target=latido, daemon=True).start()
 
     def _es_residente(self) -> bool:
         c = self.cliente
@@ -889,16 +1030,18 @@ class App:
                 if fila.get("estado") not in cerrados:
                     cuotas_pend += float(fila.get("cuota") or 0)
         graves = [x for x in inf.pendientes if x.nivel == "grave"]
+        provisional = any("PROVISIONAL" in e for e in inf.estados)
         kpis = ft.Row([
             ui.kpi("Inmuebles a 31/12", str(pat.num_inmuebles), p, I.HOME_OUTLINED),
             ui.kpi("Base Patrimonio", ui.eur(pat.valor_bienes), p, I.SAVINGS_OUTLINED),
             ui.kpi("Cuotas 210 por pagar", ui.eur(cuotas_pend), p, I.RECEIPT_LONG_OUTLINED,
-                   p.naranja if cuotas_pend else None),
+                   p.naranja if cuotas_pend else None, "Incluye importes provisionales" if provisional else None),
             ui.kpi("Avisos urgentes", str(len(graves)), p, I.NOTIFICATIONS_ACTIVE_OUTLINED,
                    p.rojo if graves else p.verde, "Ver pendientes" if graves else "Todo en orden",
                    on_click=lambda e: self._ir_a_seccion(1)),
         ], spacing=12)
-        estados = [ui.fila(I.DESCRIPTION_OUTLINED, p.texto2, e.split(" · ", 1)[-1],
+        estados = [ui.fila(I.HOURGLASS_EMPTY if "PROVISIONAL" in e else I.DESCRIPTION_OUTLINED,
+                           p.naranja if "PROVISIONAL" in e else p.texto2, e.split(" · ", 1)[-1],
                            e.split(" · ", 1)[0] if " · " in e else None, p) for e in inf.estados[1:]]
         alertas = [ui.fila(I.LIGHTBULB_OUTLINE, ui.colores_estado(a.nivel, p)[0], a.mensaje,
                            a.inmueble or "Cliente", p, fondo_icono=ui.colores_estado(a.nivel, p)[1])
@@ -1634,7 +1777,10 @@ class App:
                          "También puedes pedir: «Renombra DOC-001 a Factura Luz T3.pdf» o «Cambia DOC-001 al ejercicio 2026». "
                          "Las acciones documentales requieren /confirmar_documento y su token.", p, p.texto3)
         avisos = [ui.leyenda(aviso_carpeta, p, p.rojo)] if aviso_carpeta else []
-        return ft.Column([cabecera, *aviso_ia, *avisos, self._chat_lista, entrada, pie], spacing=16,
+        # Las pruebas con la API real mostraron variaciones entre respuestas: el chat orienta, no valida.
+        orientativo = ui.leyenda("Respuestas orientativas de IA: comprueba cifras y conclusiones en las fichas "
+                                 "antes de presentar o informar al cliente.", p, p.texto3)
+        return ft.Column([cabecera, *aviso_ia, *avisos, self._chat_lista, entrada, orientativo, pie], spacing=16,
                          horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
 
     def _nueva_conversacion(self, _e=None) -> None:
@@ -2060,6 +2206,8 @@ class App:
         Un fallo en un archivo se avisa y el lote sigue; nunca se anuncia como archivado lo que no lo está."""
         cid, ej = self.cid, self.ejercicio
         rutas = [Path(r) for r in rutas]
+        if not rutas:
+            return
         comentario_guia = adj.normalizar_comentario(comentario_guia)
         admite = _admite_comentario(self.ctrl.procesar_pdf)
         if comentario_guia and not admite:
@@ -2070,46 +2218,84 @@ class App:
         def en_ui(fn: Callable[[], None]) -> None:
             ejecutar_en_ui(self.page, lambda: fn() if not self.cerrando else None)
 
+        if self.cerrando or self._turno.locked():
+            self.avisar("Espera a que termine la tarea en curso.")
+            return  # sin tocar la tarjeta del lote que ya está en marcha
+        cola = cola_doc.ColaDocumentos([r.name for r in rutas])
+        self._cola, self._cola_cid = cola, cid
+        self._pintar_cola()
+        self._reloj_cola(cola)
+
+        def marcar(accion: Callable[[], None]) -> None:
+            # El estado del lote solo cambia en el hilo de la interfaz, el mismo que lo pinta
+            en_ui(lambda: (accion(), self._pintar_cola()) if self._cola is cola else None)
+
         def trabajo():
             res: dict = {}
             fallos: list[str] = []
             total = len(rutas)
-            for i, ruta in enumerate(rutas, 1):
-                if self.cerrando:
-                    break
-                if (self.cid, self.ejercicio) != (cid, ej):
-                    en_ui(lambda n=total-i+1: self.avisar(f"Lote detenido por cambio de expediente. Quedan {n} documentos sin procesar."))
-                    break
-                en_ui(lambda t=f"Leyendo {ruta.name} ({i}/{total})…": self.set_ocupado(True, t))
-                try:
-                    actual = self.ctrl.procesar_pdf(cid, ruta, ej, confirmar=lambda ext: self.revisar_extraccion(ext, cid, ej),
-                                                    **extra)
-                except CanceladoPorUsuario:
-                    en_ui(lambda n=ruta.name: self.avisar(f"Descartado: {n}"))
-                    continue
-                except excel_generator.ExcelConflictoImportacion:
-                    raise  # afecta a todo el Excel del cliente: se detiene el lote y se muestra la revisión
-                except Exception as exc:
-                    fallos.append(ruta.name)
-                    en_ui(lambda n=ruta.name, m=str(exc) or exc.__class__.__name__:
-                          self.avisar(f"No se pudo procesar {n}: {m}", True))
-                    continue
-                r = (actual or {}).get("resultado")
-                if r is None:
-                    fallos.append(ruta.name)
-                    en_ui(lambda n=ruta.name: self.avisar(f"No se pudo procesar {n}: no se obtuvo ningún resultado.", True))
-                    continue
-                res = actual
-                en_ui(lambda n=ruta.name, r=r: self.avisar(
-                    f"Ya estaba archivado como {r.documento}." if getattr(r, "duplicado", False)
-                    else f"{n} archivado como {r.documento}. Excel actualizado."))
+            try:
+                for i, ruta in enumerate(rutas, 1):
+                    k = i - 1
+                    if self.cerrando:
+                        break
+                    if (self.cid, self.ejercicio) != (cid, ej):
+                        en_ui(lambda n=total-i+1: self.avisar(f"Lote detenido por cambio de expediente. Quedan {n} documentos sin procesar."))
+                        break
+                    en_ui(lambda t=f"Leyendo {ruta.name} ({i}/{total})…": self.set_ocupado(True, t))
+                    marcar(lambda k=k: cola.leyendo(k))
+
+                    uso_registrado = False
+
+                    def registrar_uso(ext, k=k):
+                        lecturas = getattr(ext, "lecturas_ia", None) or []
+                        modelos = [x.get("modelo") for x in lecturas if isinstance(x, dict) and x.get("modelo")]
+                        if not modelos and getattr(ext, "modelo_ia", None):
+                            modelos = [ext.modelo_ia]
+                        marcar(lambda: cola.en_revision(k, getattr(ext, "coste_usd", None),
+                                                        bool(getattr(ext, "coste_incompleto", False)), modelos))
+
+                    def confirmar(ext, k=k):
+                        nonlocal uso_registrado
+                        registrar_uso(ext, k)
+                        uso_registrado = True
+                        return self.revisar_extraccion(ext, cid, ej)
+                    try:
+                        actual = self.ctrl.procesar_pdf(cid, ruta, ej, confirmar=confirmar, **extra)
+                    except CanceladoPorUsuario:
+                        marcar(lambda k=k: cola.terminar(k, cola_doc.DESCARTADO))
+                        continue
+                    except excel_generator.ExcelConflictoImportacion:
+                        raise  # afecta a todo el Excel del cliente: se detiene el lote y se muestra la revisión
+                    except Exception as exc:
+                        if not uso_registrado and hasattr(exc, "lecturas_ia"):
+                            registrar_uso(exc, k)
+                        fallos.append(ruta.name)
+                        mensaje = str(exc) or exc.__class__.__name__
+                        marcar(lambda k=k, m=mensaje: cola.terminar(k, cola_doc.ERROR, m))
+                        en_ui(lambda n=ruta.name, m=mensaje: self.avisar(f"No se pudo procesar {n}: {m}", True))
+                        continue
+                    r = (actual or {}).get("resultado")
+                    if r is None:
+                        fallos.append(ruta.name)
+                        marcar(lambda k=k: cola.terminar(k, cola_doc.ERROR, "No se obtuvo ningún resultado."))
+                        en_ui(lambda n=ruta.name: self.avisar(f"No se pudo procesar {n}: no se obtuvo ningún resultado.", True))
+                        continue
+                    res = actual
+                    # El resultado de cada documento se ve en la tarjeta del lote: sin un aviso flotante por archivo
+                    marcar(lambda k=k, r=r: cola.terminar(
+                        k, cola_doc.DUPLICADO if getattr(r, "duplicado", False) else cola_doc.ARCHIVADO, r.documento))
+            finally:
+                marcar(lambda: cola.detener() if cola.activo else None)
             if fallos and total > 1:
                 nombres = ", ".join(fallos[:3]) + (f" y {len(fallos) - 3} más" if len(fallos) > 3 else "")
                 resto = " El resto del lote siguió adelante." if len(fallos) < total else ""
                 en_ui(lambda: self.avisar(f"{len(fallos)} de {total} documentos no se pudieron procesar: {nombres}."
                                           + resto, True))
             return res
-        self.en_segundo_plano("Procesando documentos…", trabajo)
+        if not self.en_segundo_plano("Procesando documentos…", trabajo) and self._cola is cola:
+            self._cola = None  # el lote no llegó a empezar: su tarjeta no se queda colgada
+            self._pintar_cola()
 
     def sincronizar(self, _e=None) -> None:
         self.en_segundo_plano("Sincronizando Excel…", lambda cid=self.cid, ej=self.ejercicio: self.ctrl.sincronizar(cid, ej),
@@ -2140,7 +2326,7 @@ class App:
             self.ctrl.cambiar_carpeta_clientes(Path(ruta))
             self.lbl_carpeta.value, self.lbl_carpeta.tooltip = Path(ruta).name, str(ruta)
             self.page.update()
-            self.avisar("Carpeta de clientes actualizada.")
+            self.avisar("Carpeta de clientes actualizada: los clientes nuevos se guardarán ahí. Los ya creados siguen en su carpeta actual.")
 
     # ================================================================== diálogos
     def revisar_extraccion(self, ext: pdf_processor.Extraccion, cid: Optional[int] = None,
@@ -2155,7 +2341,7 @@ class App:
         decision = {"guardar": False, "resuelta": False}
         cid_revision = self.cid if cid is None else cid
         ej_abierto = self.ejercicio if ejercicio is None else ejercicio
-        cliente_revision = self.ctrl.lector.get_cliente(self.cid if cid is None else cid) or {}
+        cliente_revision = self.ctrl.lector.get_cliente(cid_revision) or {}
         identidad = " ".join(x for x in (cliente_revision.get("nombre"), cliente_revision.get("apellidos")) if x)
         destino_revision = ui.tarjeta(ft.Column([
             ui.leyenda("EXPEDIENTE DE DESTINO", p),
@@ -2173,8 +2359,12 @@ class App:
                 ejercicio_detectado = a_fecha(ext.campos["fecha"]).year
             except (ValueError, TypeError):
                 pass  # La revisión del campo fecha mostrará el error de formato.
-        ej_registro = ui.campo("Ejercicio de registro", p, str(ejercicio_detectado or ej_abierto),
+        ej_registro = ui.campo("Ejercicio de registro", p, str(ejercicio_detectado or ("" if ext.tipo == pdf_processor.TipoDocumento.CATASTRO_IBI else ej_abierto)),
                                ayuda="Año al que se vinculan los datos; la fecha del documento se conserva.")
+        confirmar_revision = ft.Checkbox(
+            label="He comprobado en el documento el año de entrada en vigor de la revisión catastral colectiva",
+            value=False, visible=ext.tipo == pdf_processor.TipoDocumento.CATASTRO_IBI,
+            label_style=ft.TextStyle(color=p.texto, size=13), active_color=p.acento)
         confirmar_destino = ft.Checkbox(label="Confirmo el ejercicio de registro distinto del que tengo abierto",
                                        value=False, label_style=ft.TextStyle(color=p.texto, size=13),
                                        active_color=p.acento)
@@ -2194,9 +2384,11 @@ class App:
         aviso_ejercicio.value = (f"El documento indica {ejercicio_detectado}, distinto del ejercicio abierto {ej_abierto}. "
                                 "Confirma el destino o corrígelo antes de guardar."
                                 if confirmar_destino.visible else f"Se registrará en el ejercicio abierto: {ej_abierto}.")
+        if ext.tipo == pdf_processor.TipoDocumento.CATASTRO_IBI and not ejercicio_detectado:
+            aviso_ejercicio.value = "El PDF no tiene un ejercicio identificado. Indica el año del valor antes de guardar."
         tipos = [(t.value, pdf_processor.TIPOS_LEGIBLES[t]) for t in pdf_processor.TipoDocumento]
         dd_tipo = ui.desplegable("Tipo de documento", tipos, p, ext.tipo.value, expand=True)
-        inmuebles = self.ctrl.lector.listar("inmuebles", self.cid if cid is None else cid)
+        inmuebles = self.ctrl.lector.listar("inmuebles", cid_revision)
         dd_inm = ui.desplegable("Inmueble", [("AUTO", "Detectar automáticamente")] +
                                 [(i["codigo"], f"{i['codigo']} · {i.get('direccion') or i.get('ref_catastral') or ''}")
                                  for i in inmuebles], p, "AUTO", expand=True)
@@ -2205,31 +2397,54 @@ class App:
         sw_gan.visible = ext.tipo == pdf_processor.TipoDocumento.ESCRITURA_COMPRA
         def ajustar_tipo(_e=None):
             sw_gan.visible = dd_tipo.value == pdf_processor.TipoDocumento.ESCRITURA_COMPRA.value
+            if dd_tipo.value == pdf_processor.TipoDocumento.CATASTRO_IBI.value and not ejercicio_detectado:
+                ej_registro.value = ""
+                revisar_ejercicio()
+            confirmar_revision.visible = dd_tipo.value == pdf_processor.TipoDocumento.CATASTRO_IBI.value
+            confirmar_revision.value = False
+            actualizar_campos(dd_tipo.value)
+            fila_campos.controls = list(controles)
             self.page.update()
         dd_tipo.on_select = ajustar_tipo
-        claves = [c for c in ext.campos if c not in ("gananciales_forzado", "inmueble", "ejercicio")]
-        for sugerido in ia_extractor.CAMPOS_POR_TIPO.get(ext.tipo.value, ()):
-            if sugerido not in claves and sugerido != "ejercicio":
-                claves.append(sugerido)
         campos: dict[str, ft.TextField] = {}
         controles: list[ft.Control] = []
-        for clave in claves:
-            tipo = ia_extractor.CAMPOS.get(clave, "t")
-            valor = ext.campos.get(clave)
-            texto = ""
-            if valor not in (None, ""):
-                try:
-                    texto = (a_fecha(valor).strftime("%d/%m/%Y") if tipo == "f" else
-                             ui.eur(valor).replace(" €", "") if tipo == "i" else
-                             ui.pct(valor) if tipo == "p" else str(valor))
-                except (ValueError, TypeError):
-                    texto = str(valor)
-            evid = ext.evidencias.get(clave)
-            tf = ui.campo(ETIQUETAS_EXTRACCION.get(clave, clave.replace("_", " ").capitalize()), p, texto,
-                          ayuda=f"«{evid}»" if evid and evid != "Lector local" else evid,
-                          hint="No encontrado: escríbelo si lo ves en el PDF" if not texto else None)
-            campos[clave] = tf
-            controles.append(ft.Container(tf, col={"xs": 12, "sm": 6}))
+
+        def actualizar_campos(tipo_seleccionado):
+            anteriores = dict(campos)
+            campos.clear()
+            controles.clear()
+            claves = [c for c in ext.campos if c not in ("gananciales_forzado", "inmueble", "ejercicio")]
+            for sugerido in ia_extractor.CAMPOS_POR_TIPO.get(tipo_seleccionado, ()):
+                if sugerido not in claves and sugerido != "ejercicio":
+                    claves.append(sugerido)
+            for clave in claves:
+                if clave in anteriores:
+                    campos[clave] = anteriores[clave]
+                    controles.append(ft.Container(anteriores[clave], col={"xs": 12, "sm": 6}))
+                    continue
+                tipo = ia_extractor.CAMPOS.get(clave, "t")
+                valor = ext.campos.get(clave)
+                texto = ""
+                if valor not in (None, ""):
+                    try:
+                        texto = (a_fecha(valor).strftime("%d/%m/%Y") if tipo == "f" else
+                                 ui.eur(valor).replace(" €", "") if tipo == "i" else
+                                 ui.pct(valor) if tipo == "p" else str(valor))
+                    except (ValueError, TypeError):
+                        texto = str(valor)
+                evid = ext.evidencias.get(clave)
+                tf = ui.campo(ETIQUETAS_EXTRACCION.get(clave, clave.replace("_", " ").capitalize()), p, texto,
+                              ayuda=f"«{evid}»" if evid and evid != "Lector local" else evid,
+                              hint="No encontrado: escríbelo si lo ves en el PDF" if not texto else None)
+                if clave == "anio_revision":
+                    def invalidar_confirmacion(_e=None):
+                        confirmar_revision.value = False
+                        self.page.update()
+                    tf.on_change = invalidar_confirmacion
+                campos[clave] = tf
+                controles.append(ft.Container(tf, col={"xs": 12, "sm": 6}))
+        actualizar_campos(ext.tipo.value)
+        fila_campos = ft.ResponsiveRow(list(controles), spacing=10, run_spacing=10)
         motor = (ui.pastilla("Leído con IA · Claude", p.verde, p.verde_suave) if ext.motor == "ia"
                  else ui.pastilla("Lector local", p.naranja, p.naranja_suave))
         conf_color = p.verde if ext.confianza >= 0.8 else p.naranja if ext.confianza >= 0.5 else p.rojo
@@ -2252,6 +2467,9 @@ class App:
             if (self.cid, self.ejercicio) != (cid_revision, ej_abierto):
                 mostrar_error("El expediente o el ejercicio ha cambiado. Descarta esta revisión y vuelve a subir el PDF en el destino correcto.")
                 return
+            error.value = ""
+            for campo in campos.values():
+                campo.error = None
             try:
                 destino = int((ej_registro.value or "").strip())
                 if not 1900 <= destino <= 2200:
@@ -2280,6 +2498,14 @@ class App:
                 if a_fecha(nuevos["fecha"]).year != destino:
                     mostrar_error("El ejercicio no coincide con la fecha de la factura. Corrige la fecha o el ejercicio antes de guardar.", ej_registro)
                     return
+            if tipo_elegido == pdf_processor.TipoDocumento.CATASTRO_IBI and nuevos.get("anio_revision"):
+                if not 1900 <= int(nuevos["anio_revision"]) <= destino:
+                    mostrar_error("Indica un año de revisión entre 1900 y el ejercicio del valor.", campos.get("anio_revision"))
+                    return
+                if not confirmar_revision.value:
+                    mostrar_error("Confirma la revisión colectiva o deja su año vacío; el cálculo quedará provisional.", campos.get("anio_revision"))
+                    return
+            ext.revision_confirmada = bool(confirmar_revision.value) if tipo_elegido == pdf_processor.TipoDocumento.CATASTRO_IBI else False
             ext.tipo = tipo_elegido
             nuevos["ejercicio"] = destino
             if dd_inm.value and dd_inm.value != "AUTO":
@@ -2291,19 +2517,23 @@ class App:
             ext.campos = nuevos
             decision["guardar"] = True
             decision["resuelta"] = True
-            self.page.pop_dialog()
-            evento.set()
+            try:
+                self.page.pop_dialog()
+            finally:
+                evento.set()
 
         def descartar(_e=None, cerrar=True):
             if decision["resuelta"]:
                 return
             decision["resuelta"] = True
-            if cerrar:
-                self.page.pop_dialog()
-            evento.set()
+            try:
+                if cerrar:
+                    self.page.pop_dialog()
+            finally:
+                evento.set()
 
         movimientos = []
-        revisar_movimientos = ft.Checkbox(label="He revisado los movimientos propuestos", value=False,
+        revisar_movimientos = ft.Checkbox(label="He revisado los datos propuestos", value=False,
                                           visible=bool(ext.registros), active_color=p.acento)
         if ext.registros:
             for numero, registro in enumerate(ext.registros, 1):
@@ -2314,17 +2544,29 @@ class App:
                         return a_fecha(valor).strftime("%d/%m/%Y") if valor else "Sin indicar"
                     except (ValueError, TypeError):
                         return str(valor)
-                texto_fila = (f"{numero}. {'Cobro' if registro.tabla == 'cobros' else 'Gasto'} · "
-                              f"{fecha_visible(datos_fila.get('periodo_desde'))} — "
-                              f"{fecha_visible(datos_fila.get('periodo_hasta'))} · {ui.eur(importe) if importe is not None else 'Importe sin indicar'}")
+                if registro.tabla == "catastro":
+                    valor = datos_fila.get("valor_catastral")
+                    texto_fila = (f"{numero}. Catastro · ejercicio {datos_fila.get('ejercicio') or 'sin indicar'} · "
+                                  f"{ui.eur(valor) if valor is not None else 'Valor sin indicar'}")
+                elif registro.tabla == "cobros" and not datos_fila.get("periodo_desde") and not datos_fila.get("periodo_hasta"):
+                    texto_fila = (f"{numero}. Cobro · {fecha_visible(datos_fila.get('fecha_cobro'))} · "
+                                  f"{ui.eur(importe) if importe is not None else 'Importe sin indicar'} · Periodo pendiente de asignar")
+                else:
+                    texto_fila = (f"{numero}. {'Cobro' if registro.tabla == 'cobros' else 'Gasto'} · "
+                                  f"{fecha_visible(datos_fila.get('periodo_desde'))} — "
+                                  f"{fecha_visible(datos_fila.get('periodo_hasta'))} · {ui.eur(importe) if importe is not None else 'Importe sin indicar'}")
                 movimientos.append(ft.Column([ui.cuerpo(texto_fila, p), ui.leyenda(registro.evidencia, p),
-                    *[ui.leyenda(f"{ETIQUETAS_EXTRACCION.get(campo, campo.replace('_', ' ').capitalize())}: {fecha_visible(valor) if campo in {'fecha', 'fecha_cobro'} else ui.eur(valor) if campo in {'base', 'iva'} else valor}", p)
+                    *[ui.leyenda(f"{ETIQUETAS_EXTRACCION.get(campo, campo.replace('_', ' ').capitalize())}: {fecha_visible(valor) if campo in {'fecha', 'fecha_cobro'} else ui.eur(valor) if campo in {'base', 'iva', 'valor_suelo', 'valor_construccion'} else valor}", p)
                       for campo, valor in datos_fila.items()
-                      if valor not in (None, "") and campo not in {"periodo_desde", "periodo_hasta", "importe_cobrado", "total"}]], spacing=2))
+                      if valor not in (None, "") and campo not in {"periodo_desde", "periodo_hasta", "importe_cobrado", "total", "valor_catastral"}]], spacing=2))
         bloque_movimientos = ft.Column([
-            ui.leyenda(f"{len(ext.registros)} MOVIMIENTOS PROPUESTOS", p),
+            ui.leyenda(f"{len(ext.registros)} DATOS PROPUESTOS", p),
             ui.leyenda("Comprueba importes, periodos y fuentes. Si hay errores, descarta y ajusta el comentario; "
-                       "también podrás corregir las filas guardadas en Cobros o Gastos.", p),
+                       "también podrás corregir las filas guardadas en Cobros, Gastos o Catastro.", p),
+            *([ui.leyenda("Los cobros sin periodo quedarán pendientes de asignar en Cobros y no cambiarán la renta del contrato.", p)]
+              if any(r.tabla == "cobros" and not r.campos.get("periodo_desde") and not r.campos.get("periodo_hasta") for r in ext.registros) else []),
+            *([ui.leyenda("Ante diferencias con valores catastrales existentes, se conservará el conjunto anterior. Revisa el aviso antes de sustituirlos manualmente en Catastro.", p)]
+              if any(r.tabla == "catastro" for r in ext.registros) else []),
             ft.Column(movimientos, spacing=10),
             revisar_movimientos], visible=bool(ext.registros), spacing=8)
         contenido = ft.Column([
@@ -2342,7 +2584,8 @@ class App:
             sw_gan,
             ui.separador(p),
             ui.leyenda("Comprueba cada dato. Cuando hay una cita del PDF, se muestra debajo del campo.", p),
-            ft.ResponsiveRow(controles, spacing=10, run_spacing=10),
+            fila_campos,
+            confirmar_revision,
             error,
         ], spacing=12, tight=True, scroll=ft.ScrollMode.AUTO)
         dlg = self._dialogo(f"Revisar · {ext.nombre_archivo}", contenido,
@@ -2734,10 +2977,79 @@ class App:
         p = self.p
         aj = self.ctrl.ajustes_ia()
         sw = ui.interruptor(aj.activada, None, p)
-        hay = ia_extractor.hay_clave()
+        estado = ia_extractor.estado_clave()
+        hay = estado["guardada"]
+        desde_entorno = estado["origen"] == "entorno"
+        referencia = estado["referencia"]
+        f_guardada = ui.campo("Clave guardada", p, referencia, solo_lectura=True)
         f_clave = ui.campo("Clave API de Anthropic", p, "", password=True,
-                           hint="Guardada ✓ (escribe otra para cambiarla)" if hay else "sk-ant-…",
-                           ayuda="Se guarda en el almacén de credenciales de Windows, no en el proyecto.")
+                           hint="Nueva clave para sustituir la guardada" if hay else "Pega aquí tu clave",
+                           ayuda="Déjalo vacío para conservar la clave actual." if hay else
+                                 "Se guarda en el almacén de credenciales de Windows.")
+        f_clave.visible = not hay
+        error_clave = ui.leyenda("", p, p.rojo)
+        ver = ui.accion("Mostrar clave", None, p, I.VISIBILITY_OUTLINED)
+
+        def ocultar_guardada():
+            f_guardada.value = referencia
+            ver.content = "Mostrar clave"
+            ver.icon = I.VISIBILITY_OUTLINED
+
+        def limpiar_secretos():
+            ocultar_guardada()
+            f_clave.value = ""
+
+        def mostrar_clave(_e):
+            error_clave.value = ""
+            if ver.content == "Ocultar clave":
+                f_guardada.value = referencia
+                ver.content = "Mostrar clave"
+                ver.icon = I.VISIBILITY_OUTLINED
+            else:
+                valor = ia_extractor.obtener_clave()
+                if not valor:
+                    error_clave.value = "La clave ya no está disponible. Vuelve a guardarla."
+                    self.page.update()
+                    return
+                f_guardada.value = valor
+                ver.content = "Ocultar clave"
+                ver.icon = I.VISIBILITY_OFF_OUTLINED
+            self.page.update()
+        ver.on_click = mostrar_clave
+
+        def cambiar_clave(_e):
+            error_clave.value = ""
+            ocultar_guardada()
+            f_clave.visible = True
+            self.page.update()
+            if hasattr(self.page, "run_task"):
+                self.page.run_task(f_clave.focus)
+
+        def conservar_clave(_e):
+            confirmar_borrado.visible = False
+            self.page.update()
+
+        confirmar_borrado = ft.Column([
+            ui.cuerpo("¿Eliminar la clave de este equipo? Tendrás que introducirla otra vez para usar la IA.", p),
+            ft.Row([ui.accion("Conservar clave", conservar_clave, p),
+                    ui.accion("Confirmar eliminación", lambda e: borrar(e), p)], wrap=True),
+        ], visible=False, spacing=8, tight=True)
+
+        def pedir_borrado(_e):
+            ocultar_guardada()
+            error_clave.value = ""
+            confirmar_borrado.visible = True
+            self.page.update()
+
+        estado_visible = ui.tarjeta(ft.Column([
+            ui.cuerpo("Clave guardada" if hay else "Sin clave configurada", p, peso=ft.FontWeight.W_600),
+            *([ui.leyenda("Activa desde ANTHROPIC_API_KEY; se gestiona en Windows." if desde_entorno else
+                          "Guardada en este equipo. Se conservará al cerrar y volver a abrir Ajustes.", p),
+               f_guardada,
+               ft.Row([ver, *([] if desde_entorno else
+                   [ui.accion("Cambiar clave", cambiar_clave, p, I.EDIT_OUTLINED)])], wrap=True)] if hay else
+              [ui.leyenda("Introduce una clave para activar la lectura con IA.", p)]),
+        ], spacing=8, tight=True), p, padding=14)
         dd_modelo = ui.desplegable("Modelo", [("claude-opus-5-5", "Claude Opus 5.5 · máxima precisión"),
                                               ("claude-sonnet-5-5", "Claude Sonnet 5.5 · equilibrado"),
                                               ("claude-haiku-5-5", "Claude Haiku 5.5 · más barato")], p, aj.modelo)
@@ -2745,28 +3057,46 @@ class App:
                                                         ("high", "Alto · documentos difíciles")], p, aj.esfuerzo)
 
         def guardar(_e):
+            error_clave.value = ""
+            ocultar_guardada()
+            clave_nueva = (f_clave.value or "").strip()
             nuevo = ia_extractor.AjustesIA(activada=bool(sw.value), modelo=dd_modelo.value or aj.modelo,
-                                           esfuerzo=dd_esf.value or aj.esfuerzo)
+                                           esfuerzo=dd_esf.value or aj.esfuerzo, respaldo=aj.respaldo)
             try:
-                self.ctrl.guardar_ajustes_ia(nuevo, (f_clave.value or "").strip() or None)
+                self.ctrl.guardar_ajustes_ia(nuevo, clave_nueva or None)
             except Exception as exc:
-                self.avisar(str(exc), True)
+                error_clave.value = str(exc) if isinstance(exc, ia_extractor.ErrorIA) else "No se pudieron guardar los ajustes. Vuelve a intentarlo."
+                self.page.update()
                 return
+            limpiar_secretos()
             self.page.pop_dialog()
             self._pintar_principal()
-            self.avisar("Ajustes guardados.")
+            self.avisar("Ajustes y clave guardados." if clave_nueva else "Ajustes guardados.")
 
         def borrar(_e):
-            self.ctrl.borrar_clave_ia()
+            error_clave.value = ""
+            ocultar_guardada()
+            try:
+                self.ctrl.borrar_clave_ia()
+            except Exception as exc:
+                error_clave.value = str(exc) if isinstance(exc, ia_extractor.ErrorIA) else "No se pudo eliminar la clave. Vuelve a intentarlo."
+                self.page.update()
+                return
+            limpiar_secretos()
             self.page.pop_dialog()
             self._pintar_principal()
-            self.avisar("Clave API eliminada de este equipo.")
+            self.avisar("Clave API eliminada de este equipo; no se revoca en Anthropic.")
 
-        self._dialogo("Ajustes e IA", ft.Column([
+        def cancelar(_e=None):
+            limpiar_secretos()
+            self.page.pop_dialog()
+
+        dlg = self._dialogo("Ajustes e IA", ft.Column([
             ft.Row([ft.Column([ui.cuerpo("Leer los PDFs con IA (Claude)", p, peso=ft.FontWeight.W_600),
                                ui.leyenda("Entiende cualquier formato de notaría, ayuntamiento o contrato, "
                                           "también escaneados.", p)], spacing=2, expand=True), sw]),
-            f_clave, dd_modelo, dd_esf,
+            estado_visible, f_clave, confirmar_borrado, error_clave, dd_modelo, dd_esf,
+            ui.leyenda("Guardar la clave no consume saldo. La API consume al analizar documentos o usar el chat.", p),
             ft.Container(ft.Row([ft.Icon(I.SHIELD_OUTLINED, size=18, color=p.texto2),
                                  ft.Container(ui.leyenda(
                                      "Privacidad: cada PDF se envía a la API de Anthropic para leerlo. Revisa tu "
@@ -2774,10 +3104,13 @@ class App:
                                      "se usa el lector local, sin internet.", p), expand=True)],
                                 spacing=10, vertical_alignment=ft.CrossAxisAlignment.START),
                          bgcolor=p.campo, border_radius=12, padding=12),
-        ], spacing=14, tight=True), [
-            *([ui.boton("Borrar clave", borrar, p, tipo="peligro")] if hay else []),
-            ui.boton("Cancelar", self.cerrar_dialogo, p, tipo="texto"), ui.boton("Guardar", guardar, p, I.CHECK)],
+        ], spacing=14, tight=True, scroll=ft.ScrollMode.AUTO), [
+            *([ui.accion("Eliminar clave", pedir_borrado, p)] if hay and not desde_entorno else []),
+            ui.accion("Cancelar", cancelar, p), ui.accion("Guardar", guardar, p, I.CHECK, "primario")],
             ancho=520, icono=I.TUNE)
+        if dlg is not None:
+            dlg.on_dismiss = lambda _e: limpiar_secretos()
+            self.page.update()
 
     # ================================================================== bandeja vigilada
     def _revisar_lote_bandeja(self, cid: int, ej: int, rutas: list[Path]):

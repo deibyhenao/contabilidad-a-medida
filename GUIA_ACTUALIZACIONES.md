@@ -1,5 +1,24 @@
 # Instalador y actualizaciones de Contabilidad a Medida
 
+## Novedades de la versión 1.0.5
+
+1. Lectura híbrida: Haiku procesa los documentos; Sonnet interviene solo si no se reconocen, la confianza es menor de 0,50 o hay un error de esquema o negativa compatible con respaldo.
+2. Caché del prompt en la extracción habitual. La relectura de respaldo evita una escritura de caché que no se reutilizaría.
+3. Mejor lectura de Excel con totales sin fecha y estados de cobro ambiguos, con avisos para revisar.
+4. Prórroga legal solo para contratos vigentes; se respeta la rescisión anticipada.
+5. Corrección de datos de una imputación ya presentada sin bloquear la edición por la revisión catastral.
+6. Aviso cuando la base de un 210 presentado no coincide con los ingresos y gastos registrados.
+7. El Excel conserva los importes históricos de una imputación presentada y explica su origen en comentarios.
+8. Menor envío de páginas en PDF largos: selección ordenada de hasta 40 páginas y aviso de lectura parcial. Reduce consumo en documentos extensos; no garantiza encontrar datos de páginas omitidas ni evitar cualquier tramo de tarifa.
+9. Compatibilidad del esquema de extracción con la API real y control del tamaño de la petición antes de enviarla.
+10. Chat más breve, con avisos documentales sin contrastar, cobros pendientes de conciliación y la leyenda de respuestas orientativas.
+11. Imputaciones provisionales identificadas en el resumen fiscal y en el indicador de cuotas.
+12. Rescisión compatible con los desplegables y aviso de que cambiar la carpeta de clientes no traslada expedientes existentes.
+13. Un 210 presentado con NRC de formato plausible y pago vacío puede tomar la cuota como pago, con nota de origen. Conserva cualquier importe manual, incluido cero o un pago parcial. Los comentarios del resumen distinguen pagos, pendientes y movimientos sin conciliar.
+14. Tarjeta de progreso al subir documentos: estados por archivo, tiempo, modelos utilizados y coste estimado, también si se descarta o falla una lectura. Los costes incompletos se identifican como parciales.
+
+También se evita duplicar imágenes compartidas al preparar PDF largos. La vista protege el lote activo frente a una segunda subida y detiene los documentos pendientes al cambiar de expediente o ejercicio.
+
 ## Para quien instala el programa
 
 1. Descarga `ContabilidadAMedida-<versión>-windows-x64-Setup.exe` de **Releases** del repositorio oficial.

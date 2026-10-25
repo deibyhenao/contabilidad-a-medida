@@ -87,6 +87,36 @@ def test_contexto_incluye_expediente_y_pdfs(ctrl, pepito):
     assert "sha256" not in texto and "cliente_id" not in texto
 
 
+def test_contexto_incluye_cobros_pendientes_sin_inventar_devengo(ctrl, pepito):
+    ctrl.db.upsert("cobros", pepito, {"ejercicio": 2026, "inmueble": "INM-001",
+        "fecha_cobro": "2026-06-01", "importe_cobrado": 2115,
+        "estado": "Pendiente", "observaciones": "MOVIMIENTO_PENDIENTE_CONCILIAR"})
+    texto, _ = asis.construir_contexto(ctrl.lector, pepito, 2026)
+    cobros = texto.split("## cobros (", 1)[1].split("\n\n##", 1)[0]
+    assert "importe_cobrado=2115.0" in cobros and "estado=Pendiente" in cobros
+    assert "MOVIMIENTO_PENDIENTE_CONCILIAR" in cobros and "fecha_cobro=2026-06-01" in cobros
+    assert "periodo_desde=" not in cobros and "periodo_hasta=" not in cobros and "contrato=" not in cobros
+
+
+def test_avisos_de_la_lectura_ia_llegan_como_sin_contrastar(ctrl, pepito):
+    ctrl.db.registrar_documento(pepito, "Soportes_PDF/210.pdf", "Modelo 210", "a" * 64, "210.pdf",
+                                observaciones="AVISO_LIBRE_DE_LA_IA")
+    texto, _ = asis.construir_contexto(ctrl.lector, pepito, 2026)
+    docs = texto.split("## documentos (", 1)[1].split("\n\n##", 1)[0]
+    assert "avisos_lectura_sin_contrastar=AVISO_LIBRE_DE_LA_IA" in docs and "observaciones=" not in docs
+    assert "avisos_lectura_sin_contrastar" in asis.SISTEMA
+
+
+def test_avisos_ia_sin_contrastar_tambien_en_cartera_residentes(ctrl):
+    cid = ctrl.crear_cliente("Prueba", "Residente", "12345678Z", tipo_cliente="Autónomo")["id"]
+    ctrl.db.registrar_documento(cid, "Soportes_PDF/factura.pdf", "Factura", "b" * 64, "factura.pdf",
+                                observaciones="AVISO_RESIDENTE_SIN_CONTRASTAR")
+    texto, _ = asis.construir_contexto(ctrl.lector, cid, 2026)
+    docs = texto.split("## documentos (", 1)[1].split("\n\n##", 1)[0]
+    assert "avisos_lectura_sin_contrastar=AVISO_RESIDENTE_SIN_CONTRASTAR" in docs
+    assert "observaciones=" not in docs
+
+
 def test_solo_lee_la_carpeta_de_su_cliente(ctrl, pepito, tmp_path):
     otro = ctrl.crear_cliente("Ana", "Ruiz", "Y7654321B")["id"]
     _pdf(Path(ctrl.db.get_cliente(otro)["carpeta"]) / "Soportes_PDF" / "secreto.pdf", "DATOS DE ANA")

@@ -346,6 +346,11 @@ def test_presentado_no_admite_cambio_silencioso_de_periodicidad(expediente):
     tax.recalcular_cliente(db, cid, 2025)
     fila = modelo(db, cid, inm, 2025)
     db.upsert("m210_alquiler", cid, {"codigo": fila["codigo"], "estado": "Presentado"})
+    congelada = db.get("m210_alquiler", cid, fila["codigo"])
     db.set_config("periodicidad_210_alquiler", "Trimestral")
-    with pytest.raises(ValueError, match="periodicidad"):
-        tax.recalcular_cliente(db, cid, 2026)
+    tax.recalcular_cliente(db, cid, 2026)
+    assert db.get("m210_alquiler", cid, fila["codigo"]) == congelada
+    assert db.get_config("periodicidad_210_alquiler") == "Trimestral"
+    assert {r["periodo"] for r in db.listar("m210_alquiler", cid, ejercicio=2025)} == {"Anual"}
+    assert {r["periodo"] for r in db.listar("m210_alquiler", cid, ejercicio=2026)
+            if r["estado"] != "No procede"} == {"1T", "2T", "3T", "4T"}

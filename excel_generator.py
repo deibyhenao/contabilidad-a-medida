@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import math
 import json
 import hashlib
 import shutil
@@ -348,6 +349,37 @@ def _resumen_valores(wb, db: Database, cid: int, ejercicio: int) -> None:
     wb["03_CATASTRO_IBI"]["E1"].comment = Comment("Valor catastral del ejercicio. Se conserva separado del precio de escritura, los gastos y el valor de referencia.", "Contabilidad a Medida")
 
 
+def _aclaraciones_resumen(wb, db: Database, cid: int, ejercicio: int) -> None:
+    """Aclara el alcance de las fórmulas existentes sin cambiarlas ni alterar la plantilla."""
+    from tax_calculator import fmt_eur
+    ws = wb["00_RESUMEN"]
+    notas = {
+        "H7": "Total de impuestos pagados registrados para el ejercicio. No suma cuotas pendientes ni provisionales.",
+        "E10": "Suma de movimientos cobrados registrados; puede incluir cobros pendientes de conciliar. No acredita su naturaleza ni su devengo fiscal.",
+        "E12": "Suma de importes anotados en gastos. Contrasta la deducción fiscal con residencia, límites y modelos 210; no acredita por sí sola gastos efectivamente deducidos.",
+        "H10": "Cuenta documentos faltantes de todo el expediente, no solo del ejercicio seleccionado. Filtra 13_DOCUMENTACION por ejercicio para revisarlos.",
+    }
+    pendientes = [f for f in db.listar("m210_imputacion", cid, ejercicio=ejercicio)
+                  if f.get("estado") not in ("Presentado", "No procede")]
+    total = sum(float(f.get("cuota") or 0) for f in pendientes)
+    notas["E14"] = ("Solo suma importes pagados, no la cuota pendiente. Cuota de modelos no presentados: "
+                    + fmt_eur(total) + ". Consulta 10_210_IMPUTACION."
+                    + " Una declaración presentada también puede tener pagos pendientes."
+                    + (" Cálculo PROVISIONAL: falta documentación por acreditar." if any(
+                        f.get("estado") == "Falta documentación" for f in pendientes) else ""))
+    for coordenada, texto in notas.items():
+        anterior = ws[coordenada].comment
+        if anterior:
+            texto = anterior.text if texto in anterior.text else anterior.text + "\n\n" + texto
+            comentario = copy(anterior)
+            comentario.text = texto
+        else:
+            comentario = Comment(texto, "Contabilidad a Medida")
+        comentario.width = max(comentario.width, 360)
+        comentario.height = max(comentario.height, 160)
+        ws[coordenada].comment = comentario
+
+
 def exportar_cliente(db: Database, cliente_id: int, ejercicio: int, destino: Path | None = None) -> Path:
     """Exporta BD; el controlador debe importar el Excel ANTES de modificar BD.
 
@@ -388,6 +420,16 @@ def exportar_cliente(db: Database, cliente_id: int, ejercicio: int, destino: Pat
                         celda.value = _valor_excel(col, valor)
                         if isinstance(celda.value, str):
                             celda.data_type = "s"
+                if nombre == "m210_imputacion" and datos.get("estado") == "Presentado":
+                    # Congelada: renta y cuota son las del justificante (la fórmula usaría los datos de la app)
+                    for formula, campo in (("renta_imputada_formula", "renta_imputada"), ("cuota_formula", "cuota")):
+                        col = next((c for c in tabla.columnas_excel if c.campo == formula), None)
+                        if col and datos.get(campo) not in (None, ""):
+                            ws[f"{col.letra}{fila}"].value = float(datos[campo])
+                            ws[f"{col.letra}{fila}"].comment = Comment(
+                                "Importe de la declaración presentada (justificante). Sustituye a la fórmula para "
+                                "conservar lo declarado; si deja de estar presentada, vuelve la fórmula.",
+                                "Contabilidad a Medida")
         resumen = {
             **cliente,
             "nombre_completo": f"{cliente['nombre']} {cliente['apellidos']}".strip(),
@@ -404,6 +446,7 @@ def exportar_cliente(db: Database, cliente_id: int, ejercicio: int, destino: Pat
         if cartera == NR:  # el desglose dinámico por inmueble solo existe en la plantilla de no residentes
             _resumen_gastos(ws, db.listar("inmuebles", cliente_id), max(3000, wb["08_GASTOS"].max_row))
             _resumen_valores(wb, db, cliente_id, ejercicio)
+            _aclaraciones_resumen(wb, db, cliente_id, ejercicio)
         if wb.calculation is None:
             wb.calculation = CalcProperties()
         wb.calculation.fullCalcOnLoad = True
@@ -561,6 +604,21 @@ def sincronizar(db: Database, cliente_id: int, ejercicio: int) -> Path:
     return exportar_cliente(db, cliente_id, ejercicio)
 
 
+def _celdas_imputacion_congeladas(ws) -> set[str]:
+    """Renta y cuota de una imputación presentada: llevan el importe del justificante en lugar de la fórmula."""
+    tabla = database.TABLAS["m210_imputacion"]
+    if ws.title not in {tabla.hoja_en(c) for c in (NR, RES)}:
+        return set()
+    letra = {c.campo: c.letra for c in tabla.columnas_excel}
+    if "estado" not in letra:
+        return set()
+    return {f"{letra[campo]}{fila}"
+            for fila in range(tabla.fila_inicio, ws.max_row + 1) if ws[f"{letra['estado']}{fila}"].value == "Presentado"
+            for campo in ("renta_imputada_formula", "cuota_formula")
+            if campo in letra and type(ws[f"{letra[campo]}{fila}"].value) in (int, float)
+            and math.isfinite(ws[f"{letra[campo]}{fila}"].value)}
+
+
 def verificar_estructura(ruta: Path, plantilla_ruta: Path | None = None) -> list[str]:
     """Diferencias respecto a la plantilla (NR por defecto), sin evaluar fórmulas."""
     diferencias = []
@@ -594,8 +652,11 @@ def verificar_estructura(ruta: Path, plantilla_ruta: Path | None = None) -> list
             if ws.max_column != original.max_column:
                 diferencias.append(f"{ws.title}: número de columnas diferente")
             # También protege las fórmulas de resumen.
+            congeladas = _celdas_imputacion_congeladas(ws)
             for fila in original:
                 for celda in fila:
+                    if celda.coordinate in congeladas:
+                        continue
                     if celda.data_type == "f" and ws[celda.coordinate].value != celda.value:
                         diferencias.append(f"{ws.title}!{celda.coordinate}: fórmula diferente o ausente")
     finally:

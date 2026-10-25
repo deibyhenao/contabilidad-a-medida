@@ -106,7 +106,7 @@ CALCULADOS = {
     "m111_115": {"perceptores", "base", "retenciones"},
 }
 OCULTOS = {"codigo", "sha256", "nombre_original", "origen", "pct_titularidad_escritura", "renta_imputada", "cuota",
-           "detalle_limite"}
+           "detalle_limite", "revision_pendiente"}
 CAMPOS_PRESENTACION = {
     "m210_alquiler": ("fecha_presentacion", "pagado", "nrc"),
     "m210_imputacion": ("fecha_presentacion", "pagado", "nrc"),
@@ -553,11 +553,15 @@ class Controlador:
                 raise ValueError(f"Cliente inexistente: {cid}")
             self.db.verificar_cartera(cliente)  # nunca se archiva un soporte fuera de la cartera del cliente
             self._importar(cid)
-            resultado = pdf_processor.procesar_pdf(self.db, cid, Path(ruta_pdf), confirmar=confirmar,
-                                                   inmueble_destino=inmueble_destino, ejercicio=ej,
-                                                   **({"comentario_guia": comentario_guia} if comentario_guia else {}))
-            return {"resultado": resultado,
-                    **self._recalcular_y_exportar(cid, set(resultado.ejercicios_afectados) | {ej}, ej)}
+            ext, huella = pdf_processor.preparar_pdf(self.db, Path(ruta_pdf), confirmar=confirmar,
+                                                   comentario_guia=comentario_guia)
+            # Confirmar importación y cálculo juntos; exportar solo después del commit.
+            with pdf_processor.archivos_importacion(), self.db.transaccion():
+                resultado = pdf_processor.aplicar(self.db, cid, ext, Path(ruta_pdf),
+                                                  inmueble_destino=inmueble_destino, ejercicio=ej,
+                                                  huella_esperada=huella)
+                informe = self._recalcular_bd(cid, set(resultado.ejercicios_afectados) | {ej}, ej)
+            return {"resultado": resultado, **self._exportar_informe(cid, ej, informe)}
 
     def sincronizar(self, cid: int, ejercicio: int) -> dict:
         with self._lock:
@@ -646,12 +650,16 @@ class Controlador:
         with self._lock:
             self._importar(cid)
             validos = {c.campo for c in TABLAS[tabla].columnas_bd}
-            limpios = {k: v for k, v in datos.items() if k in validos and k != "codigo"}
+            limpios = {k: v for k, v in datos.items() if k in validos and k not in {"codigo", "revision_pendiente"}}
             if tabla in ("gastos", "facturas_emitidas", "facturas_recibidas") and not codigo:
                 limpios.setdefault("origen", "app")
             if tabla == "residencias" and limpios.get("ejercicio"):
                 codigo = codigo or str(int(limpios["ejercicio"]))
             previa = self.db.get(tabla, cid, codigo) if codigo else None
+            if tabla == "catastro" and limpios.get("anio_revision"):
+                anio_valor = limpios.get("ejercicio") or (previa or {}).get("ejercicio") or ejercicio
+                if int(limpios["anio_revision"]) > int(anio_valor):
+                    raise ValueError("La revisión catastral no puede ser posterior al ejercicio del valor.")
             with self.db.transaccion():
                 if codigo:
                     nuevo = self.db.upsert(tabla, cid, {"codigo": codigo, **limpios}, respetar_manuales=False)
@@ -662,6 +670,13 @@ class Controlador:
                 else:
                     nuevo = self.db.upsert(tabla, cid, limpios, respetar_manuales=False)
                 fila = self.db.get(tabla, cid, nuevo) or {}
+                # Los ajustes administrativos de una presentada conservan su justificante.
+                # Cambiar su identidad fiscal exige validar el nuevo destino, aun omitiendo estado.
+                cambia_destino = any((previa or {}).get(k) != fila.get(k)
+                                     for k in ("ejercicio", "inmueble", "id_modelo"))
+                if fila.get("estado") == "Presentado" and (
+                        (previa or {}).get("estado") != "Presentado" or cambia_destino):
+                    self._validar_imputacion_presentable(cid, tabla, nuevo, fila_propuesta=fila)
                 if tabla == "inmuebles":
                     self.db.proteger_campos_inmueble(cid, nuevo, (
                         k for k in limpios if (previa or {}).get(k) != fila.get(k)))
@@ -819,6 +834,20 @@ class Controlador:
                 afectados |= tax_calculator.ejercicios_gasto(previa or {})
             return self._recalcular_y_exportar(cid, afectados, int(ejercicio))
 
+    def _validar_imputacion_presentable(self, cid: int, tabla: str, codigo: str,
+                                          fila_propuesta: Optional[dict] = None) -> None:
+        from validacion_catastro import revision_pendiente
+        fila = fila_propuesta if fila_propuesta is not None else (self.db.get(tabla, cid, codigo) or {})
+        if tabla == "obligaciones":
+            modelo = fila.get("id_modelo")
+            if modelo and _PREFIJO_A_TABLA.get(modelo.rsplit("-", 1)[0]) == "m210_imputacion":
+                return self._validar_imputacion_presentable(cid, "m210_imputacion", modelo,
+                    fila_propuesta=self.db.get("m210_imputacion", cid, modelo))
+        if tabla == "m210_imputacion" and (fila_propuesta is not None or fila.get("estado") != "Presentado"):
+            cat = self.db.catastro(cid, fila.get("inmueble"), fila.get("ejercicio"))
+            if revision_pendiente(cat):
+                raise ValueError("La imputación es provisional: acredita la revisión catastral o confirma el porcentaje manual en Catastro antes de marcarla presentada.")
+
     def marcar_presentado(self, cid: int, tabla: str, codigo: str, ejercicio: int,
                           fecha_presentacion: Any = None, pagado: Any = None, justificante: Optional[str] = None) -> dict:
         """Marca una declaración como presentada (y su obligación/modelo enlazado)."""
@@ -834,6 +863,7 @@ class Controlador:
             raise ValueError("; ".join(errores.values()))
         with self._lock:
             self._importar(cid)
+            self._validar_imputacion_presentable(cid, tabla, codigo)
             self.db.upsert(tabla, cid, {"codigo": codigo, **datos})
             enlazados = []
             if tabla == "obligaciones":

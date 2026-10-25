@@ -85,7 +85,13 @@ def test_e2e_pepito_flujo_completo(tmp_path):
             anio_revision=2019,
             ibi=450,
         )
-        r_ibi = ctrl.procesar_pdf(cid, pdf_ibi, ejercicio=2026)
+        def confirmar_ibi(ext):
+            # La etiqueta genérica de la fixture exige confirmación humana de la revisión colectiva.
+            assert ext.campos["anio_revision"] == 2019
+            ext.revision_confirmada = True
+            return ext
+
+        r_ibi = ctrl.procesar_pdf(cid, pdf_ibi, ejercicio=2026, confirmar=confirmar_ibi)
         assert r_ibi["error_excel"] is None
 
         wb = openpyxl.load_workbook(ruta_excel)

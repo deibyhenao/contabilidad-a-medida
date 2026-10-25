@@ -494,10 +494,14 @@ def test_caso_12_proteccion_presentado_y_avisos_revisar(expediente_ag):
     assert db.get("m210_alquiler", cid, fila_25["codigo"]) == congelada
     assert db.get_por_clave("arrastres_gastos", cid, f"ARR|{inm}|2025")["generado"] == pytest.approx(400.0)
 
-    # Cambiar periodicidad con un 210 Presentado de otra periodicidad lanza ValueError explícito
+    # La preferencia futura no debe modificar el calendario ni los saldos del presentado.
     db.set_config("periodicidad_210_alquiler", "Trimestral")
-    with pytest.raises(ValueError, match="periodicidad"):
-        tax.recalcular_cliente(db, cid, 2026)
+    tax.recalcular_cliente(db, cid, 2026)
+    assert db.get("m210_alquiler", cid, fila_25["codigo"]) == congelada
+    assert db.get_config("periodicidad_210_alquiler") == "Trimestral"
+    assert db.get_por_clave("arrastres_gastos", cid, f"ARR|{inm}|2025")["generado"] == pytest.approx(400.0)
+    assert {r["periodo"] for r in db.listar("m210_alquiler", cid, ejercicio=2026)
+            if r["estado"] != "No procede"} == {"1T", "2T", "3T", "4T"}
 
 
 # ==============================================================================
@@ -595,4 +599,3 @@ def test_ui_claro_oscuro_gastos_arrastres_clasificar_y_sin_fugas(expediente_ag, 
     for prohibido in ("json_ia", "origen", "detalle_limite", "NO_MOSTRAR_JSON_IA", "HIDDEN_TOKEN", "cliente_id"):
         assert prohibido not in dlg_textos
     assert "detalle_limite" not in {c.campo for c in campos_editables("m210_alquiler")}
-

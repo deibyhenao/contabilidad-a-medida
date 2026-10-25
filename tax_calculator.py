@@ -14,8 +14,12 @@ Reglas de prudencia:
 """
 from __future__ import annotations
 
+from validacion_catastro import PENDIENTE_REVISION, revision_pendiente
+
 import calendar
 import json
+import math
+import re
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -257,7 +261,7 @@ def pct_imputacion(anio_revision: Optional[int], ejercicio: int, manual: Optiona
     2 % en otro caso o si no consta el año. Un % introducido a mano en 03_CATASTRO_IBI (col. J) manda."""
     if manual not in (None, ""):
         return fraccion(manual)
-    if anio_revision and int(anio_revision) >= 1994 and int(anio_revision) >= ejercicio - 10:
+    if anio_revision and int(anio_revision) >= 1994 and ejercicio - 10 <= int(anio_revision) <= ejercicio:
         return PCT_IMPUTACION_REVISADO
     return PCT_IMPUTACION_GENERAL
 
@@ -270,8 +274,31 @@ def a_mensual(importe: Optional[float], periodicidad: Optional[str]) -> float:
     return float(importe or 0) / _DIVISOR_PERIODICIDAD.get(periodicidad or "Mensual", 1)
 
 
+def fin_con_prorroga(ctr: dict) -> Optional[date]:
+    """Fin legal de un arrendamiento de VIVIENDA sin fecha de fin real: la LAU (art. 9) lo prorroga
+    obligatoriamente para el arrendador hasta 5 años (contratos desde el 06/03/2019) o 3 años (06/06/2013-05/03/2019),
+    salvo que el inquilino comunique que no renueva. Devuelve None si no aplica (temporada, local, terminado...).
+    Arrendador persona física (los clientes no residentes lo son); con persona jurídica serían 7 años · VERIFICAR."""
+    # Solo un contrato vigente se prorroga por ley: «Prorrogado» ya es indefinido y el resto terminó o no empezó.
+    if ctr.get("fecha_fin_real") or (ctr.get("estado") or "Vigente") != "Vigente":
+        return None
+    tipo = _sin_tildes(ctr.get("tipo") or "")
+    ini, fin = a_fecha(ctr.get("fecha_inicio")), a_fecha(ctr.get("fecha_fin_prevista"))
+    if "vivienda" not in tipo or "temporada" in tipo or not ini or not fin:
+        return None
+    anios = 5 if ini >= date(2019, 3, 6) else 3 if ini >= date(2013, 6, 6) else 0
+    if not anios:
+        return None
+    try:
+        legal = ini.replace(year=ini.year + anios) - timedelta(days=1)
+    except ValueError:  # 29 de febrero
+        legal = date(ini.year + anios, 2, 28)
+    return legal if legal > fin else None
+
+
 def intervalo_contrato(ctr: dict) -> Optional[tuple[date, date]]:
-    """[inicio, fin real o fin prevista]. Sin fin = indefinido. Contratos Cancelado / Pendiente firma no cuentan."""
+    """[inicio, fin real o fin prevista]. Sin fin = indefinido. Contratos Cancelado / Pendiente firma no cuentan.
+    Un contrato de vivienda sin fin real sigue hasta su fin legal con prórroga (``fin_con_prorroga``)."""
     if ctr.get("estado") in ("Cancelado", "Pendiente firma"):
         return None
     ini = a_fecha(ctr.get("fecha_inicio"))
@@ -280,6 +307,7 @@ def intervalo_contrato(ctr: dict) -> Optional[tuple[date, date]]:
     fin = a_fecha(ctr.get("fecha_fin_real")) or a_fecha(ctr.get("fecha_fin_prevista")) or date(9999, 12, 31)
     if ctr.get("estado") == "Prorrogado" and not ctr.get("fecha_fin_real"):
         fin = date(9999, 12, 31)
+    fin = fin_con_prorroga(ctr) or fin
     return (ini, fin) if ini <= fin else None
 
 
@@ -394,6 +422,7 @@ class Resultado210Alquiler:
     cuota: float
     detalle: list[str] = field(default_factory=list)
     detalle_limite: dict = field(default_factory=dict)
+    ingresos_contrato: Optional[float] = None   # periodo presentado: lo que devengan los contratos (comparación)
 
 
 CATEGORIAS_LIMITADAS = frozenset(("Intereses/financiación", "Reparación/conservación"))
@@ -461,10 +490,12 @@ def liquidar_210_alquiler(inm: dict, contratos: list[dict], rentas_por_contrato:
             except (ValueError, TypeError, KeyError):
                 liquidacion.revisar = True
                 liquidacion.saldos.clear()
+            devengado = sum(renta_devengada(c, rentas_por_contrato.get(c["codigo"], []), *ventana) for c in contratos)
             liquidacion.resultados.append(Resultado210Alquiler(
                 etiqueta, ventana[0], ventana[1], [], float(congelada.get("ingresos") or 0),
                 float(congelada.get("gastos") or 0), float(congelada.get("base") or 0),
-                float(congelada.get("tipo") or res.tipo), float(congelada.get("cuota") or 0)))
+                float(congelada.get("tipo") or res.tipo), float(congelada.get("cuota") or 0),
+                ingresos_contrato=r2(devengado * tit)))
             continue
         usados, ingresos_100 = [], 0.0
         for c in contratos:
@@ -541,9 +572,10 @@ class Resultado210Imputacion:
     cuota: float
     detalle: list[str] = field(default_factory=list)
     falta_valor: bool = False
+    provisional: bool = False
 
 
-_OBS_AUTO_IMPUTACION = ("Sin valor catastral", "Valor catastral heredado", "Año bisiesto")
+_OBS_AUTO_IMPUTACION = ("Sin valor catastral", "Valor catastral heredado", "Año bisiesto", PENDIENTE_REVISION)
 
 
 def calcular_210_imputacion(inm: dict, contratos: list[dict], cat: Optional[dict], res: Residencia,
@@ -569,11 +601,14 @@ def calcular_210_imputacion(inm: dict, contratos: list[dict], cat: Optional[dict
         vc = r2(vp.valor * 0.5)
         pct = PCT_IMPUTACION_REVISADO
         detalle.append("Sin valor catastral: 1,1 % sobre 50 % del mayor valor")
+    provisional = revision_pendiente(cat)
+    if provisional:
+        detalle.append(PENDIENTE_REVISION + ": cálculo provisional; confirma el año o el porcentaje manual.")
     if calendar.isleap(ejercicio):
         detalle.append("Año bisiesto: la plantilla divide entre 365")
     renta = r2(vc * pct * tit * dias_vacio / DIAS_ANIO_PLANTILLA)
     return Resultado210Imputacion(dias_vacio, r2(vc), pct, tit, res.tipo, renta, r2(renta * res.tipo), detalle,
-                                  falta_valor=vc <= 0)
+                                  falta_valor=vc <= 0, provisional=provisional)
 
 
 # ============================================================================================ Patrimonio / ITS
@@ -794,17 +829,67 @@ def _gasto_toca_ejercicio(g: dict, ejercicio: int) -> bool:
     return bool(periodo and interseccion(periodo, anio(ejercicio)))
 
 
+NOTA_PAGO_NRC = "Pagado tomado de la cuota por constar NRC"
+
+
+def pago_inferido_por_nrc(fila: dict) -> Optional[float]:
+    """Completa un pago ausente, sin validar el NRC con el banco ni recalcular lo presentado."""
+    if fila.get("estado") != "Presentado" or fila.get("pagado") not in (None, ""):
+        return None
+    nrc = fila.get("nrc")
+    if (not isinstance(nrc, str) or not nrc.strip().isascii()
+            or not re.fullmatch(r"[A-Z0-9]{22}", nrc.strip().upper(), flags=re.ASCII)):
+        return None
+    cuota = fila.get("cuota")
+    if type(cuota) not in (int, float) or not math.isfinite(cuota) or cuota <= 0:
+        return None
+    return r2(cuota)
+
+
+def _anadir_nota_nrc(texto: Optional[str]) -> str:
+    texto = texto or ""
+    return texto if NOTA_PAGO_NRC in texto else (texto + "; " if texto else "") + NOTA_PAGO_NRC
+
+
+def completar_pago_210_nrc(db: Database, cid: int, tabla: str, codigo: str) -> dict:
+    if tabla not in ("m210_alquiler", "m210_imputacion"):
+        raise ValueError("El pago por NRC solo se completa en modelos 210.")
+    fila = db.get(tabla, cid, codigo) or {}
+    importe = pago_inferido_por_nrc(fila)
+    if importe is not None:
+        db.upsert(tabla, cid, {"codigo": codigo, "pagado": importe,
+                              "observaciones": _anadir_nota_nrc(fila.get("observaciones"))},
+                  solo_si_vacio=("pagado",))
+        fila = db.get(tabla, cid, codigo) or fila
+    return fila
+
+
 def _obligacion(db: Database, cid: int, ejercicio: int, tipo: str, inmueble: Optional[str], clave: str,
                 fecha_limite: date, id_modelo: Optional[str], estado: str, notas: str = "",
                 pagado: Optional[float] = None, fecha_presentacion=None) -> str:
     previa = db.get_por_clave("obligaciones", cid, clave)
+    es_210 = tipo in ("210 Alquiler", "210 Imputación")
+    nota_nrc = False
+    if es_210 and id_modelo:
+        tabla = "m210_alquiler" if tipo == "210 Alquiler" else "m210_imputacion"
+        modelo = completar_pago_210_nrc(db, cid, tabla, id_modelo)
+        if pagado in (None, ""):
+            pagado = modelo.get("pagado")
+        nota_nrc = NOTA_PAGO_NRC in (modelo.get("observaciones") or "")
     if _presentado(previa):
+        if es_210 and previa.get("pagado") in (None, "") and pagado not in (None, ""):
+            cambios = {"codigo": previa["codigo"], "pagado": pagado}
+            if nota_nrc:
+                cambios["notas"] = _anadir_nota_nrc(previa.get("notas"))
+            db.upsert("obligaciones", cid, cambios, solo_si_vacio=("pagado",))
         return previa["codigo"]
+    if nota_nrc:
+        notas = _anadir_nota_nrc(notas)
     datos = {"ejercicio": ejercicio, "tipo": tipo, "inmueble": inmueble, "fecha_limite": fecha_limite,
              "id_modelo": id_modelo, "notas": notas or None}
     if not _presentado(previa):
         datos.update(estado=estado, pagado=pagado, fecha_presentacion=fecha_presentacion)
-    return db.upsert("obligaciones", cid, datos, clave=clave)
+    return db.upsert("obligaciones", cid, datos, clave=clave, solo_si_vacio=("pagado",) if es_210 else ())
 
 
 def _generar_cobros(db: Database, cid: int, ejercicio: int, inm: dict, contratos: list[dict],
@@ -818,8 +903,14 @@ def _generar_cobros(db: Database, cid: int, ejercicio: int, inm: dict, contratos
             tramo = tenencia and interseccion((ini, fin), tenencia)
             importe = renta_devengada(c, rentas_por_contrato.get(c["codigo"], []), *tramo) if tramo else 0.0
             clave = f"COB|{c['codigo']}|{ejercicio}-{mes:02d}"
-            if importe <= 0 and not db.get_por_clave("cobros", cid, clave):
-                continue
+            if importe <= 0:
+                previa = db.get_por_clave("cobros", cid, clave)
+                # Fila automática que ya no corresponde (contrato rescindido o recortado) y sin nada cobrado: fuera.
+                if previa and not previa.get("importe_cobrado") and not previa.get("fecha_cobro") \
+                        and (previa.get("estado") or "Pendiente") == "Pendiente":
+                    db.borrar("cobros", cid, previa["codigo"])
+                if not previa or not db.get("cobros", cid, previa["codigo"]):
+                    continue
             db.upsert("cobros", cid, {"ejercicio": ejercicio, "inmueble": inm["codigo"], "contrato": c["codigo"],
                                       "periodo_desde": ini, "periodo_hasta": fin, "importe_contractual": importe,
                                       "estado": "Pendiente"}, clave=clave, solo_si_vacio=("estado",))
@@ -847,10 +938,18 @@ def _liquidacion_con_historia(db: Database, cid: int, inm: dict, contratos: list
     revisar_hasta = 0
     for ej in range(min(ejercicios), ejercicio + 1):
         presentados = {f["periodo"]: f for f in modelos if f.get("ejercicio") == ej and _presentado(f)}
+        # La preferencia global no cambia el calendario de un histórico ya presentado.
+        # Resolver por inmueble y año permite carteras con declaraciones de ambos tipos.
+        periodos = set(presentados)
+        if periodos and not (periodos <= {"1T", "2T", "3T", "4T"} or periodos == {"Anual"}):
+            raise ValueError(f"{cod}, ejercicio {ej}: hay declaraciones presentadas con periodicidades incompatibles. "
+                             "Revisa el histórico antes de continuar.")
+        periodicidad_ej = ("Anual" if periodos == {"Anual"} else
+                           "Trimestral" if periodos else periodicidad)
         liquidacion = liquidar_210_alquiler(
             inm, contratos, rentas, [g for g in gastos if _gasto_toca_ejercicio(g, ej)],
             db.catastro(cid, cod, ej), resolver_residencia(db.residencia(cid, ej)), ej,
-            periodicidad, saldos, presentados)
+            periodicidad_ej, saldos, presentados)
         if liquidacion.revisar:
             revisar_hasta = ej + 4
         saldos = liquidacion.saldos
@@ -883,6 +982,7 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
     filas_a, filas_i = [], []
     inmuebles = db.listar("inmuebles", cid)
     catastros: dict[str, Optional[dict]] = {}
+    discrepancias: list[Alerta] = []   # declaraciones presentadas que no cuadran con el cálculo de la app
 
     for inm in inmuebles:
         cod = inm["codigo"]
@@ -902,6 +1002,27 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
             previa = db.get_por_clave("m210_alquiler", cid, clave)
             if _presentado(previa):
                 codigo = previa["codigo"]
+                base_pres = float(previa.get("base") or 0)
+                # Sin ingresos guardados solo vale la base como ingresos si no hay gastos (Extra-UE)
+                ing_pres = (float(previa["ingresos"]) if previa.get("ingresos") not in (None, "") else
+                            base_pres if not res.deduce_gastos else None)
+                ing_calc = r.ingresos_contrato
+                gastos_reg = previa.get("gastos")
+                esperada = (max(0.0, r2(float(previa["ingresos"]) - float(gastos_reg)))
+                            if previa.get("ingresos") not in (None, "") and gastos_reg not in (None, "") else None)
+                if esperada is not None and abs(base_pres - esperada) > 1:
+                    discrepancias.append(Alerta(
+                        "aviso", cod, f"base 210 {r.periodo}",
+                        f"210 alquiler {r.periodo} {ejercicio} presentado con base {fmt_eur(base_pres)}; los ingresos "
+                        f"({fmt_eur(float(previa['ingresos']))}) menos los gastos ({fmt_eur(float(gastos_reg))}) del periodo "
+                        f"dan {fmt_eur(esperada)} (diferencia {fmt_eur(esperada - base_pres)}). Revisa la declaración · VERIFICAR"))
+                if ing_calc is not None and ing_pres is not None and abs(ing_pres - ing_calc) > 1:
+                    discrepancias.append(Alerta(
+                        "aviso", cod, f"presentado 210 {r.periodo}",
+                        f"210 alquiler {r.periodo} {ejercicio} presentado con ingresos de {fmt_eur(ing_pres)}; los "
+                        f"contratos devengan {fmt_eur(ing_calc)} (diferencia {fmt_eur(ing_calc - ing_pres)}). Revisa si faltan "
+                        "rentas o se restaron gastos o descuentos del inquilino"
+                        + (" (Extra-UE no deduce gastos)" if res.grupo == GRUPO_EXTRA else "") + " · VERIFICAR"))
             else:
                 codigo = db.upsert("m210_alquiler", cid, {
                     "ejercicio": ejercicio, "inmueble": cod, "contrato": ", ".join(r.contratos), "periodo": r.periodo,
@@ -934,12 +1055,18 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
         clave_i = f"210I|{ejercicio}|{cod}"
         previa_i = db.get_por_clave("m210_imputacion", cid, clave_i)
         imp = calcular_210_imputacion(inm, contratos, cat, res, ejercicio)
+        if imp and _presentado(previa_i) and abs(float(previa_i.get("renta_imputada") or 0) - imp.renta_imputada) > 1:
+            discrepancias.append(Alerta(
+                "aviso", cod, "presentado 210 imputación",
+                f"210 imputación {ejercicio} presentado con renta imputada "
+                f"{fmt_eur(float(previa_i.get('renta_imputada') or 0))}; la app calcula {fmt_eur(imp.renta_imputada)} "
+                f"({imp.dias} días vacíos al {imp.pct_imputacion * 100:g} %). Revisa los días y el porcentaje · VERIFICAR"))
         if imp and not _presentado(previa_i):
             codigo_i = db.upsert("m210_imputacion", cid, {
                 "ejercicio": ejercicio, "inmueble": cod, "dias": imp.dias, "valor_catastral": imp.valor_catastral,
                 "pct_imputacion": imp.pct_imputacion, "pct_titularidad": imp.pct_titularidad, "tipo": imp.tipo,
                 "renta_imputada": imp.renta_imputada, "cuota": imp.cuota,
-                "estado": _estado_auto(previa_i, "Falta documentación" if imp.falta_valor else "Pendiente"),
+                "estado": _estado_auto(previa_i, "Falta documentación" if imp.falta_valor or imp.provisional else "Pendiente"),
                 "observaciones": "; ".join(imp.detalle) or None}, clave=clave_i)
             # Una nota automática de un cálculo anterior (p. ej. "Sin valor catastral") ya no aplica: se quita.
             # Las notas escritas a mano se conservan.
@@ -958,8 +1085,13 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
                         codigo_i, fila_i.get("estado") or "Pendiente", f"Imputación {fila_i.get('dias')} días",
                         fila_i.get("pagado"), fila_i.get("fecha_presentacion"))
             if fila_i.get("estado") not in ("Presentado", "No procede"):
-                informe_estados.append(f"{cod} · FALTA por presentar 210 Imputación de rentas {ejercicio} "
-                                       f"({fila_i.get('dias')} días vacíos · cuota {fmt_eur(fila_i.get('cuota') or 0)})")
+                motivo = ("sin valor catastral" if imp and imp.falta_valor else
+                          "revisión catastral sin acreditar" if imp and imp.provisional else None)
+                # La cuota va delante: el resumen recorta las líneas largas.
+                informe_estados.append(f"{cod} · FALTA por presentar 210 Imputación {ejercicio} · cuota "
+                                       f"{fmt_eur(fila_i.get('cuota') or 0)}"
+                                       + (f" · PROVISIONAL: {motivo}" if motivo else "")
+                                       + f" · {fila_i.get('dias')} días vacíos")
             else:
                 informe_estados.append(f"{cod} · 210 Imputación {ejercicio}: {fila_i.get('estado')}")
 
@@ -970,8 +1102,9 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
             _obligacion(db, cid, ejercicio, "Otra", cod, f"COMPRA|{cod}", adq + timedelta(days=30), None,
                         "Revisar" if liquidado else "Pendiente",
                         "Impuesto de compra (ITP o IVA+AJD): " + ("importe registrado, comprobar liquidación"
-                                                                   if liquidado else "PENDIENTE de liquidar. "
-                                                                   "Plazo orientativo 30 días hábiles, según CCAA"))
+                                                                   if liquidado else "liquidación pendiente de acreditar "
+                                                                   "(sube el modelo 600 o su justificante). Plazo orientativo "
+                                                                   "30 días hábiles, según CCAA"))
             if not liquidado:
                 informe_estados.append(f"{cod} · Escritura nueva: pendiente liquidar ITP/IVA-AJD de la compra")
 
@@ -1031,6 +1164,16 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
 
     # ---- Asesor interanual + avisos -> 15_NOTAS
     alertas = comparar_interanual(db, cid, ejercicio)
+    for inm in inmuebles:
+        for c in db.listar("contratos", cid, inmueble=inm["codigo"]):
+            legal, prevista = fin_con_prorroga(c), a_fecha(c.get("fecha_fin_prevista"))
+            if legal and prevista and prevista < date(ejercicio, 12, 31) and legal >= date(ejercicio, 1, 1):
+                alertas.append(Alerta(
+                    "aviso", inm["codigo"], f"prórroga {c['codigo']}",
+                    f"{c['codigo']}: fin previsto el {prevista:%d/%m/%Y}, pero un alquiler de vivienda se prorroga por "
+                    f"ley hasta el {legal:%d/%m/%Y} (LAU art. 9). Se calcula como alquilado; si el inquilino se fue, "
+                    "registra la fecha de fin real · VERIFICAR"))
+    alertas.extend(discrepancias)
     if res.asumida:
         alertas.insert(0, Alerta("grave", None, "residencia",
                                  "Sin residencia fiscal registrada: se calcula como Extra-UE (24 %, sin gastos)."))
@@ -1097,6 +1240,9 @@ def revisar_pendientes(db: Database, cid: int, ejercicio: int, hoy: Optional[dat
         if not periodo_tenencia(inm, ejercicio):
             continue
         cat = db.catastro(cid, cod, ejercicio)
+        if revision_pendiente(cat):
+            faltan[f"FALTA|{ejercicio}|{cod}|revision-catastro"] = (
+                "Catastro / IBI", f"{PENDIENTE_REVISION} de {cod}. Cálculo provisional: revisa Catastro.", cod, "grave")
         if not cat or cat.get("_heredado"):
             faltan[f"FALTA|{ejercicio}|{cod}|ibi"] = (
                 "Catastro / IBI", f"Recibo IBI o certificado catastral {ejercicio} de {cod}", cod, "grave")

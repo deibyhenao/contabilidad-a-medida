@@ -30,7 +30,9 @@ from database import TABLAS, Database, SUBCARPETA_SOPORTES
 
 PRESUPUESTO_PDF = 40_000        # caracteres de texto de PDFs en el contexto (~10 000 tokens)
 MAX_POR_PDF = 3_000             # caracteres por documento
-MAX_TOKENS_RESPUESTA = 4_000
+# El límite incluye el razonamiento: 4.000 cortaba respuestas reales con esfuerzo medio.
+# Es un máximo, no un consumo obligatorio; el chat sigue usando el modelo seleccionado.
+MAX_TOKENS_RESPUESTA = 8_192
 MAX_PAGINAS_PDF = 10
 MAX_PDFS_CONTEXTO = 40
 MAX_CACHE_PDFS = 128
@@ -61,10 +63,30 @@ Acciones documentales:
 Cómo responder:
 - Usa solo lo que consta en el expediente y en los documentos. Si un dato no está, dilo claramente y di qué
   documento habría que subir para tenerlo. No inventes importes, fechas ni documentos.
+- Los avisos y observaciones de una extracción con IA son hipótesis pendientes de contraste, no hechos
+  acreditados. Contrástalos con los campos y justificantes: no repitas un aviso que contradiga esos datos.
+  En documentos llegan como «avisos_lectura_sin_contrastar»: no los conviertas en pendientes ni en
+  recomendaciones; si los mencionas, di que son avisos automáticos sin contrastar. Una lista de «qué falta»
+  solo incluye datos o documentos ausentes del expediente, nunca algo que solo sugiere un aviso.
+- Distingue cobros aportados de cobros conciliados: un cobro Pendiente sí existe, pero puede no tener
+  periodo de devengo ni contrato asignado. No lo omitas al sumar movimientos ni inventes su devengo.
+  Mientras no esté conciliado, no afirmes qué es (renta, suministros, fianza, otro concepto): describe la
+  diferencia con la renta contractual y presenta su origen solo como posibilidad a confirmar.
+- Tú no validas el expediente: señala diferencias y datos que faltan, sin declarar una declaración
+  presentada correcta o incorrecta. Esa conclusión es del asesor.
+- En el 210, el tipo 35 permite agrupar alquileres de varios pagadores: no es por sí mismo un error ni obliga
+  a cambiarlo a 01 o a rellenar un pagador. Desde 2024 puede haber agrupación anual; filas trimestrales
+  No procede pueden ser cálculos obsoletos anulados al pasar a anual, no ingresos omitidos.
+- Si consta un NRC, no afirmes sin más que no hay justificante de pago. Distingue ese dato de la
+  verificación bancaria. Un PDF sin texto extraíble pudo leerse visualmente por IA: no confundas la
+  muestra de texto del chat con todo el documento ni exijas OCR por ese único motivo.
 - Cita la fuente de cada cifra entre corchetes: [Gastos 2026], [210 3T/2026], [Catastro 2025 INM-001] o el nombre
   del PDF [2026-03-10_FACTURA_GASTO_luz.pdf].
 - Importes con formato español (1.234,56 €). Sé breve y concreto: primero la respuesta, luego el detalle en una
-  lista corta. Usa negrita solo para la cifra o la conclusión clave.
+  lista corta. No superes 350 palabras aunque pidan varios apartados: como máximo 3 viñetas de una línea
+  por apartado, sin repetir cifras ya dichas, y ofrece ampliar si hace falta. Céntrate en el ejercicio
+  solicitado, sin enumerar incidencias de otros años salvo que impidan responder. Usa negrita solo para
+  la cifra o la conclusión clave.
 - Reglas que aplica la aplicación (explícalas si preguntan por qué):
   · Residente UE/EEE: 19 % y deduce gastos proporcionales. Fuera de la UE/EEE: 24 % sobre ingresos íntegros.
   · Imputación de rentas por días vacíos: 1,1 % del valor catastral si se revisó en los 10 últimos años, si no 2 %,
@@ -247,6 +269,10 @@ def _filas_contexto(db: Database, tabla: str, cid: int, ejercicio: int) -> list[
     filas = db.con.execute(f"SELECT * FROM {tabla} WHERE {where} ORDER BY {orden} LIMIT ?",
                            (*parametros, MAX_FILAS_TABLA + 1)).fetchall()
     salida = [dict(f) for f in filas[:MAX_FILAS_TABLA]]
+    if tabla == "documentos":
+        # La procedencia del aviso no depende de la cartera del cliente.
+        salida = [{("avisos_lectura_sin_contrastar" if k == "observaciones" else k): v
+                   for k, v in fila.items()} for fila in salida]
     if len(filas) > MAX_FILAS_TABLA:
         salida.append({"AVISO": "Sección parcial: hay más filas no incluidas"})
     return salida
@@ -272,7 +298,7 @@ def construir_contexto(db: Database, cid: int, ejercicio: int, pendientes: Optio
     if cartera == RES:
         return _contexto_residente(db, cid, ejercicio, pendientes, partes, carpeta)
 
-    tablas = ["residencias", "inmuebles", "catastro", "contratos", "inquilinos", "rentas", "gastos",
+    tablas = ["residencias", "inmuebles", "catastro", "contratos", "inquilinos", "rentas", "cobros", "gastos",
               "m210_alquiler", "m210_imputacion", "patrimonio_714", "its_718", "obligaciones", "documentos",
               "actividades", "modelos_presentados"]
     if "arrastres_gastos" in TABLAS:
@@ -294,7 +320,8 @@ def construir_contexto(db: Database, cid: int, ejercicio: int, pendientes: Optio
         if sum(map(len, partes)) >= MAX_BD:
             partes.append("## EXPEDIENTE PARCIAL: se omitieron secciones por espacio; concreta la consulta.")
             break
-        seccion = _seccion(f"{t} ({TABLAS[t].hoja or 'solo BD'})", _filas_contexto(db, t, cid, ejercicio))
+        filas = _filas_contexto(db, t, cid, ejercicio)
+        seccion = _seccion(f"{t} ({TABLAS[t].hoja or 'solo BD'})", filas)
         restante = max(0, MAX_BD - sum(map(len, partes)))
         if len(seccion) > restante:
             seccion = seccion[:restante] + "\n[Sección parcial: texto recortado]"

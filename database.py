@@ -31,7 +31,7 @@ from app_paths import RECURSOS as RECURSOS_DIR, carpeta_datos
 from persistencia import crear_snapshot
 from rutas_seguras import sanitize_safe_path
 
-VERSION_ESQUEMA = 2
+VERSION_ESQUEMA = 3
 
 PROYECTO_DIR = carpeta_datos()
 DB_PATH_DEFECTO = PROYECTO_DIR / "contabilidad.db"
@@ -121,6 +121,7 @@ TABLAS: dict[str, TablaDef] = {
             _c("fuente", "K"), _c("fecha_comprobacion", "L", "date"), _c("ibi_ejercicio", "M", "eur"),
             _c("ibi_pagado", "N", "eur"), _c("ruta", "O", "link"), _c("observaciones", "P"),
             _c("valor_referencia", None, "eur"),  # valor de referencia Catastro del ejercicio
+            _c("revision_pendiente", None, "int"),  # control interno; no añade columnas a Excel
         )),
         TablaDef("contratos", "04_CONTRATOS", "CTR", (
             _c("codigo", "A"), _c("inmueble", "B"), _c("fecha_inicio", "C", "date"),
@@ -311,10 +312,16 @@ def slug(texto: str, mayusculas: bool = False) -> str:
 
 
 
+def _sin_tilde_latina(c: str) -> str:
+    """«é» -> «e», «ñ» -> «n»; el resto de alfabetos intacto (en cirílico «й» no es «и» con tilde)."""
+    if unicodedata.name(c, "").startswith("LATIN"):
+        return "".join(x for x in unicodedata.normalize("NFKD", c) if not unicodedata.combining(x))
+    return c
+
+
 def componente_ruta(texto: str, limite: int = 64) -> str:
     """Componente Unicode válido en Windows; conserva nombres internacionales."""
-    normal = unicodedata.normalize("NFKD", texto or "")
-    normal = "".join(c for c in normal if not unicodedata.combining(c))
+    normal = "".join(_sin_tilde_latina(c) for c in unicodedata.normalize("NFC", texto or ""))
     normal = re.sub(r"[^\w-]+", "_", normal, flags=re.UNICODE).strip("_") or "Cliente"
     if normal.upper() in {"CON", "PRN", "AUX", "NUL", *[f"COM{i}" for i in range(10)],
                           *[f"LPT{i}" for i in range(10)]}:
@@ -940,6 +947,9 @@ class Database:
         if tabla == "gastos" and limpio.get("categoria"):
             categorias = {c.casefold(): c for c in CATEGORIAS_GASTO}
             limpio["categoria"] = categorias.get(limpio["categoria"].casefold(), limpio["categoria"])
+        if tabla == "contratos" and limpio.get("estado") == "Rescindido":
+            # Valor antiguo (pdf_processor < 1.0.5): el estado válido, el del desplegable del Excel, es este.
+            limpio["estado"] = "Rescindido anticipadamente"
         codigo = limpio.pop("codigo", None)
 
         fila = None

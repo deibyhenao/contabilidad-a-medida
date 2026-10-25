@@ -4,7 +4,9 @@ from PyInstaller.utils.hooks import collect_all, collect_data_files, copy_metada
 import flet_desktop
 
 ROOT = Path(SPECPATH).parent
-datas = [(str(ROOT/'assets'), 'assets'), (str(ROOT/'plantillas'), 'plantillas'),
+datas = [(str(ROOT/'assets/icono.ico'), 'assets'), (str(ROOT/'assets/icono.png'), 'assets'),
+         (str(ROOT/'plantillas/Plantilla_Expediente_No_Residente_v2.xlsx'), 'plantillas'),
+         (str(ROOT/'plantillas/Plantilla_Expediente_Residente_v1.xlsx'), 'plantillas'),
          (str(ROOT/'packaging/aplicar_actualizacion.ps1'), 'packaging')]
 # Incluye el cliente oficial completo; el usuario final no tiene que descargarlo.
 desktop = Path(flet_desktop.ensure_client_cached())

@@ -68,6 +68,9 @@ def test_alta_manual_de_contrato_genera_210(ctrl, pepito):
 
 
 def test_marcar_presentado_congela_y_actualiza_obligacion(ctrl, pepito):
+    # El recibo sintético no acredita revisión colectiva: el usuario confirma el porcentaje.
+    catastro = ctrl.db.catastro(pepito, "INM-001", 2026)
+    ctrl.editar(pepito, "catastro", catastro["codigo"], {"pct_imputacion": "1,1 %"}, 2026)
     inf = ctrl.sincronizar(pepito, 2026)["informe"]
     imp = inf.filas_210_imputacion[0]
     res = ctrl.marcar_presentado(pepito, "m210_imputacion", imp, 2026, "15/12/2027", "123,45", "NRC-1")
@@ -79,6 +82,9 @@ def test_marcar_presentado_congela_y_actualiza_obligacion(ctrl, pepito):
 
 
 def test_marcar_presentada_desde_obligacion_marca_el_modelo(ctrl, pepito):
+    # El recibo sintético no acredita revisión colectiva: el usuario confirma el porcentaje.
+    catastro = ctrl.db.catastro(pepito, "INM-001", 2026)
+    ctrl.editar(pepito, "catastro", catastro["codigo"], {"pct_imputacion": "1,1 %"}, 2026)
     inf = ctrl.sincronizar(pepito, 2026)["informe"]
     imp = inf.filas_210_imputacion[0]
     obl = ctrl.db.listar("obligaciones", pepito, id_modelo=imp)[0]

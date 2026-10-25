@@ -1,6 +1,7 @@
 """Exporta código permitido a un clon limpio; jamás publica el historial privado."""
 from __future__ import annotations
 import argparse
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -14,21 +15,39 @@ def ejecutar(args, cwd):
 
 
 def archivos_publicables():
-    rutas=[p for p in ROOT.glob('*.py') if p.is_file()]
+    tracked=set(ejecutar(['git','ls-files'],ROOT).splitlines())
+    rutas=[p for p in ROOT.glob('*.py') if p.is_file() and p.name in tracked]
     rutas += [ROOT/n for n in ['requirements.txt','requirements-build.txt','GUIA_ACTUALIZACIONES.md','README.md','.gitignore']]
-    for patron in ['assets/icono.ico','assets/icono.png','plantillas/*.xlsx','packaging/*','scripts/build_release.py','scripts/preparar_publicacion.py','.github/workflows/*.yml']:
+    for patron in ['assets/icono.ico','assets/icono.png','plantillas/Plantilla_Expediente_No_Residente_v2.xlsx',
+                   'plantillas/Plantilla_Expediente_Residente_v1.xlsx','packaging/ContabilidadAMedida.spec',
+                   'packaging/instalador.iss','packaging/aplicar_actualizacion.ps1',
+                   'scripts/build_release.py','scripts/preparar_publicacion.py','.github/workflows/*.yml']:
         rutas += [p for p in ROOT.glob(patron) if p.is_file()]
     # Solo pruebas seguidas por Git, además de las nuevas incluidas en esta entrega.
-    tracked=ejecutar(['git','ls-files','--','tests/*.py'],ROOT).splitlines()
-    rutas += [ROOT/p for p in tracked]
+    rutas += [ROOT/p for p in tracked if p.startswith('tests/') and p.endswith('.py')]
     return sorted(set(rutas))
+
+
+def copiar_publicable(src: Path, dst: Path) -> None:
+    if dst.is_symlink() or dst.resolve() != Path(os.path.abspath(dst)):
+        raise ValueError('El destino no puede estar redirigido: '+str(dst))
+    dst.parent.mkdir(parents=True,exist_ok=True)
+    if src.suffix.lower() in {'.py','.md','.txt','.yml','.yaml','.spec','.iss','.ps1'} or src.name=='.gitignore':
+        # Conserva BOM (PowerShell) y caracteres UTF-8; no recodifica recursos binarios.
+        dst.write_bytes(src.read_bytes().replace(b'\r\n',b'\n').replace(b'\r',b'\n'))
+        shutil.copystat(src,dst)
+    else:
+        shutil.copy2(src,dst)
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--destino',type=Path,required=True,help='Clon limpio separado del proyecto')
     args=parser.parse_args()
-    destino=args.destino.resolve()
+    original=Path(os.path.abspath(args.destino))
+    destino=original.resolve()
+    if original.is_symlink() or destino!=original:
+        parser.error('La raíz del clon público no puede estar redirigida.')
     if destino==ROOT or ROOT in destino.parents:
         parser.error('El clon público debe estar fuera del proyecto original.')
     if not destino.exists():
@@ -44,8 +63,7 @@ def main():
         if src.is_symlink() or src.resolve()!=src.absolute():
             parser.error('No se publican archivos redirigidos: '+str(relative))
         dst=destino/relative
-        dst.parent.mkdir(parents=True,exist_ok=True)
-        shutil.copy2(src,dst)
+        copiar_publicable(src,dst)
     print('Código exportado sin bases, expedientes ni historial:',destino)
     print('Revisa git diff y git status en ese clon. Commit/push/tag se hacen desde el clon público.')
     print('Si se eliminó un módulo, revisa también su eliminación en el clon: no se borra automáticamente.')

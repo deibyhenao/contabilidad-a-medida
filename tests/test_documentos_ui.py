@@ -281,3 +281,52 @@ def test_conflicto_excel_muestra_dialogo_legible_y_libera_tarea(app):
     assert isinstance(app._dialogo.call_args.args[2][0], ft.TextButton)
     assert app._dialogo.call_args.args[2][0].autofocus
     app.avisar.assert_not_called()
+
+def test_catastro_sin_ejercicio_exige_dato_explicito(app):
+    ext=pdf.Extraccion(tipo=pdf.TipoDocumento.CATASTRO_IBI,confianza=.9,
+        nombre_archivo='catastro.pdf',campos={'valor_catastral':90000})
+    def responder(_titulo,contenido,acciones,**_kwargs):
+        campo=buscar(contenido,'Ejercicio de registro')
+        assert campo.value==''
+        acciones[-1].on_click(None)
+        app.page.pop_dialog.assert_not_called()
+        campo.value='2026'
+        acciones[-1].on_click(None)
+    app._dialogo.side_effect=responder
+    assert app.revisar_extraccion(ext,7,2026).campos['ejercicio']==2026
+
+
+def test_revision_colectiva_exige_confirmacion_y_se_invalida_al_editar(app):
+    ext=pdf.Extraccion(tipo=pdf.TipoDocumento.CATASTRO_IBI,confianza=.9,
+        nombre_archivo='catastro.pdf',campos={'ejercicio':2026,'anio_revision':2019})
+    def responder(_titulo,contenido,acciones,**_kwargs):
+        campo=buscar(contenido,'Año de revisión catastral colectiva')
+        casilla=buscar(contenido,'He comprobado en el documento el año de entrada en vigor de la revisión catastral colectiva')
+        acciones[-1].on_click(None)
+        app.page.pop_dialog.assert_not_called()
+        casilla.value=True
+        campo.value='2020'
+        campo.on_change(None)
+        assert not casilla.value
+        casilla.value=True
+        acciones[-1].on_click(None)
+    app._dialogo.side_effect=responder
+    resultado=app.revisar_extraccion(ext,7,2026)
+    assert resultado.revision_confirmada and resultado.campos['anio_revision']==2020
+
+def test_cambiar_tipo_a_catastro_pide_ejercicio_y_muestra_revision(app):
+    ext=pdf.Extraccion(tipo=pdf.TipoDocumento.DESCONOCIDO,confianza=.5,
+        nombre_archivo='sin_clasificar.pdf',campos={})
+    def responder(_titulo,contenido,acciones,**_kwargs):
+        tipo=buscar(contenido,'Tipo de documento')
+        assert buscar(contenido,'Ejercicio de registro').value=='2026'
+        tipo.value='CATASTRO_IBI'
+        tipo.on_select(None)
+        assert buscar(contenido,'Ejercicio de registro').value==''
+        assert buscar(contenido,'Año de revisión catastral colectiva') is not None
+        acciones[-1].on_click(None)
+        app.page.pop_dialog.assert_not_called()
+        buscar(contenido,'Ejercicio de registro').value='2026'
+        acciones[-1].on_click(None)
+    app._dialogo.side_effect=responder
+    assert app.revisar_extraccion(ext,7,2026).campos['ejercicio']==2026
