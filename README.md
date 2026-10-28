@@ -20,3 +20,5 @@ py -3.10 -m venv .venv
 ```
 
 Las dos plantillas de `plantillas/` se conservan como recursos originales. La aplicación genera una copia para cada expediente; no se deben modificar sus fórmulas, hojas ni columnas. Antes de actualizar un Excel de cliente se importan sus cambios manuales.
+
+En los libros generados, las imputaciones pendientes redondean base y cuota a dos decimales. Las presentadas conservan los importes de su justificante con comentario. Estas excepciones están acotadas a las columnas H/J de la hoja de imputaciones; las plantillas originales no cambian.

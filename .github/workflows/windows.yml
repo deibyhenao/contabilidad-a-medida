@@ -23,7 +23,8 @@ concurrency:
 jobs:
   validar:
     runs-on: windows-latest
-    timeout-minutes: 55
+    # La suite con estrés de 600 expedientes llegó a 96 minutos en Windows local.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:

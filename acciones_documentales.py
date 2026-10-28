@@ -34,6 +34,9 @@ HERRAMIENTA = {
 
 
 def validar_plan(datos):
+    if type(datos) is dict and datos.get("accion") == "editar_registro":
+        from correcciones_expediente import validar_plan as validar_correccion
+        return validar_correccion(datos)
     if type(datos) is not dict:
         raise ValueError("La propuesta documental no es válida.")
     accion, codigo = datos.get("accion"), datos.get("codigo")
@@ -115,29 +118,47 @@ class GestorAcciones:
             propuesta = Propuesta(cid, ejercicio, tuple(sorted(plan.items())), vista["version"], self.reloj() + 120)
             self._pendiente = (hashlib.sha256(token.encode()).digest(), propuesta)
             self._fallos = 0
-            detalles = ["**Propuesta pendiente de confirmación**", f"Cliente #{cid} · Documento {plan['codigo']}",
-                        f"Archivo: {literal(vista['ruta_origen'])} → {literal(vista['ruta_destino'])}"]
+            correccion = plan['accion'] == 'editar_registro'
+            if correccion:
+                detalles = ["**Corrección pendiente de confirmación**",
+                            f"{literal(vista.get('cliente') or f'Cliente #{cid}')} · Ejercicio {ejercicio} · {literal(plan['codigo'])}",
+                            f"{literal(vista.get('etiqueta') or plan['campo'])}: {literal(vista['antes'] if vista['antes'] is not None else 'Sin dato')} → {literal(vista['despues'] if vista['despues'] is not None else 'Vaciar dato')}",
+                            "Se recalcularán los datos dependientes y se intentará actualizar el Excel; se avisará si queda pendiente."]
+            else:
+                detalles = ["**Propuesta pendiente de confirmación**", f"Cliente #{cid} · Documento {plan['codigo']}",
+                            f"Archivo: {literal(vista['ruta_origen'])} → {literal(vista['ruta_destino'])}"]
             if plan['accion'] == 'cambiar_ejercicio':
                 detalles.append(f"Ejercicio: {vista['ejercicio_origen']} → {plan['ejercicio_destino']}. Se recalcularán los ejercicios afectados.")
             elif 'descripcion' in plan:
                 detalles.append(f"Descripción: {literal(plan['descripcion'])}")
             detalles.extend(vista.get('advertencias', []))
-            detalles.append(f"Revisa los cambios. Para aplicarlos escribe `/confirmar_documento {token}`. Caduca en 2 minutos. `/cancelar_documento` descarta la propuesta.")
+            confirmar, cancelar = ('confirmar_cambio', 'cancelar_cambio') if correccion else ('confirmar_documento', 'cancelar_documento')
+            detalles.append(f"Revisa los cambios. Para aplicarlos escribe `/{confirmar} {token}`. Caduca en 2 minutos. `/{cancelar}` descarta la propuesta.")
             return '\n\n'.join(detalles)
 
     def procesar(self, texto, cid, ejercicio, ejecutar):
         partes = texto.strip().split()
-        if not partes or partes[0].casefold() not in ('/confirmar_documento', '/cancelar_documento'):
+        if not partes or partes[0].casefold() not in ('/confirmar_documento', '/cancelar_documento', '/confirmar_cambio', '/cancelar_cambio'):
             return None
-        if partes[0].casefold() == '/cancelar_documento':
-            pendiente = self._pendiente is not None
-            self.descartar()
+        if partes[0].casefold() in ('/cancelar_documento', '/cancelar_cambio'):
+            with self._lock:
+                pendiente = self._pendiente is not None
+                correccion = pendiente and dict(self._pendiente[1].plan)['accion'] == 'editar_registro'
+                self._pendiente, self._fallos = None, 0
+                self._generacion += 1
+            if correccion or partes[0].casefold() == '/cancelar_cambio':
+                return 'Corrección descartada.' if pendiente else 'No hay una corrección pendiente.'
             return 'Propuesta documental descartada.' if pendiente else 'No hay una propuesta documental pendiente.'
         with self._lock:
             actual = self._pendiente
             if actual is None:
-                raise ValueError('No hay una propuesta documental pendiente. Solicita una nueva.')
+                tipo = 'corrección' if partes[0].casefold() == '/confirmar_cambio' else 'propuesta documental'
+                raise ValueError(f'No hay una {tipo} pendiente. Solicita una nueva.')
             huella, propuesta = actual
+            correccion = dict(propuesta.plan)['accion'] == 'editar_registro'
+            esperado = '/confirmar_cambio' if correccion else '/confirmar_documento'
+            if partes[0].casefold() != esperado:
+                raise ValueError('Usa el comando de confirmación mostrado en la propuesta.')
             if self.reloj() >= propuesta.caduca or self.activo() != (cid, ejercicio) or (cid, ejercicio) != (propuesta.cliente_id, propuesta.ejercicio):
                 self._pendiente = None
                 raise ValueError('La propuesta caducó o cambió el expediente. Solicita una nueva.')
@@ -146,14 +167,19 @@ class GestorAcciones:
                 self._fallos += 1
                 if self._fallos >= 5:
                     self._pendiente = None
-                raise ValueError('Confirmación documental inválida.')
+                raise ValueError('Confirmación de la corrección inválida.' if correccion else 'Confirmación documental inválida.')
             # Consumir ANTES de escribir: un fallo parcial nunca permite repetición automática.
             self._pendiente = None
         resultado = ejecutar(propuesta)
-        if not isinstance(resultado, dict) or not resultado.get('documentos_actualizados'):
+        verificado = 'registro_actualizado' if correccion else 'documentos_actualizados'
+        if not isinstance(resultado, dict) or not resultado.get(verificado):
             raise ValueError('No se pudo verificar la operación. Revisa el expediente antes de repetirla.')
         avisos = list(resultado.get('avisos_documentales') or [])
         if resultado.get('error_excel'):
             avisos.append(resultado['error_excel'])
+        if correccion:
+            if not resultado.get('excel') and not resultado.get('error_excel'):
+                avisos.append('El dato se guardó; falta verificar la actualización del Excel. Pulsa Sincronizar.')
+            return 'Corrección guardada y datos recalculados.' + ('\n' + '\n'.join(avisos) if avisos else '\nExcel actualizado.')
         soporte = 'PDF' if str(dict(propuesta.plan).get('nombre', '')).casefold().endswith('.pdf') else 'Documento'
         return 'Operación documental guardada y datos recalculados.' + ('\n' + '\n'.join(avisos) if avisos else f'\n{soporte} y Excel actualizados.')

@@ -5,14 +5,17 @@ Orden obligatorio en toda escritura: importar Excel -> cambiar BD -> recalcular 
 """
 from __future__ import annotations
 
+import calendar
 import gc
 import hashlib
 import json
+import logging
 import os
 import shutil
 import threading
+import uuid
 from contextlib import nullcontext
-from datetime import date
+from datetime import date, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -44,6 +47,17 @@ def _carpeta_sin_enlaces(carpeta: Path) -> Path:
 
 class CanceladoPorUsuario(Exception):
     """El usuario descartó el documento en el diálogo de revisión."""
+
+
+class CalculoConfirmadoSinExcel(RuntimeError):
+    """La BD ya se confirmó: conservar el informe calculado aunque falle la exportación posterior."""
+
+    def __init__(self, cid: int, ejercicio: int, resultado: dict, causa: Exception):
+        self.cliente_id, self.ejercicio, self.resultado = cid, ejercicio, resultado
+        registro = f"Registro {resultado['codigo']} guardado. " if resultado.get('codigo') else ''
+        super().__init__(registro + "El cálculo se guardó en la base de datos, pero no se pudo completar la actualización del Excel "
+                         f"({type(causa).__name__}). "
+                         "Revisa permisos y espacio disponible y pulsa Sincronizar para reintentarlo.")
 
 
 # Etiquetas de los campos que no tienen columna en la plantilla (solo BD)
@@ -159,8 +173,15 @@ class Controlador:
 
     def __init__(self, db_path: Path | None = None):
         ruta = Path(db_path) if db_path is not None else database.DB_PATH_DEFECTO
+        from migracion_actualizacion import preparar_actualizacion, validar_almacen_existente
+        validar_almacen_existente(ruta)
         self.db = Database(ruta, multihilo=True)
-        self.lector = Database(ruta, multihilo=True)  # conexión aparte para que la UI lea sin bloquear
+        try:
+            self.copia_actualizacion = preparar_actualizacion(self.db)
+            self.lector = Database(ruta, multihilo=True)  # conexión aparte para que la UI lea sin bloquear
+        except BaseException:
+            self.db.cerrar()
+            raise
         self._lock = threading.RLock()
         self._firmas: dict[int, Optional[str]] = {}  # firma del Excel leída en la última importación
         self.aviso_migracion: Optional[str] = None
@@ -264,8 +285,11 @@ class Controlador:
             try:
                 # Las tablas del cliente tienen ON DELETE CASCADE hacia clientes
                 self.db.con.execute("DELETE FROM clientes WHERE id=?", (cid,))
-                self.db.con.execute("DELETE FROM config WHERE clave IN (?,?,?)",
-                                    (f"excel_firma|{cid}", f"excel_pendiente|{cid}", f"excel_resumen|{cid}"))
+                self.db.con.execute("DELETE FROM config WHERE clave IN (?,?,?,?,?,?)",
+                                    tuple(f'{prefijo}|{cid}' for prefijo in ('excel_firma', 'excel_pendiente',
+                                        'excel_resumen', 'excel_version', 'excel_nombre', 'excel_filas')))
+                prefijo = f"periodicidad_210|{cid}|"
+                self.db.con.execute("DELETE FROM config WHERE substr(clave,1,?)=?", (len(prefijo), prefijo))
                 self.db.con.commit()
             except Exception:
                 self.db.con.rollback()
@@ -278,8 +302,15 @@ class Controlador:
     def abrir_cliente(self, cid: int, ejercicio: int) -> dict:
         """Carga el expediente. Si el usuario tocó el Excel fuera de la app, sincroniza primero (A3-P3)."""
         with self._lock:
+            cliente = self.db.get_cliente(cid)
+            if cliente is None:
+                raise ValueError('El cliente ya no existe. Actualiza la lista de expedientes.')
+            if not self.db.verificar_cartera(cliente).is_dir():
+                raise FileNotFoundError('No se encuentra la carpeta del expediente; no se ha recreado. '
+                                        'Comprueba su ubicación y la unidad antes de continuar.')
             documentos.recuperar_archivos(self.db, cid)
-            if excel_generator.excel_modificado(self.db, cid):
+            if (excel_generator.excel_modificado(self.db, cid)
+                    or excel_generator.necesita_actualizar_formato(self.db, cid)):
                 return self.sincronizar(cid, ejercicio)
             if self._es_residente(cid):
                 ej = int(ejercicio)
@@ -345,26 +376,151 @@ class Controlador:
 
     def _exportar_informe(self, cid: int, ejercicio_activo: int, resultado: dict) -> dict:
         ej = int(ejercicio_activo)
-        self.db.set_config(f"excel_pendiente|{cid}", "1")
+        firma = self._firmas.get(cid, excel_generator.FIRMA_NO_ESPECIFICADA)
         try:
+            self.db.set_config(f"excel_pendiente|{cid}", "1")
             if self._excel_cambiado_durante(cid):
                 # El usuario guardó el Excel mientras trabajábamos (A4-P01): no se pisa su versión
                 cliente = self.db.get_cliente(cid)
                 base = self.db.ruta_excel(cliente)
-                pendiente = base.with_name(f"{base.stem}_PENDIENTE_{date.today():%Y%m%d}{base.suffix}")
+                # Cada conflicto conserva su propia copia, incluso dos el mismo día.
+                pendiente = base.with_name(f"{base.stem}_PENDIENTE_{uuid.uuid4().hex[:12]}{base.suffix}")
+                if len(str(pendiente)) > 247:
+                    pendiente = base.with_name(f"PENDIENTE_{uuid.uuid4().hex[:12]}{base.suffix}")
                 ruta_excel = excel_generator.exportar_cliente(self.db, cid, ej, destino=pendiente)
                 error_excel = ("Guardaste el Excel mientras se procesaba: tu versión se ha conservado. La versión "
-                               f"actualizada está en {pendiente.name}. Pulsa Sincronizar para unirlas.")
+                               f"calculada está en {pendiente.name}. La copia pendiente no se importa "
+                               "automáticamente: conserva cualquier edición que hagas en ella. "
+                               "Al sincronizar se leerá tu Excel principal y se volverá a generar desde los datos guardados.")
             else:
-                ruta_excel, error_excel = excel_generator.exportar_cliente(self.db, cid, ej), None
+                opciones = {} if firma is excel_generator.FIRMA_NO_ESPECIFICADA else {'firma_esperada': firma}
+                ruta_excel, error_excel = excel_generator.exportar_cliente(self.db, cid, ej, **opciones), None
         except excel_generator.ExcelBloqueadoError as exc:
             ruta_excel, error_excel = exc.ruta_pendiente, str(exc)
+        except Exception as exc:
+            raise CalculoConfirmadoSinExcel(cid, ej, resultado, exc) from exc
         if error_excel:
             self.db.set_config(f"excel_pendiente|{cid}", str(ruta_excel))
         return {**resultado, "excel": ruta_excel, "error_excel": error_excel}
 
     def _recalcular_y_exportar(self, cid: int, ejercicios: set[int], ejercicio_activo: int) -> dict:
-        return self._exportar_informe(cid, ejercicio_activo, self._recalcular_bd(cid, ejercicios, ejercicio_activo))
+        return self.commit_and_sync_excel(cid, ejercicio_activo, ejercicios)
+
+    def commit_and_sync_excel(self, cid: int, ejercicio: int, ejercicios: Optional[set[int]] = None) -> dict:
+        """Punto común de recálculo y exportación tras importar/guardar una modificación validada.
+
+        El ejercicio es explícito para no escribir accidentalmente el año actual al editar un histórico.
+        Los guardados concurrentes del asesor y los Excel bloqueados conservan sus protecciones.
+        """
+        with self._lock:
+            ej = int(ejercicio)
+            return self._exportar_informe(cid, ej, self._recalcular_bd(cid, set(ejercicios or {ej}) | {ej}, ej))
+
+    def sincronizar_excel_si_cambio(self, cid: int, ejercicio: int) -> dict:
+        """Importa al regresar a la app; si la firma no cambió no recalcula ni reescribe el archivo."""
+        with self._lock:
+            if self.db.get_cliente(cid) is None:
+                raise ValueError("El cliente no existe.")
+            if not excel_generator.excel_modificado(self.db, cid):
+                return {}
+            return {**self.sincronizar(cid, int(ejercicio)), "excel_importado": True}
+
+    def establecer_periodicidad_210(self, cid: int, inmueble: str, ejercicio: int, periodicidad: str,
+                                    al_recalcular: Optional[Callable[[dict], None]] = None) -> dict:
+        if periodicidad not in ("Anual", "Trimestral"):
+            raise ValueError("Elige Anual o Trimestral.")
+        ej = int(ejercicio)
+        if ej < 2024:
+            raise ValueError("El selector anual/trimestral solo está disponible desde el ejercicio 2024.")
+        with self._lock:
+            if not self.db.get("inmuebles", cid, inmueble):
+                raise ValueError("El inmueble no pertenece a este cliente.")
+            self._importar(cid)
+            borradores = [f for f in self.db.listar("m210_alquiler", cid, inmueble=inmueble, ejercicio=ej)
+                          if (f.get("estado") or "Pendiente") not in
+                          (*tax_calculator.ESTADOS_AUTOMATICOS, "Presentado")
+                          # un periodo no reconocible cuenta como incompatible: que lo revise el asesor
+                          and (tax_calculator.periodo_210_o_none(f.get("periodo")) is None
+                               or (tax_calculator.periodo_210_o_none(f.get("periodo")) == "Anual")
+                               != (periodicidad == "Anual"))]
+            if borradores:
+                raise ValueError("Hay modelos en preparación o revisión con otra periodicidad. "
+                                 "Revisa sus datos y déjalos en Pendiente antes de cambiar el calendario.")
+            presentados = {tax_calculator.periodo_210_o_none(f.get("periodo"))
+                           for f in self.db.listar("m210_alquiler", cid, inmueble=inmueble, ejercicio=ej)
+                           if f.get("estado") == "Presentado"} - {None}
+            if presentados and ((periodicidad == "Anual" and presentados != {"Anual"})
+                                or (periodicidad == "Trimestral" and "Anual" in presentados)):
+                raise ValueError("La periodicidad difiere de un modelo ya presentado. Revisa el histórico antes de cambiarla.")
+            with self.db.transaccion():
+                self.db.set_config(f"periodicidad_210|{cid}|{inmueble}|{ej}", periodicidad)
+                resultado = self._recalcular_bd(cid, {ej}, ej)
+            # El cálculo ya está confirmado: la UI puede mostrarlo sin esperar a serializar Excel.
+            # Un fallo de presentación nunca impide guardar el libro ni libera el turno de escritura.
+            if al_recalcular is not None:
+                try:
+                    al_recalcular(dict(resultado))
+                except Exception as exc:
+                    logging.getLogger(__name__).warning(
+                        "No se pudo notificar el avance del recálculo (%s).", type(exc).__name__)
+            try:
+                return self._exportar_informe(cid, ej, resultado)
+            except Exception as exc:
+                raise CalculoConfirmadoSinExcel(cid, ej, resultado, exc) from exc
+
+    def previsualizar_contrato(self, cid: int, datos: dict, ejercicio: int) -> dict:
+        """Previsualización sin escrituras; una duración propone fin previsto, nunca una rescisión real."""
+        columnas = {c.campo: c for c in TABLAS["contratos"].columnas_bd}
+        limpios = {k: database._normalizar(columnas[k], v)
+                   for k, v in datos.items() if k in columnas}
+        inicio = a_fecha(limpios.get("fecha_inicio"))
+        if inicio is None:
+            raise ValueError("Indica la fecha de inicio del contrato.")
+        meses = datos.get("duracion_meses", datos.get("meses"))
+        if meses not in (None, "") and not limpios.get("fecha_fin_prevista"):
+            if isinstance(meses, bool) or not str(meses).strip().isdigit() or not 1 <= int(meses) <= 1200:
+                raise ValueError("La duración debe ser de 1 a 1200 meses enteros.")
+            indice = inicio.year * 12 + inicio.month - 1 + int(meses)
+            anio, mes = divmod(indice, 12)
+            mes += 1
+            limite = date(anio, mes, min(inicio.day, calendar.monthrange(anio, mes)[1]))
+            limpios["fecha_fin_prevista"] = limite - timedelta(days=1)
+        for nombre in ("fecha_fin_prevista", "fecha_fin_real"):
+            if limpios.get(nombre) and a_fecha(limpios[nombre]) < inicio:
+                raise ValueError("La fecha de fin no puede ser anterior al inicio.")
+        inm = self.lector.get("inmuebles", cid, limpios.get("inmueble"))
+        if not inm:
+            raise ValueError("Selecciona un inmueble de este cliente.")
+        limpios.setdefault("codigo", "PREVISUALIZACION")
+        limpios.setdefault("estado", "Vigente")
+        limpios.setdefault("periodicidad", "Mensual")
+        rentas = (self.lector.listar("rentas", cid, contrato=limpios["codigo"])
+                  if datos.get("codigo") else [])
+        resumen = tax_calculator.resumen_arrendamiento(
+            inm, [limpios], {limpios["codigo"]: rentas}, int(ejercicio))
+        avisos = []
+        fin_legal = tax_calculator.fin_con_prorroga(limpios)
+        if fin_legal and limpios.get("fecha_fin_prevista") and fin_legal > a_fecha(limpios["fecha_fin_prevista"]):
+            avisos.append("Vivienda vigente: se aplica la prórroga legal. La fecha prevista no acredita el fin real del alquiler.")
+        return {**resumen, "fecha_fin_prevista": (a_fecha(limpios.get("fecha_fin_prevista")) or None),
+                "avisos": avisos}
+
+    def resumen_alquileres(self, cid: int, ejercicio: int) -> dict:
+        """Todos los contratos para poder corregirlos; sus métricas corresponden solo al ejercicio."""
+        ej = int(ejercicio)
+        inmuebles = {i["codigo"]: i for i in self.lector.listar("inmuebles", cid)}
+        contratos = []
+        for fila in self.lector.listar("contratos", cid):
+            inm = inmuebles.get(fila.get("inmueble"))
+            resumen = (tax_calculator.resumen_arrendamiento(inm, [fila],
+                       {fila["codigo"]: self.lector.listar("rentas", cid, contrato=fila["codigo"])}, ej)
+                       if inm else {"dias_alquilado": 0, "ingresos_devengados": 0})
+            contratos.append({**fila, "_dias_alquilado": resumen["dias_alquilado"],
+                              "_ingresos_devengados": resumen["ingresos_devengados"]})
+        cobros = self.lector.listar("cobros", cid, ejercicio=ej)
+        return {"contratos": contratos, "cobros": cobros,
+                "ingresos_devengados": tax_calculator.r2(sum(c["_ingresos_devengados"] for c in contratos)),
+                "ingresos_cobrados": tax_calculator.r2(sum(float(c.get("importe_cobrado") or 0) for c in cobros))}
 
     def _importar(self, cid: int) -> None:
         """Importa lo manual del Excel y recuerda qué versión del archivo se leyó."""
@@ -373,6 +529,8 @@ class Controlador:
         # Captura ANTES: un guardado externo durante la importación debe detectarse al exportar.
         firma = excel_generator._firma_excel(ruta) if ruta and ruta.exists() else None
         excel_generator.import_excel_to_db(self.db, cid)
+        if ruta and ruta.exists() and self.db.get_config(f'excel_nombre|{cid}') != ruta.name:
+            self.db.set_config(f'excel_nombre|{cid}', ruta.name)
         self._firmas[cid] = firma
 
     def _excel_cambiado_durante(self, cid: int) -> bool:
@@ -636,7 +794,8 @@ class Controlador:
                 errores[campo] = f"{nombres.get(campo, campo)}: {ayuda}"
         return errores
 
-    def editar(self, cid: int, tabla: str, codigo: Optional[str], datos: dict, ejercicio: int) -> dict:
+    def editar(self, cid: int, tabla: str, codigo: Optional[str], datos: dict, ejercicio: int,
+               esperados: Optional[dict] = None, version_esperada: Optional[str] = None) -> dict:
         """Alta (codigo=None) o corrección manual de una fila. Un campo enviado vacío se borra."""
         if tabla == "documentos" and codigo and "ejercicio" in datos:
             previo = self.db.get(tabla, cid, codigo)
@@ -656,6 +815,37 @@ class Controlador:
             if tabla == "residencias" and limpios.get("ejercicio"):
                 codigo = codigo or str(int(limpios["ejercicio"]))
             previa = self.db.get(tabla, cid, codigo) if codigo else None
+            if version_esperada is not None:
+                version = hashlib.sha256(json.dumps(previa, sort_keys=True, default=str).encode('utf-8')).hexdigest()
+                if version != version_esperada:
+                    raise ValueError("El registro cambió durante la confirmación. Solicita una nueva propuesta.")
+            if codigo and esperados is not None:
+                if previa is None:
+                    raise ValueError("El registro ya no existe. Reabre la ficha antes de guardar.")
+                columnas = {c.campo: c for c in TABLAS[tabla].columnas_bd}
+                for campo in limpios.keys() & esperados.keys():
+                    anterior = database._normalizar(columnas[campo], esperados[campo])
+                    propuesto = database._normalizar(columnas[campo], limpios[campo])
+                    if previa.get(campo) != anterior and previa.get(campo) != propuesto:
+                        sujeto = "El contrato" if tabla == "contratos" else "El registro"
+                        raise ValueError(sujeto + " cambió desde que abriste el diálogo (por ejemplo, en Excel). "
+                                         "No se han sobrescrito tus datos. Reabre la ficha y revisa los cambios.")
+            if (tabla not in ('facturas_emitidas', 'facturas_recibidas')
+                    and limpios.get('estado', (previa or {}).get('estado')) != 'Presentado'):
+                columnas = {c.campo: c for c in TABLAS[tabla].columnas_bd}
+                cambiados = [c for c in CALCULADOS.get(tabla, set()) & limpios.keys()
+                             if database._normalizar(columnas[c], limpios[c]) != (previa or {}).get(c)]
+                if cambiados:
+                    raise ValueError("Estos campos se recalculan automáticamente: " + ', '.join(sorted(cambiados))
+                                     + ". Corrige los datos de origen (contrato, renta, gastos o catastro).")
+            if tabla == "contratos" and (not codigo or any(
+                    k in limpios for k in ("fecha_inicio", "fecha_fin_prevista", "fecha_fin_real"))):
+                propuesta = {**(previa or {}), **limpios}
+                inicio = a_fecha(propuesta.get("fecha_inicio"))
+                for campo in ("fecha_fin_prevista", "fecha_fin_real"):
+                    fin = a_fecha(propuesta.get(campo))
+                    if inicio and fin and fin < inicio:
+                        raise ValueError("La fecha de fin del contrato no puede ser anterior al inicio.")
             if tabla == "catastro" and limpios.get("anio_revision"):
                 anio_valor = limpios.get("ejercicio") or (previa or {}).get("ejercicio") or ejercicio
                 if int(limpios["anio_revision"]) > int(anio_valor):
@@ -680,16 +870,17 @@ class Controlador:
                 if tabla == "inmuebles":
                     self.db.proteger_campos_inmueble(cid, nuevo, (
                         k for k in limpios if (previa or {}).get(k) != fila.get(k)))
-            afectados = {int(ejercicio)}
-            if tabla == "gastos":
-                afectados |= tax_calculator.ejercicios_gasto(previa or {}) | tax_calculator.ejercicios_gasto(fila)
-            elif tabla in ("inmuebles", "contratos", "rentas", "residencias"):
-                afectados |= {int(f["ejercicio"]) for f in self.db.listar("m210_alquiler", cid) if f.get("ejercicio")}
-            if isinstance((previa or {}).get("ejercicio"), int):
-                afectados.add(previa["ejercicio"])
-            if isinstance(fila.get("ejercicio"), int):
-                afectados.add(fila["ejercicio"])
-            return {"codigo": nuevo, **self._recalcular_y_exportar(cid, afectados, int(ejercicio))}
+                afectados = {int(ejercicio)}
+                if tabla == "gastos":
+                    afectados |= tax_calculator.ejercicios_gasto(previa or {}) | tax_calculator.ejercicios_gasto(fila)
+                elif tabla in ("inmuebles", "contratos", "rentas", "residencias"):
+                    afectados |= {int(f["ejercicio"]) for f in self.db.listar("m210_alquiler", cid) if f.get("ejercicio")}
+                if isinstance((previa or {}).get("ejercicio"), int):
+                    afectados.add(previa["ejercicio"])
+                if isinstance(fila.get("ejercicio"), int):
+                    afectados.add(fila["ejercicio"])
+                resultado = self._recalcular_bd(cid, afectados, int(ejercicio))
+            return self._exportar_informe(cid, int(ejercicio), {"codigo": nuevo, **resultado})
 
     def aplicar_correccion_chat(self, propuesta, cliente_activo: int, ejercicio_activo: int, al_guardar=None):
         """Solo comandos confirmados del usuario; nunca se invoca desde una respuesta del modelo."""
@@ -724,6 +915,60 @@ class Controlador:
             return cc.ReciboGuardado(propuesta.id, cid, ej, propuesta.codigo, propuesta.campo,
                                     cc.importe_leido(fila["precio_escritura"]), 1)
 
+    def preparar_correccion_expediente(self, cid: int, ejercicio: int, plan: dict) -> dict:
+        from correcciones_expediente import validar_plan
+        plan = validar_plan(plan)
+        with self._lock:
+            cliente = self.db.get_cliente(cid)
+            if cliente is None:
+                raise ValueError("El cliente no existe.")
+            self.db.verificar_cartera(cliente)
+            permitidas = {t.nombre for t, _ in database.hojas_cartera(cartera_de(cliente.get('tipo_cliente')))}
+            if plan['tabla'] not in permitidas:
+                raise ValueError("El registro no pertenece a la cartera activa.")
+            self._importar(cid)
+            fila = self.db.get(plan['tabla'], cid, plan['codigo'])
+            if fila is None:
+                raise ValueError("El registro no pertenece a este cliente o ya no existe.")
+            errores = self.validar(plan['tabla'], {plan['campo']: plan['valor']})
+            if errores:
+                raise ValueError('; '.join(errores.values()))
+            columna = next(c for c in TABLAS[plan['tabla']].columnas_bd if c.campo == plan['campo'])
+            despues = database._normalizar(columna, plan['valor'])
+            if plan['tabla'] == 'contratos':
+                self.previsualizar_contrato(cid, {**fila, plan['campo']: despues}, int(ejercicio))
+            version = hashlib.sha256(json.dumps(fila, sort_keys=True, default=str).encode('utf-8')).hexdigest()
+            tablas_presentadas = _DECLARACIONES_RES if self._es_residente(cid) else ('m210_alquiler', 'm210_imputacion', 'patrimonio_714', 'its_718')
+            advertencias = (['Las declaraciones presentadas conservarán sus importes. Si la corrección les afecta, revisa su rectificación.']
+                            if any(tax_calculator._presentado(f) for tabla in tablas_presentadas for f in self.db.iterar(tabla, cid)) else [])
+            if plan['tabla'] in ('facturas_emitidas', 'facturas_recibidas'):
+                advertencias.append('Comprueba también los tipos y cuotas de IVA y retención de la factura: corregir un dato no autoriza cambiar los demás importes documentados.')
+            return {'version': version, 'antes': fila.get(plan['campo']), 'despues': despues,
+                    'cliente': ' '.join(str(cliente.get(c) or '') for c in ('nombre', 'apellidos')).strip(),
+                    'etiqueta': etiquetas(plan['tabla']).get(plan['campo'], plan['campo']),
+                    'advertencias': advertencias}
+
+    def ejecutar_correccion_expediente(self, propuesta) -> dict:
+        from acciones_documentales import Propuesta
+        from correcciones_expediente import validar_plan
+        if type(propuesta) is not Propuesta:
+            raise ValueError("Se requiere una propuesta confirmada.")
+        plan = validar_plan(dict(propuesta.plan))
+        cid, ej = propuesta.cliente_id, propuesta.ejercicio
+        with self._lock:
+            vista = self.preparar_correccion_expediente(cid, ej, plan)
+            if vista['version'] != propuesta.version:
+                raise ValueError("El registro cambió desde la propuesta. Revisa los datos y solicita otra corrección.")
+            try:
+                resultado = self.editar(cid, plan['tabla'], plan['codigo'], {plan['campo']: plan['valor']}, ej,
+                                        esperados={plan['campo']: vista['antes']}, version_esperada=propuesta.version)
+            except CalculoConfirmadoSinExcel as exc:
+                resultado = {**exc.resultado, 'error_excel': str(exc), 'excel': None}
+            actual = self.db.get(plan['tabla'], cid, plan['codigo'])
+            if actual is None or actual.get(plan['campo']) != vista['despues']:
+                raise ValueError("No se pudo verificar el dato guardado. Revisa la ficha antes de repetirlo.")
+            return {**resultado, 'registro_actualizado': True}
+
     # Dependientes que se borran con su inmueble o contrato (las referencias son texto, sin claves foráneas)
     _DEPENDIENTES = {
         "inmuebles": ("inmueble", ("catastro", "contratos", "inquilinos", "rentas", "cobros", "gastos",
@@ -731,6 +976,36 @@ class Controlador:
         "contratos": ("contrato", ("inquilinos", "rentas", "cobros")),
     }
     _DECLARACIONES = ("m210_alquiler", "m210_imputacion", "obligaciones")
+
+    def editar_datos_cliente(self, cid: int, ejercicio: int, datos: dict, residencia: dict,
+                            nuevo_tipo: str) -> dict:
+        """Confirma ficha, residencia y cálculo juntos; exporta después del commit."""
+        permitidos = {'nombre', 'apellidos', 'pasaporte', 'nacionalidad', 'email', 'telefono', 'responsable'}
+        if set(datos) - permitidos or set(residencia) - {'pais', 'certificado'}:
+            raise ValueError('La ficha contiene campos no editables.')
+        if 'nombre' in datos and not str(datos['nombre'] or '').strip():
+            raise ValueError('El nombre del cliente no puede quedar vacío.')
+        nuevo_tipo = carteras.validar_tipo(nuevo_tipo)
+        ej = int(ejercicio)
+        with self._lock:
+            self._importar(cid)
+            cliente = self.db.get_cliente(cid)
+            if not cliente:
+                raise ValueError('El cliente ya no existe.')
+            if cartera_de(cliente.get('tipo_cliente')) != cartera_de(nuevo_tipo):
+                raise ValueError('El cambio de cartera requiere su confirmación específica.')
+            with self.db.transaccion():
+                self.db.actualizar_cliente(cid, tipo_cliente=nuevo_tipo, **datos)
+                if residencia:
+                    cambios = dict(residencia)
+                    if cambios.get('pais'):
+                        cambios['grupo'] = tax_calculator.grupo_territorio(cambios['pais'])
+                    codigo = self.db.guardar_residencia(cid, ej, **cambios)
+                    for campo, valor in residencia.items():
+                        if valor == '':
+                            self.db.vaciar_campo('residencias', cid, codigo, campo)
+                resultado = self._recalcular_bd(cid, {ej}, ej)
+            return self._exportar_informe(cid, ej, resultado)
 
     def cambiar_tipo_cliente(self, cid: int, nuevo_tipo: str, ejercicio: int) -> dict:
         """Cambia el tipo de cliente. Si cambia de cartera, mueve su carpeta a la otra raíz (todo o nada).
@@ -746,8 +1021,7 @@ class Controlador:
             self._importar(cid)
             antes, despues = cartera_de(cliente.get("tipo_cliente")), cartera_de(nuevo_tipo)
             if antes == despues:
-                self.db.actualizar_cliente(cid, tipo_cliente=nuevo_tipo)
-                return self._recalcular_y_exportar(cid, {int(ejercicio)}, int(ejercicio))
+                return self.editar_datos_cliente(cid, ejercicio, {}, {}, nuevo_tipo)
             tablas = (self._DECLARACIONES[:2] + ("patrimonio_714", "its_718")) if antes == NR else _DECLARACIONES_RES
             presentadas = [f"{t} {r['codigo']}" for t in tablas for r in self.db.listar(t, cid)
                            if r.get("estado") == "Presentado"]
@@ -785,7 +1059,8 @@ class Controlador:
                         _carpeta_sin_enlaces(copia)
                         viejo.rename(copia)
                         respaldo = copia
-                    self.db.con.execute("DELETE FROM config WHERE clave=?", (f"excel_firma|{cid}",))
+                    self.db.con.execute("DELETE FROM config WHERE clave IN (?,?,?,?)",
+                        tuple(f'{p}|{cid}' for p in ('excel_firma', 'excel_nombre', 'excel_version', 'excel_filas')))
             except Exception as exc:
                 fallos = []
                 if respaldo is not None:
@@ -928,11 +1203,31 @@ class Controlador:
     def vista_inmuebles(self, cid: int, ejercicio: int, limite: Optional[int] = None,
                         desplazamiento: int = 0) -> list[dict]:
         out = []
+        conflictos = tax_calculator.conflictos_210_alquiler(self.lector, cid, int(ejercicio))
         inmuebles = (self.lector.listar_pagina("inmuebles", cid, limite, desplazamiento)
                      if limite is not None else self.lector.iterar("inmuebles", cid))
         for inm in inmuebles:
             cat = self.lector.catastro(cid, inm["codigo"], int(ejercicio))
             vp = tax_calculator.valor_patrimonial(inm, cat)
             tit = tax_calculator.pct_titularidad(inm)
-            out.append({**inm, "_vp": vp, "_tit": tit, "_computado": round(vp.valor * tit, 2), "_catastro": cat})
+            contratos = self.lector.listar("contratos", cid, inmueble=inm["codigo"])
+            rentas = {c["codigo"]: self.lector.listar("rentas", cid, contrato=c["codigo"]) for c in contratos}
+            ocupacion = tax_calculator.resumen_arrendamiento(inm, contratos, rentas, int(ejercicio))
+            compra = a_fecha(inm.get("fecha_adquisicion"))
+            ref_compra = inm.get("valor_referencia")
+            if ref_compra in (None, "") and compra:
+                ref_compra = self.lector.valor_referencia_ejercicio(cid, inm["codigo"], compra.year)
+            cobros = self.lector.listar("cobros", cid, inmueble=inm["codigo"], ejercicio=int(ejercicio))
+            desglose = [m for m in self.lector.listar(
+                "m210_alquiler", cid, inmueble=inm["codigo"], ejercicio=int(ejercicio), orden="periodo")
+                if m.get("estado") != "No procede"]
+            out.append({**inm, "_vp": vp, "_tit": tit, "_computado": round(vp.valor * tit, 2), "_catastro": cat,
+                        **{"_" + k: v for k, v in ocupacion.items()},
+                        "_ingresos_cobrados": tax_calculator.r2(sum(float(c.get("importe_cobrado") or 0) for c in cobros)),
+                        "_valor_referencia_compra": ref_compra,
+                        "_valor_referencia_actual": self.lector.valor_referencia_ejercicio(cid, inm["codigo"], int(ejercicio)),
+                        "_anio_compra": compra.year if compra else None,
+                        "_desglose_210": desglose,
+                        "_revision_210": conflictos.get(inm["codigo"]),
+                        "_periodicidad_210": tax_calculator.periodicidad_210_alquiler(self.lector, cid, inm["codigo"], int(ejercicio))})
         return out

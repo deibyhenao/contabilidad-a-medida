@@ -64,7 +64,9 @@ def test_alta_manual_de_contrato_genera_210(ctrl, pepito):
     res = ctrl.editar(pepito, "contratos", None, {"inmueble": "INM-001", "fecha_inicio": "01/01/2026",
                                                   "renta_inicial": "750", "estado": "Vigente"}, 2026)
     assert res["codigo"] == "CTR-001"
-    assert len(res["informe"].filas_210_alquiler) == 4
+    assert len(res["informe"].filas_210_alquiler) == 1
+    modelo = ctrl.db.get("m210_alquiler", pepito, res["informe"].filas_210_alquiler[0])
+    assert modelo["periodo"] == "Anual" and modelo["ingresos"] == 9000
 
 
 def test_marcar_presentado_congela_y_actualiza_obligacion(ctrl, pepito):

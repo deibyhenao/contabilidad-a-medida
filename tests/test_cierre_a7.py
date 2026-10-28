@@ -106,6 +106,7 @@ def test_excel_rechaza_fraccion_superior_a_uno(expediente, tmp_path, valor):
     db, cid, _ = expediente
     wb = Workbook()
     wb.remove(wb.active)
+    wb.create_sheet('00_RESUMEN')['B5'] = db.get_cliente(cid)['nif']
     for tabla in database.TABLAS.values():
         if tabla.hoja and tabla.hoja not in wb.sheetnames:
             wb.create_sheet(tabla.hoja)
@@ -335,6 +336,8 @@ def test_controller_recalcula_anios_anterior_nuevo_y_borrado(expediente):
     ctrl._lock = threading.RLock()
     ctrl._importar = lambda cid: None
     ctrl._recalcular_y_exportar = lambda cid, anios, activo: {"anios": anios}
+    ctrl._recalcular_bd = lambda cid, anios, activo: {"anios": anios}
+    ctrl._exportar_informe = lambda cid, activo, resultado: resultado
     resultado = ctrl.editar(cid, "gastos", cod, {"ejercicio": 2027}, 2026)
     assert resultado["anios"] == {2025, 2026, 2027}
     resultado = ctrl.borrar_registro(cid, "gastos", cod, 2026)

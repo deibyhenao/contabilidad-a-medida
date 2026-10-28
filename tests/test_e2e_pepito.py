@@ -33,6 +33,7 @@ def _filas_hoja(ws):
 
 def test_e2e_pepito_flujo_completo(tmp_path):
     ctrl = Controlador(tmp_path / "contabilidad.db")
+    ctrl.db.set_config("periodicidad_210_alquiler", "Trimestral")  # flujo histórico que presenta 3T
     ctrl.cambiar_carpeta_clientes(tmp_path / "Clientes")
     pdfs_dir = tmp_path / "pdfs_origen"
     pdfs_dir.mkdir(parents=True, exist_ok=True)

@@ -185,7 +185,7 @@ def test_bloque_excel_preserva_plantilla_y_formulas(db, cliente, cantidad):
         ws = wb["00_RESUMEN"]
         original = plantilla["00_RESUMEN"]
         assert ws.max_column == original.max_column == 8
-        assert ws["A29"].value == "GASTOS DEDUCIBLES DEL EJERCICIO POR INMUEBLE"
+        assert ws["A29"].value == "GASTOS REGISTRADOS DEL EJERCICIO POR INMUEBLE"
         assert "A29:H29" in set(map(str, ws.merged_cells.ranges))
         for atributo in ("font", "fill", "alignment"):
             assert copy(getattr(ws["A29"], atributo)) == copy(getattr(original["A18"], atributo))
@@ -213,7 +213,7 @@ def test_bloque_excel_preserva_plantilla_y_formulas(db, cliente, cantidad):
                     assert "'08_GASTOS'!$C$2:$C$3000" in formula
                     assert f"LEFT({cell.column_letter}$30," in formula
             if cantidad > 6:
-                assert ws["H30"].value == "Resto"
+                assert ws["H30"].value == "Resto / sin asignar"
                 assert ws[f"H{fila}"].value == f"=B{fila}-SUM(C{fila}:G{fila})"
         fila_total = 31 + len(database.CATEGORIAS_GASTO)
         assert ws.cell(fila_total, 1).value == "TOTAL"

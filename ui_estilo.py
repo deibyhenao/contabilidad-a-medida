@@ -207,8 +207,17 @@ def colores_estado(estado: Optional[str], p: Paleta) -> tuple[str, str]:
 
 
 def pastilla_estado(estado: Optional[str], p: Paleta) -> ft.Container:
+    """Estado con su color pastel. «Presentado» (también un antiguo «PRESENTADO[OK]») se muestra con el texto
+    canónico y un icono de confirmación: el OK no se guarda ni depende solo del color."""
+    if estado and "".join(ch for ch in str(estado).lower() if ch.isalpha()) in ("presentado", "presentadook"):
+        estado = "Presentado"
     color, fondo = colores_estado(estado, p)
-    return pastilla(estado or "—", color, fondo)
+    c = pastilla(estado or "—", color, fondo)
+    if estado == "Presentado":
+        c.content = ft.Row([ft.Icon(ft.Icons.CHECK_CIRCLE, size=13, color=color, semantics_label="Confirmado"),
+                            c.content], spacing=4, tight=True, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+        c.tooltip = "Presentado: importe fijado con el justificante"
+    return c
 
 
 def kpi(titulo_kpi: str, valor: str, p: Paleta, icono=None, color: Optional[str] = None,
@@ -287,6 +296,23 @@ def accion(texto: str, on_click, p: Paleta, icono=None, tipo: str = "neutro",
                                    ft.ControlState.DEFAULT: ft.BorderSide(0, "transparent")},
                              shape=ft.RoundedRectangleBorder(radius=12),
                              text_style=ft.TextStyle(size=13, font_family=FUENTE, weight=ft.FontWeight.W_600)))
+
+
+def accion_icono(icono, on_click, p: Paleta, tooltip: str, color: Optional[str] = None,
+                 peligro: bool = False) -> ft.IconButton:
+    """Versión nativa de ``boton_icono`` (mismo icono y círculo): recibe el foco con Tab, se activa con
+    teclado, muestra un borde de foco y su área es de 44 px. ``tooltip`` sirve también de nombre accesible."""
+    reposo = color or p.acento
+    activo = p.rojo if peligro else reposo
+    return ft.IconButton(icono, on_click=on_click, tooltip=tooltip, icon_size=19, width=44, height=44,
+                         style=ft.ButtonStyle(
+                             icon_color={ft.ControlState.HOVERED: activo, ft.ControlState.FOCUSED: activo,
+                                         ft.ControlState.DEFAULT: reposo},
+                             overlay_color={ft.ControlState.HOVERED: p.rojo_suave if peligro else p.hover,
+                                            ft.ControlState.FOCUSED: p.rojo_suave if peligro else p.acento_suave},
+                             side={ft.ControlState.FOCUSED: ft.BorderSide(2, activo),
+                                   ft.ControlState.DEFAULT: ft.BorderSide(0, "transparent")},
+                             shape=ft.CircleBorder()))
 
 
 def campo(etiqueta: str, p: Paleta, valor: str = "", ayuda: Optional[str] = None, solo_lectura: bool = False,

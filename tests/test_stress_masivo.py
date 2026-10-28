@@ -92,8 +92,9 @@ def test_100_clientes_20_rusos_multinmueble_y_paginacion(db, record_property):
             assert db.residencia(cid, EJ)['gastos_deducibles'] == 'No'
             assert not any(c['id'] == cid for c in db.listar_clientes(cartera='RES'))
         modelos_ue = [r for r in db.listar('m210_alquiler', europeos[0], ejercicio=EJ) if r['ingresos']]
+        assert {f['periodo'] for f in modelos_ue} == {'Anual'}
         for f in modelos_ue:
-            dias = 90 if f['periodo'] == '1T' else 92
+            dias = 90 if f['inmueble'] == 'INM-001' else 92  # duración real de cada contrato, independiente del calendario
             amort = euros(200000 * .6 * .03 * dias / 365)
             gastos = euros(900 + amort)
             assert f['tipo'] == .19

@@ -1106,7 +1106,16 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
             datos.update(ejercicio=ej, inmueble=inmueble, ruta=relativo, estado="Presentado")
             if renta in ("01", "35"):
                 # La calculadora usa 'Anual'; el documento puede denominarlo '0A'.
-                periodo = "Anual" if periodo == "0A" else periodo
+                from tax_calculator import normalizar_periodo_210, periodo_210_o_none
+                periodo = normalizar_periodo_210(periodo)
+                anteriores = {periodo_210_o_none(f.get('periodo'))
+                              for f in db.listar('m210_alquiler', cid, inmueble=inmueble, ejercicio=ej)
+                              if f.get('estado') == 'Presentado'}
+                if anteriores and (None in anteriores or
+                        (periodo == 'Anual' and anteriores != {'Anual'}) or
+                        (periodo != 'Anual' and 'Anual' in anteriores)):
+                    raise ValueError("Declaraciones presentadas con periodicidades incompatibles. "
+                                     "Revisa el histórico antes de incorporar este justificante.")
                 datos["periodo"] = periodo
                 codigos["210_alquiler"] = db.upsert("m210_alquiler", cid, datos,
                                                     clave=f"210A|{ej}|{inmueble}|{periodo}", solo_si_vacio=("pagado",))

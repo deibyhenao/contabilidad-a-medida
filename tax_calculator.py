@@ -160,6 +160,67 @@ def dias_anio(ejercicio: int) -> int:
     return 366 if calendar.isleap(ejercicio) else 365
 
 
+def normalizar_periodo_210(periodo: str) -> str:
+    """Identidad fiscal única: 0A y Anual son el mismo periodo, no dos declaraciones."""
+    texto = re.sub(r"\s+", "", str(periodo or "")).upper()
+    if texto in ("0A", "OA", "ANUAL"):
+        return "Anual"
+    if texto in ("1T", "2T", "3T", "4T"):
+        return texto
+    raise ValueError("Periodo del modelo 210 no válido: usa Anual (0A) o 1T–4T.")
+
+
+def periodo_210_o_none(periodo) -> Optional[str]:
+    """Como normalizar_periodo_210, pero None si no se reconoce: una fila mal escrita a mano en el Excel no debe
+    bloquear el recálculo de todo el cliente (la fila se conserva tal cual)."""
+    try:
+        return normalizar_periodo_210(periodo)
+    except ValueError:
+        return None
+
+
+def periodicidad_210_alquiler(db: Database, cid: int, inmueble: str, ejercicio: int) -> str:
+    """Preferencia por inmueble/año; el calendario presentado prevalece sobre una preferencia nueva."""
+    presentados = {periodo_210_o_none(f.get("periodo"))
+                  for f in db.listar("m210_alquiler", cid, inmueble=inmueble, ejercicio=int(ejercicio))
+                  if _presentado(f)} - {None}
+    if presentados == {"Anual"}:
+        return "Anual"
+    if presentados and presentados <= {"1T", "2T", "3T", "4T"}:
+        return "Trimestral"
+    elegido = db.get_config(f"periodicidad_210|{cid}|{inmueble}|{int(ejercicio)}")
+    if elegido in ("Anual", "Trimestral"):
+        return elegido
+    # El calendario ya existente se conserva, también si las filas eran Pendiente.
+    # Solo un cálculo sin histórico ni preferencia recibe el nuevo valor por defecto.
+    historicos = [f for f in db.listar('m210_alquiler', cid, inmueble=inmueble, ejercicio=int(ejercicio))
+                  if not _presentado(f)]
+    activos = [f for f in historicos if f.get('estado') != 'No procede']
+    borradores = {periodo_210_o_none(f.get("periodo"))
+                  for f in (activos or historicos)} - {None}
+    if borradores and borradores <= {"1T", "2T", "3T", "4T"}:
+        return "Trimestral"
+    if borradores == {"Anual"}:
+        return "Anual"
+    # Una preferencia general solo sirve de valor inicial para cálculos nuevos.
+    elegido = db.get_config("periodicidad_210_alquiler")
+    if elegido in ("Anual", "Trimestral"):
+        return elegido
+    return "Anual" if int(ejercicio) >= 2024 else "Trimestral"
+
+
+def resumen_arrendamiento(inm: dict, contratos: list[dict], rentas_por_contrato: dict,
+                         ejercicio: int) -> dict:
+    """Ocupación sin duplicar días solapados e ingresos contractuales del inmueble al 100 %."""
+    tenencia = periodo_tenencia(inm, int(ejercicio))
+    propiedad = dias(*tenencia) if tenencia else 0
+    alquilados = dias_totales(intervalos_alquilados(contratos, tenencia)) if tenencia else 0
+    devengados = (r2(sum(renta_devengada(c, rentas_por_contrato.get(c["codigo"], []), *tenencia)
+                         for c in contratos)) if tenencia else 0.0)
+    return {"dias_propiedad": propiedad, "dias_alquilado": alquilados,
+            "dias_vacio": max(0, propiedad - alquilados), "ingresos_devengados": devengados}
+
+
 def trimestres(ejercicio: int) -> list[tuple[str, date, date]]:
     return [("1T", date(ejercicio, 1, 1), date(ejercicio, 3, 31)),
             ("2T", date(ejercicio, 4, 1), date(ejercicio, 6, 30)),
@@ -168,10 +229,17 @@ def trimestres(ejercicio: int) -> list[tuple[str, date, date]]:
 
 
 def plazo_210_alquiler(ejercicio: int, periodo: str) -> date:
-    """Plazo del 210 de rendimientos: 20 primeros días naturales del mes siguiente al trimestre (4T: 20 enero).
-    Declaración anual: 20 de enero del año siguiente. VERIFICAR con la Orden del modelo 210 vigente."""
-    return {"1T": date(ejercicio, 4, 20), "2T": date(ejercicio, 7, 20), "3T": date(ejercicio, 10, 20)}.get(
-        periodo, date(ejercicio + 1, 1, 20))
+    """Plazo del 210 de arrendamientos (Orden EHA/3316/2010, art. 5, según la AEAT a 26/10/2026):
+    - anual (agrupación desde 2024): 1-20 de enero del año siguiente para 2024 y 2025; 1-20 de abril desde 2026;
+    - declaración separada por trimestre: 20 primeros días del mes siguiente al trimestre hasta los devengos de
+      septiembre de 2026; desde octubre de 2026, 1-20 de abril del año siguiente."""
+    periodo = periodo_210_o_none(periodo) or periodo
+    trimestral = {"1T": date(ejercicio, 4, 20), "2T": date(ejercicio, 7, 20), "3T": date(ejercicio, 10, 20)}
+    if periodo in trimestral and ejercicio <= 2026:
+        return trimestral[periodo]
+    if ejercicio >= 2026:  # anual de 2026 en adelante y separadas desde el 4T de 2026
+        return date(ejercicio + 1, 4, 20)
+    return date(ejercicio + 1, 1, 20)
 
 
 def plazo_210_imputacion(ejercicio: int) -> date:
@@ -244,6 +312,21 @@ def valor_patrimonial(inm: dict, cat: Optional[dict]) -> ValorPatrimonial:
     catastral = float((cat or {}).get("valor_catastral") or 0)
     escritura = float(inm.get("precio_escritura") or 0)
     referencia = float((cat or {}).get("valor_referencia") or inm.get("valor_referencia") or 0)
+    # AEAT (Patrimonio 2025, bienes inmuebles): la referencia solo cuenta en adquisiciones desde el 01/01/2022 y si
+    # fue la base del tributo de la adquisición (ITP/ISD). Se usa la de la escritura, no la del año consultado, y se
+    # presume base cuando supera el precio declarado (la base del ITP es el mayor de ambos) · VERIFICAR si se recurrió.
+    adquisicion = a_fecha(inm.get("fecha_adquisicion"))
+    ref_compra = float(inm.get("valor_referencia") or 0)
+    if not (adquisicion and adquisicion >= date(2022, 1, 1) and ref_compra > escritura):
+        referencia = 0.0
+    else:
+        referencia = ref_compra
+    # Los datos documentados por el asesor prevalecen sobre la presunción anterior.
+    base_compra = inm.get("base_impuesto_adquisicion")
+    if (_sin_tildes(str(inm.get("uso_valor_referencia") or "")) == "no"
+            or (base_compra not in (None, "") and float(base_compra) >= 0
+                and abs(float(base_compra) - ref_compra) > 0.01)):
+        referencia = 0.0
     comprobado = float(inm.get("valor_comprobado") or 0)
     candidatos = [("Valor catastral", r2(catastral)), ("Valor escritura", r2(escritura)),
                   ("Valor referencia", r2(referencia)), ("Valor comprobado", r2(comprobado))]
@@ -804,6 +887,7 @@ class InformeFiscal:
     alertas: list[Alerta] = field(default_factory=list)
     estados: list[str] = field(default_factory=list)  # control de estado legible para la UI
     pendientes: list["Pendiente"] = field(default_factory=list)  # documentos y declaraciones por hacer
+    alquileres_bloqueados: dict[str, str] = field(default_factory=dict)
 
     @property
     def mensaje_patrimonio(self) -> str:
@@ -868,6 +952,13 @@ def _obligacion(db: Database, cid: int, ejercicio: int, tipo: str, inmueble: Opt
                 fecha_limite: date, id_modelo: Optional[str], estado: str, notas: str = "",
                 pagado: Optional[float] = None, fecha_presentacion=None) -> str:
     previa = db.get_por_clave("obligaciones", cid, clave)
+    if tipo == "210 Alquiler" and id_modelo:
+        # La identidad es el modelo, aunque la clave histórica diga OA/0A.
+        vinculadas = db.listar("obligaciones", cid, ejercicio=ejercicio, tipo=tipo,
+                              inmueble=inmueble, id_modelo=id_modelo)
+        if vinculadas:
+            previa = next((f for f in vinculadas if _presentado(f)), vinculadas[0])
+            clave = previa.get("clave") or clave
     es_210 = tipo in ("210 Alquiler", "210 Imputación")
     nota_nrc = False
     if es_210 and id_modelo:
@@ -887,6 +978,8 @@ def _obligacion(db: Database, cid: int, ejercicio: int, tipo: str, inmueble: Opt
         notas = _anadir_nota_nrc(notas)
     datos = {"ejercicio": ejercicio, "tipo": tipo, "inmueble": inmueble, "fecha_limite": fecha_limite,
              "id_modelo": id_modelo, "notas": notas or None}
+    if previa:
+        datos["codigo"] = previa["codigo"]
     if not _presentado(previa):
         datos.update(estado=estado, pagado=pagado, fecha_presentacion=fecha_presentacion)
     return db.upsert("obligaciones", cid, datos, clave=clave, solo_si_vacio=("pagado",) if es_210 else ())
@@ -916,6 +1009,49 @@ def _generar_cobros(db: Database, cid: int, ejercicio: int, inm: dict, contratos
                                       "estado": "Pendiente"}, clave=clave, solo_si_vacio=("estado",))
 
 
+class ConflictoHistorial210(ValueError):
+    """Histórico ambiguo: se suspende solo el alquiler del inmueble afectado."""
+
+
+class ConflictoDuplicados210(ConflictoHistorial210):
+    """Dos registros con la misma identidad fiscal requieren conciliación."""
+
+
+def _conflictos_modelos_210(modelos: list[dict], ejercicio: int) -> dict[str, str]:
+    grupos = {}
+    presentados, conflictos = {}, {}
+    for fila in sorted(modelos, key=lambda f: (int(f.get("ejercicio") or 0), f["codigo"])):
+        ej = int(fila.get("ejercicio") or 0)
+        periodo = periodo_210_o_none(fila.get("periodo"))
+        if not 1900 <= ej <= ejercicio or fila.get('estado') == 'No procede':
+            continue
+        inmueble = fila.get('inmueble')
+        if _presentado(fila):
+            presentados.setdefault((inmueble, ej), set()).add(periodo)
+            if not periodo:
+                conflictos.setdefault(inmueble, f"{inmueble}, ejercicio {ej}: periodo no reconocido en presentado "
+                                      f"{fila['codigo']}. Revisa el histórico antes de reutilizar arrastres.")
+        if not periodo:
+            continue
+        tipo = "presentados" if _presentado(fila) else "borradores"
+        grupos.setdefault((fila.get("inmueble"), ej, periodo, tipo), []).append(fila["codigo"])
+    for (inmueble, ej, periodo, tipo), codigos in grupos.items():
+        if len(codigos) > 1:
+            conflictos.setdefault(inmueble, f"{inmueble}, ejercicio {ej}, periodo {periodo}: modelos {tipo} "
+                                  f"duplicados ({', '.join(codigos)}). Revisa el histórico; no se recalculan "
+                                  "el alquiler ni los arrastres dependientes de este inmueble.")
+    for (inmueble, ej), periodos in presentados.items():
+        if 'Anual' in periodos and len(periodos) > 1:
+            conflictos.setdefault(inmueble, f"{inmueble}, ejercicio {ej}: declaraciones presentadas con "
+                                  "periodicidades incompatibles. Revisa el histórico y sus arrastres.")
+    return conflictos
+
+
+def conflictos_210_alquiler(db: Database, cid: int, ejercicio: int) -> dict[str, str]:
+    """Conflictos vivos, también al reabrir o exportar sin una nueva sesión de cálculo."""
+    return _conflictos_modelos_210(db.listar("m210_alquiler", cid), int(ejercicio))
+
+
 def _liquidacion_con_historia(db: Database, cid: int, inm: dict, contratos: list[dict],
                              rentas: dict[str, list[dict]], ejercicio: int,
                              periodicidad: str) -> LiquidacionAlquiler:
@@ -928,6 +1064,9 @@ def _liquidacion_con_historia(db: Database, cid: int, inm: dict, contratos: list
     cod = inm["codigo"]
     gastos = db.listar("gastos", cid, inmueble=cod)
     modelos = db.listar("m210_alquiler", cid, inmueble=cod)
+    conflicto = _conflictos_modelos_210(modelos, ejercicio).get(cod)
+    if conflicto:
+        raise ConflictoDuplicados210(conflicto)
     saldos_guardados = db.listar("arrastres_gastos", cid, inmueble=cod)
     ejercicios = [ejercicio]
     for g in gastos:
@@ -937,7 +1076,16 @@ def _liquidacion_con_historia(db: Database, cid: int, inm: dict, contratos: list
     saldos = {}
     revisar_hasta = 0
     for ej in range(min(ejercicios), ejercicio + 1):
-        presentados = {f["periodo"]: f for f in modelos if f.get("ejercicio") == ej and _presentado(f)}
+        # 0A, OA y Anual son el mismo periodo (importaciones antiguas guardaban el código del modelo)
+        presentados = {}
+        for f in modelos:
+            if f.get("ejercicio") != ej or not _presentado(f):
+                continue
+            periodo = periodo_210_o_none(f.get("periodo")) or f.get("periodo")
+            if periodo in presentados:
+                raise ConflictoDuplicados210(f"{cod}, ejercicio {ej}: modelos presentados duplicados para {periodo}. "
+                                 "Revisa el histórico antes de continuar.")
+            presentados[periodo] = f
         # La preferencia global no cambia el calendario de un histórico ya presentado.
         # Resolver por inmueble y año permite carteras con declaraciones de ambos tipos.
         periodos = set(presentados)
@@ -945,7 +1093,7 @@ def _liquidacion_con_historia(db: Database, cid: int, inm: dict, contratos: list
             raise ValueError(f"{cod}, ejercicio {ej}: hay declaraciones presentadas con periodicidades incompatibles. "
                              "Revisa el histórico antes de continuar.")
         periodicidad_ej = ("Anual" if periodos == {"Anual"} else
-                           "Trimestral" if periodos else periodicidad)
+                           "Trimestral" if periodos else periodicidad_210_alquiler(db, cid, cod, ej))
         liquidacion = liquidar_210_alquiler(
             inm, contratos, rentas, [g for g in gastos if _gasto_toca_ejercicio(g, ej)],
             db.catastro(cid, cod, ej), resolver_residencia(db.residencia(cid, ej)), ej,
@@ -977,79 +1125,130 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
         db.upsert("residencias", cid, {"codigo": fila_res["codigo"], "grupo": res.grupo,
                                        "gastos_deducibles": "Sí" if res.deduce_gastos else "No"},
                   solo_si_vacio=() if res.grupo == GRUPO_EXTRA else ("gastos_deducibles",))
-    periodicidad = db.get_config("periodicidad_210_alquiler", "Trimestral")
     informe_estados: list[str] = []
     filas_a, filas_i = [], []
     inmuebles = db.listar("inmuebles", cid)
     catastros: dict[str, Optional[dict]] = {}
     discrepancias: list[Alerta] = []   # declaraciones presentadas que no cuadran con el cálculo de la app
+    alquileres_bloqueados = {}
 
     for inm in inmuebles:
         cod = inm["codigo"]
+        periodicidad = periodicidad_210_alquiler(db, cid, cod, ejercicio)
         cat = db.catastro(cid, cod, ejercicio)
         catastros[cod] = cat
+        adquisicion = a_fecha(inm.get("fecha_adquisicion"))
+        referencia = float(inm.get("valor_referencia") or 0)
+        base_compra = float(inm.get("base_impuesto_adquisicion") or 0)
+        uso_referencia = _sin_tildes(str(inm.get("uso_valor_referencia") or ""))
+        if (adquisicion and adquisicion >= date(2022, 1, 1)
+                and referencia > float(inm.get("precio_escritura") or 0)
+                and uso_referencia != "no"
+                and ((base_compra <= 0 and uso_referencia != "si")
+                     or (base_compra > 0 and abs(base_compra - referencia) > 0.01))):
+            discrepancias.append(Alerta(
+                "aviso", cod, "referencia adquisición",
+                "Valor de referencia: falta confirmar o hay contradicción con la base del impuesto de adquisición. "
+                "Se respetan los datos explícitos del asesor; revisa la valoración de Patrimonio · VERIFICAR"))
         contratos = db.listar("contratos", cid, inmueble=cod)
         rentas = {c["codigo"]: db.listar("rentas", cid, contrato=c["codigo"]) for c in contratos}
         gastos = [g for g in db.listar("gastos", cid, inmueble=cod) if _gasto_toca_ejercicio(g, ejercicio)]
+        filas_modelos = db.listar("m210_alquiler", cid, inmueble=cod, ejercicio=ejercicio)
+        invalidos = [f for f in filas_modelos if not periodo_210_o_none(f.get("periodo"))]
+        for f in invalidos:
+            discrepancias.append(Alerta(
+                "grave", cod, f"periodo 210 {f['codigo']}",
+                f"{f['codigo']}: periodo no reconocido ({f.get('periodo') or 'vacío'}). "
+                "Se conservan sus importes; corrige el periodo antes de dar por cerrado el cálculo."))
         _generar_cobros(db, cid, ejercicio, inm, contratos, rentas)
 
         # ---- 210 rendimientos
-        liquidacion = _liquidacion_con_historia(db, cid, inm, contratos, rentas, ejercicio, periodicidad)
-        if liquidacion.revisar:
-            informe_estados.append(f"{cod} · REVISAR arrastre: declaración presentada sin desglose verificable")
-        for r in liquidacion.resultados:
-            clave = f"210A|{ejercicio}|{cod}|{r.periodo}"
-            previa = db.get_por_clave("m210_alquiler", cid, clave)
-            if _presentado(previa):
-                codigo = previa["codigo"]
-                base_pres = float(previa.get("base") or 0)
-                # Sin ingresos guardados solo vale la base como ingresos si no hay gastos (Extra-UE)
-                ing_pres = (float(previa["ingresos"]) if previa.get("ingresos") not in (None, "") else
-                            base_pres if not res.deduce_gastos else None)
-                ing_calc = r.ingresos_contrato
-                gastos_reg = previa.get("gastos")
-                esperada = (max(0.0, r2(float(previa["ingresos"]) - float(gastos_reg)))
-                            if previa.get("ingresos") not in (None, "") and gastos_reg not in (None, "") else None)
-                if esperada is not None and abs(base_pres - esperada) > 1:
-                    discrepancias.append(Alerta(
-                        "aviso", cod, f"base 210 {r.periodo}",
-                        f"210 alquiler {r.periodo} {ejercicio} presentado con base {fmt_eur(base_pres)}; los ingresos "
-                        f"({fmt_eur(float(previa['ingresos']))}) menos los gastos ({fmt_eur(float(gastos_reg))}) del periodo "
-                        f"dan {fmt_eur(esperada)} (diferencia {fmt_eur(esperada - base_pres)}). Revisa la declaración · VERIFICAR"))
-                if ing_calc is not None and ing_pres is not None and abs(ing_pres - ing_calc) > 1:
-                    discrepancias.append(Alerta(
-                        "aviso", cod, f"presentado 210 {r.periodo}",
-                        f"210 alquiler {r.periodo} {ejercicio} presentado con ingresos de {fmt_eur(ing_pres)}; los "
-                        f"contratos devengan {fmt_eur(ing_calc)} (diferencia {fmt_eur(ing_calc - ing_pres)}). Revisa si faltan "
-                        "rentas o se restaron gastos o descuentos del inquilino"
-                        + (" (Extra-UE no deduce gastos)" if res.grupo == GRUPO_EXTRA else "") + " · VERIFICAR"))
-            else:
-                codigo = db.upsert("m210_alquiler", cid, {
-                    "ejercicio": ejercicio, "inmueble": cod, "contrato": ", ".join(r.contratos), "periodo": r.periodo,
-                    "desde": r.desde, "hasta": r.hasta, "pais": res.pais or res.grupo, "ingresos": r.ingresos,
-                    "gastos": r.gastos, "base": r.base, "tipo": r.tipo, "cuota": r.cuota,
-                    "estado": _estado_auto(previa, "Pendiente"),
-                    "observaciones": "; ".join(r.detalle),
-                    "detalle_limite": json.dumps(r.detalle_limite, sort_keys=True)}, clave=clave)
-            fila = db.get("m210_alquiler", cid, codigo)
-            filas_a.append(codigo)
-            _obligacion(db, cid, ejercicio, "210 Alquiler", cod, f"OBL|{clave}", plazo_210_alquiler(ejercicio, r.periodo),
-                        codigo, fila.get("estado") or "Pendiente", f"210 rendimientos {r.periodo} {ejercicio}",
-                        fila.get("pagado"), fila.get("fecha_presentacion"))
-            informe_estados.append(f"{cod} · 210 Arrendamientos {r.periodo}/{ejercicio}: {fila.get('estado')}"
-                                   f" · cuota {fmt_eur(fila.get('cuota') or 0)}")
+        inicio_filas, inicio_estados, inicio_alertas = len(filas_a), len(informe_estados), len(discrepancias)
+        try:
+            with db.transaccion():
+                liquidacion = _liquidacion_con_historia(db, cid, inm, contratos, rentas, ejercicio, periodicidad)
+                if liquidacion.revisar:
+                    informe_estados.append(f"{cod} · REVISAR arrastre: declaración presentada sin desglose verificable")
+                for r in liquidacion.resultados:
+                    clave = f"210A|{ejercicio}|{cod}|{r.periodo}"
+                    previa = db.get_por_clave("m210_alquiler", cid, clave)
+                    if previa and not periodo_210_o_none(previa.get("periodo")):
+                        informe_estados.append(f"{cod} · REVISAR 210 {r.periodo}: periodo no reconocido en {previa['codigo']}")
+                        continue
+                    if not _presentado(previa):
+                        # Un presentado importado con otra clave («0A», «OA») es el mismo periodo: no se duplica
+                        equivalentes = [f for f in filas_modelos
+                                        if periodo_210_o_none(f.get("periodo")) == r.periodo]
+                        previa = next((f for f in equivalentes if _presentado(f)), previa)
+                        if previa is None and equivalentes:
+                            if len(equivalentes) > 1:
+                                raise ConflictoDuplicados210(f"{cod}, ejercicio {ejercicio}: borradores duplicados para {r.periodo}. "
+                                                 "Revisa sus datos antes de continuar.")
+                            previa = equivalentes[0]
+                    if _presentado(previa):
+                        codigo = previa["codigo"]
+                        base_pres = float(previa.get("base") or 0)
+                        # Sin ingresos guardados solo vale la base como ingresos si no hay gastos (Extra-UE)
+                        ing_pres = (float(previa["ingresos"]) if previa.get("ingresos") not in (None, "") else
+                                    base_pres if not res.deduce_gastos else None)
+                        ing_calc = r.ingresos_contrato
+                        gastos_reg = previa.get("gastos")
+                        esperada = (max(0.0, r2(float(previa["ingresos"]) - float(gastos_reg)))
+                                    if previa.get("ingresos") not in (None, "") and gastos_reg not in (None, "") else None)
+                        if esperada is not None and abs(base_pres - esperada) > 1:
+                            discrepancias.append(Alerta(
+                                "aviso", cod, f"base 210 {r.periodo}",
+                                f"210 alquiler {r.periodo} {ejercicio} presentado con base {fmt_eur(base_pres)}; los ingresos "
+                                f"({fmt_eur(float(previa['ingresos']))}) menos los gastos ({fmt_eur(float(gastos_reg))}) del periodo "
+                                f"dan {fmt_eur(esperada)} (diferencia {fmt_eur(esperada - base_pres)}). Revisa la declaración · VERIFICAR"))
+                        if ing_calc is not None and ing_pres is not None and abs(ing_pres - ing_calc) > 1:
+                            discrepancias.append(Alerta(
+                                "aviso", cod, f"presentado 210 {r.periodo}",
+                                f"210 alquiler {r.periodo} {ejercicio} presentado con ingresos de {fmt_eur(ing_pres)}; los "
+                                f"contratos devengan {fmt_eur(ing_calc)} (diferencia {fmt_eur(ing_calc - ing_pres)}). Revisa si faltan "
+                                "rentas o se restaron gastos o descuentos del inquilino"
+                                + (" (Extra-UE no deduce gastos)" if res.grupo == GRUPO_EXTRA else "") + " · VERIFICAR"))
+                    else:
+                        codigo = db.upsert("m210_alquiler", cid, {
+                            "codigo": previa["codigo"] if previa else None,
+                            "ejercicio": ejercicio, "inmueble": cod, "contrato": ", ".join(r.contratos), "periodo": r.periodo,
+                            "desde": r.desde, "hasta": r.hasta, "pais": res.pais or res.grupo, "ingresos": r.ingresos,
+                            "gastos": r.gastos, "base": r.base, "tipo": r.tipo, "cuota": r.cuota,
+                            "estado": _estado_auto(previa, "Pendiente"),
+                            "observaciones": "; ".join(r.detalle),
+                            "detalle_limite": json.dumps(r.detalle_limite, sort_keys=True)}, clave=clave,
+                            solo_si_vacio=("observaciones",) if previa and previa.get("estado")
+                            not in (None, "", *ESTADOS_AUTOMATICOS) else ())
+                    fila = db.get("m210_alquiler", cid, codigo)
+                    filas_a.append(codigo)
+                    _obligacion(db, cid, ejercicio, "210 Alquiler", cod, f"OBL|{clave}", plazo_210_alquiler(ejercicio, r.periodo),
+                                codigo, fila.get("estado") or "Pendiente", f"210 rendimientos {r.periodo} {ejercicio}",
+                                fila.get("pagado"), fila.get("fecha_presentacion"))
+                    informe_estados.append(f"{cod} · 210 Arrendamientos {r.periodo}/{ejercicio}: {fila.get('estado')}"
+                                           f" · cuota {fmt_eur(fila.get('cuota') or 0)}")
 
-        # ---- 210 rendimientos obsoletos (contrato cancelado, venta...): se anulan si no están presentados
-        vigentes = set(filas_a)
-        for viejo in db.listar("m210_alquiler", cid, ejercicio=ejercicio, inmueble=cod):
-            if viejo["codigo"] in vigentes or _presentado(viejo) or not (viejo.get("clave") or "").startswith("210A|"):
-                continue
-            db.upsert("m210_alquiler", cid, {"codigo": viejo["codigo"], "ingresos": 0, "gastos": 0, "base": 0,
-                                             "cuota": 0, "estado": _estado_auto(viejo, "No procede")})
-            fila_v = db.get("m210_alquiler", cid, viejo["codigo"])
-            _obligacion(db, cid, ejercicio, "210 Alquiler", cod, f"OBL|{viejo['clave']}",
-                        plazo_210_alquiler(ejercicio, viejo.get("periodo") or ""), viejo["codigo"],
-                        fila_v.get("estado"), "Sin ingresos en el periodo tras recalcular")
+                # ---- 210 rendimientos obsoletos (contrato cancelado, venta...): se anulan si no están presentados
+                vigentes = set(filas_a)
+                for viejo in db.listar("m210_alquiler", cid, ejercicio=ejercicio, inmueble=cod):
+                    if (viejo["codigo"] in vigentes or _presentado(viejo)
+                            or not periodo_210_o_none(viejo.get("periodo"))
+                            or not (viejo.get("clave") or "").startswith("210A|")):
+                        continue
+                    db.upsert("m210_alquiler", cid, {"codigo": viejo["codigo"], "ingresos": 0, "gastos": 0, "base": 0,
+                                                     "cuota": 0, "estado": _estado_auto(viejo, "No procede")})
+                    fila_v = db.get("m210_alquiler", cid, viejo["codigo"])
+                    _obligacion(db, cid, ejercicio, "210 Alquiler", cod, f"OBL|{viejo['clave']}",
+                                plazo_210_alquiler(ejercicio, viejo.get("periodo") or ""), viejo["codigo"],
+                                fila_v.get("estado"), "Sin ingresos en el periodo tras recalcular")
+        except ConflictoHistorial210 as exc:
+            # El savepoint revierte exclusivamente las escrituras de alquiler de este inmueble.
+            del filas_a[inicio_filas:]
+            del informe_estados[inicio_estados:]
+            del discrepancias[inicio_alertas:]
+            alquileres_bloqueados[cod] = str(exc)
+            discrepancias.append(Alerta("grave", cod, "conflicto 210 alquiler", str(exc)))
+            informe_estados.append(f"{cod} · PROVISIONAL: 210 alquiler {ejercicio} pendiente de revisión; "
+                                   "histórico ambiguo y arrastres sin recalcular")
 
         # ---- 210 imputación
         clave_i = f"210I|{ejercicio}|{cod}"
@@ -1174,9 +1373,28 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
                     f"ley hasta el {legal:%d/%m/%Y} (LAU art. 9). Se calcula como alquilado; si el inquilino se fue, "
                     "registra la fecha de fin real · VERIFICAR"))
     alertas.extend(discrepancias)
+    vinculadas = {}
+    for obligacion in db.listar("obligaciones", cid, ejercicio=ejercicio, tipo="210 Alquiler"):
+        modelo = obligacion.get("id_modelo")
+        if modelo:
+            vinculadas.setdefault(modelo, []).append(obligacion)
+    for modelo, filas in vinculadas.items():
+        if len(filas) > 1:
+            alertas.append(Alerta(
+                "grave", filas[0].get("inmueble"), f"obligaciones 210 {modelo}",
+                f"{modelo}: obligaciones duplicadas. Se conservan los históricos y sus pagos; "
+                "revisa la conciliación antes de sumar importes."))
     if res.asumida:
         alertas.insert(0, Alerta("grave", None, "residencia",
                                  "Sin residencia fiscal registrada: se calcula como Extra-UE (24 %, sin gastos)."))
+    for inm in inmuebles:
+        if inm['codigo'] not in alquileres_bloqueados:
+            clave = f"ALERTA|{ejercicio}|{inm['codigo']}|conflicto 210 alquiler"
+            nota = db.get_por_clave('notas', cid, clave)
+            if nota and not str(nota.get('nota') or '').startswith('RESUELTO'):
+                db.nota(cid, 'Asesor interanual', nota.get('asunto') or 'Conflicto 210',
+                        'RESUELTO al recalcular: ya no hay duplicados que bloqueen este alquiler.\n'
+                        + (nota.get('nota') or ''), clave=clave, proxima_accion='Sin acción pendiente')
     for a in alertas:
         db.nota(cid, "Asesor interanual", f"{ejercicio} · {a.inmueble or 'Cliente'} · {a.tipo}", a.mensaje,
                 clave=f"ALERTA|{ejercicio}|{a.inmueble or '-'}|{a.tipo}", proxima_accion="Verificar con el cliente")
@@ -1184,7 +1402,10 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
 
     informe_estados.insert(0, pat.mensaje)
     pendientes = revisar_pendientes(db, cid, ejercicio)
-    return InformeFiscal(ejercicio, res, pat, its, filas_a, filas_i, alertas, informe_estados, pendientes)
+    pendientes.extend(Pendiente("grave", "declaracion", f"{cod} · 210 alquiler pendiente de revisión", mensaje)
+                       for cod, mensaje in alquileres_bloqueados.items())
+    return InformeFiscal(ejercicio, res, pat, its, filas_a, filas_i, alertas, informe_estados, pendientes,
+                         alquileres_bloqueados)
 
 
 # ============================================================================================ pendientes

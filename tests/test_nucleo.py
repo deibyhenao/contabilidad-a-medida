@@ -65,9 +65,15 @@ def test_grupo_territorio():
 
 
 def test_tres_valores_coge_el_mayor():
-    inm = {"precio_escritura": 200_000, "valor_referencia": 230_000}
+    # AEAT: la referencia solo cuenta en compras desde 2022 en las que fue la base del ITP (mayor que el precio)
+    inm = {"precio_escritura": 200_000, "valor_referencia": 230_000, "fecha_adquisicion": "2023-03-01"}
     vp = tc.valor_patrimonial(inm, {"valor_catastral": 90_000})
     assert vp.valor == 230_000 and vp.fuente == "Valor referencia"
+    antes_2022 = tc.valor_patrimonial({**inm, "fecha_adquisicion": "2021-05-01"}, {"valor_catastral": 90_000})
+    assert antes_2022.valor == 200_000 and antes_2022.fuente == "Valor escritura"
+    ref_del_anio = tc.valor_patrimonial({**inm, "valor_referencia": None},
+                                        {"valor_catastral": 90_000, "valor_referencia": 300_000})
+    assert ref_del_anio.valor == 200_000          # la referencia del año consultado no es la de la adquisición
 
 
 def test_gananciales_forzado():
@@ -128,6 +134,7 @@ def test_venta_corta_tenencia():
 
 # ---------------------------------------------------------------- orquestador
 def test_recalcular_cliente_pepito(db, pepito):
+    db.set_config("periodicidad_210_alquiler", "Trimestral")  # caso histórico de dos trimestres
     cid = pepito["id"]
     db.guardar_residencia(cid, 2025, pais="Francia")
     db.guardar_residencia(cid, 2026, pais="Francia")

@@ -12,6 +12,7 @@ from main import Controlador
 @pytest.fixture
 def ctrl(tmp_path):
     c = Controlador(tmp_path / "t.db")
+    c.db.set_config("periodicidad_210_alquiler", "Trimestral")  # estos casos verifican cuotas de 1T
     c.cambiar_carpeta_clientes(tmp_path / "Clientes")
     yield c
     c.cerrar()

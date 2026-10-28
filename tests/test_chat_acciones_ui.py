@@ -61,3 +61,22 @@ def test_cambiar_cliente_mientras_claude_propone_no_previsualiza(monkeypatch):
     app.ctrl.ejecutar_accion_documental.assert_not_called()
     assert 'cambiado' in app.conversaciones[7].ultimo_error
     assert not app._turno.locked()
+
+
+def test_chat_natural_propone_correccion_y_solo_la_ejecuta_al_confirmar(monkeypatch):
+    app = crear_app(monkeypatch)
+    app.ctrl.preparar_correccion_expediente = Mock(return_value={
+        'version': 'v1', 'antes': '2026-12-31', 'despues': '2026-09-30'})
+    app.ctrl.ejecutar_correccion_expediente = Mock(return_value={'registro_actualizado': True, 'excel': 'ficticio.xlsx'})
+    def proponer(conv, pregunta, *a):
+        conv.acciones_propuestas = [{'accion': 'editar_registro', 'tabla': 'contratos', 'codigo': 'CTR-001',
+                                    'campo': 'fecha_fin_real', 'valor': '2026-09-30'}]
+        conv.turnos = [asistente.Turno('user', pregunta), asistente.Turno('assistant', 'Propuesta')]
+    monkeypatch.setattr(asistente.Conversacion, 'preguntar', proponer)
+    app._enviar_pregunta('El contrato CTR-001 terminó el 30/09/2026. Corrígelo.')
+    app.ctrl.ejecutar_correccion_expediente.assert_not_called()
+    token = re.search(r'/confirmar_cambio ([a-f0-9]{24})', app.conversaciones[7].turnos[-1].texto)[1]
+    app._enviar_pregunta('/confirmar_cambio ' + token)
+    app.ctrl.ejecutar_correccion_expediente.assert_called_once()
+    app.ctrl.ejecutar_accion_documental.assert_not_called()
+    assert 'Excel actualizado' in app.conversaciones[7].turnos[-1].texto

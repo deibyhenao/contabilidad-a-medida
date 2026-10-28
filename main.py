@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import os
 import re
 import sys
@@ -23,6 +24,7 @@ import flet as ft
 
 import ui_estilo as ui
 import ui_adjuntos as adj
+import ui_cartera as uc
 import cola_documentos as cola_doc
 from concurrencia import ejecutar_en_ui
 from version import VERSION
@@ -43,6 +45,7 @@ def _cargar_modulos() -> None:
     pantalla de carga, así la ventana aparece antes. Al importar main desde otro módulo, se hace ya."""
     global database, excel_generator, ia_extractor, pdf_processor, tax_calculator, valores_inmuebles
     global CALCULADOS, CAMPOS_PRESENTACION, OPCIONES, CanceladoPorUsuario, Controlador, campos_editables, etiquetas
+    global CalculoConfirmadoSinExcel
     global TABLAS, a_fecha
     import database
     import excel_generator
@@ -51,7 +54,7 @@ def _cargar_modulos() -> None:
     import tax_calculator
     import valores_inmuebles
     from controlador import (CALCULADOS, CAMPOS_PRESENTACION, OPCIONES, CanceladoPorUsuario, Controlador,
-                             campos_editables, etiquetas)
+                             CalculoConfirmadoSinExcel, campos_editables, etiquetas)
     from database import TABLAS, a_fecha
 
 
@@ -60,6 +63,7 @@ if __name__ != "__main__":
 
 I = ft.Icons
 ANIM_COLA = ft.Animation(220, ft.AnimationCurve.EASE_OUT_CUBIC)  # aparición y cambios de la vista del lote
+MAX_MESES_CONTRATO = 1200  # duración de ayuda: mismo límite que previsualizar_contrato en el controlador
 # Etiquetas legibles (con tildes) de los campos del diálogo de revisión; el resto se derivan de la clave
 ETIQUETAS_EXTRACCION = {
     "direccion": "Dirección", "cp": "Código postal", "ref_catastral": "Ref. catastral",
@@ -135,6 +139,11 @@ class App:
         self.ocupado = False
         self.cerrando = False
         self._evento_dialogo: Optional[threading.Event] = None
+        # Modales abiertos por _dialogo (A-UI 1): Flet apila SnackBar y AlertDialog juntos y pop_dialog cierra
+        # el último de cualquier tipo; cerrar_dialogo cierra solo uno de estos.
+        self._dialogos: list[ft.AlertDialog] = []
+        self._dialogos_vistos: set[int] = set()
+        self._excel_pendiente = False
         self._turno = threading.Lock()  # una sola tarea de fondo a la vez (A4-P03)
         self.conversaciones: dict = {}  # cid -> asistente.Conversacion (vive mientras la app está abierta)
         import chat_correcciones
@@ -224,6 +233,10 @@ class App:
             await self.elegir_pdfs()
 
     async def _evento_ventana(self, e) -> None:
+        # Al volver a la app (p. ej. tras editar el Excel) se mira si el Excel cambió, sin bloquear
+        if e.type == getattr(ft.WindowEventType, "FOCUS", None):
+            self._comprobar_excel("foco")
+            return
         # Cierre ordenado (A3-P2): libera un diálogo de revisión en espera y cierra la BD
         if e.type == ft.WindowEventType.CLOSE:
             self.cerrando = True
@@ -409,6 +422,10 @@ class App:
             try:
                 if self.cerrando:
                     return
+                if (isinstance(error, CalculoConfirmadoSinExcel)
+                        and (self.cid, self.ejercicio) == (cid, ej)
+                        and (error.cliente_id, error.ejercicio) == (cid, ej)):
+                    self._aplicar_resultado(error.resultado)
                 if error is None:
                     if despues is not None:
                         despues()
@@ -435,6 +452,7 @@ class App:
                 if not self.cerrando:
                     self.set_ocupado(False)
                     self._pintar_principal()
+                    self._reintentar_excel()
 
         def tarea():
             res, error = {}, None
@@ -489,11 +507,52 @@ class App:
                              shape=ft.RoundedRectangleBorder(radius=18),
                              content=ft.Container(contenido, width=ancho), actions=acciones,
                              actions_alignment=ft.MainAxisAlignment.END)
-        ejecutar_en_ui(self.page, lambda: self.page.show_dialog(dlg) if not self.cerrando else None)
+        if not hasattr(self, "_dialogos"):  # App creada sin __init__ (adaptadores de tests)
+            self._dialogos, self._dialogos_vistos = [], set()
+        self._dialogos.append(dlg)
+
+        def mostrar():
+            # Si se cerró antes de llegar a mostrarse (cierre inmediato), ya no se abre
+            if self.cerrando or not any(d is dlg for d in self._dialogos):
+                return
+            self._dialogos_vistos.add(id(dlg))
+            self.page.show_dialog(dlg)
+        ejecutar_en_ui(self.page, mostrar)
         return dlg
 
-    def cerrar_dialogo(self, _e=None) -> None:
-        self.page.pop_dialog()
+    def _dialogo_de(self, control) -> Optional[ft.AlertDialog]:
+        """El modal propio que contiene ``control`` (el botón pulsado), si se puede saber."""
+        for _ in range(64):
+            if control is None:
+                return None
+            if isinstance(control, ft.AlertDialog):
+                return control if any(d is control for d in self._dialogos) else None
+            try:
+                control = control.parent
+            except Exception:
+                return None
+        return None
+
+    def cerrar_dialogo(self, _e=None, dlg: Optional[ft.AlertDialog] = None) -> None:
+        """Cierra ``dlg``, el modal del botón pulsado o, en su defecto, el último abierto por ``_dialogo``.
+        Nunca cierra un aviso (SnackBar). Igual que Flet: ``open=False`` y ``update``; el ``on_dismiss`` que
+        haya puesto cada diálogo se sigue disparando al cerrarse."""
+        abiertos = getattr(self, "_dialogos", None)
+        if abiertos is None:  # adaptadores sin _dialogo real (tests antiguos): comportamiento anterior
+            self.page.pop_dialog()
+            return
+        vistos = self._dialogos_vistos
+        # Los que ya cerró Flet (mostrados y con open=False) dejan de contar; los pendientes de mostrar, no
+        abiertos[:] = [d for d in abiertos if d.open or id(d) not in vistos]
+        if dlg is None:
+            dlg = self._dialogo_de(getattr(_e, "control", None)) or (abiertos[-1] if abiertos else None)
+        if dlg is None or not any(d is dlg for d in abiertos):
+            return  # ya cerrado: un segundo clic no cierra otra cosa
+        abiertos[:] = [d for d in abiertos if d is not dlg]
+        vistos.discard(id(dlg))
+        if dlg.open:
+            dlg.open = False
+            dlg.update()
 
     def _dialogo_excel_bloqueado(self, mensaje: str) -> None:
         self._dialogo("Excel abierto en otra aplicación",
@@ -968,6 +1027,7 @@ class App:
         self.seccion = int(e.control.selected_index)
         self.contenido.content = ft.Container(self._contenido_seccion(), key=self._clave_seccion())
         self.page.update()
+        self._comprobar_excel("pestaña")
 
     def _clave_seccion(self) -> str:
         """Solo cambia (y funde) al cambiar de cliente, ejercicio o pestaña, o al llegar el informe."""
@@ -1031,11 +1091,14 @@ class App:
                     cuotas_pend += float(fila.get("cuota") or 0)
         graves = [x for x in inf.pendientes if x.nivel == "grave"]
         provisional = any("PROVISIONAL" in e for e in inf.estados)
+        parcial = bool(getattr(inf, "alquileres_bloqueados", {}))
         kpis = ft.Row([
             ui.kpi("Inmuebles a 31/12", str(pat.num_inmuebles), p, I.HOME_OUTLINED),
             ui.kpi("Base Patrimonio", ui.eur(pat.valor_bienes), p, I.SAVINGS_OUTLINED),
             ui.kpi("Cuotas 210 por pagar", ui.eur(cuotas_pend), p, I.RECEIPT_LONG_OUTLINED,
-                   p.naranja if cuotas_pend else None, "Incluye importes provisionales" if provisional else None),
+                   p.naranja if cuotas_pend or parcial else None,
+                   "Total parcial · alquileres pendientes de revisión" if parcial else
+                   "Incluye importes provisionales" if provisional else None),
             ui.kpi("Avisos urgentes", str(len(graves)), p, I.NOTIFICATIONS_ACTIVE_OUTLINED,
                    p.rojo if graves else p.verde, "Ver pendientes" if graves else "Todo en orden",
                    on_click=lambda e: self._ir_a_seccion(1)),
@@ -1090,11 +1153,13 @@ class App:
                             "Sube la escritura o el recibo del IBI, o añádelo a mano.", p, nuevo)
         tarjetas: list[ft.Control] = [ft.Row([ui.seccion("Inmuebles", p), nuevo],
                                              alignment=ft.MainAxisAlignment.SPACE_BETWEEN)]
-        tarjetas += [self._tarjeta_inmueble(v) for v in vistas]
+        presentados = uc.inmuebles_con_presentado(
+            self.ctrl.lector.listar("m210_alquiler", self.cid, ejercicio=self.ejercicio))
+        tarjetas += [self._tarjeta_inmueble(v, v["codigo"] in presentados) for v in vistas]
         tarjetas += self._navegacion_detalle("inmuebles", siguiente)
         return ft.Column(tarjetas, spacing=14)
 
-    def _tarjeta_inmueble(self, v: dict) -> ft.Control:
+    def _tarjeta_inmueble(self, v: dict, con_presentado: bool = False) -> ft.Control:
         p = self.p
         vp = v["_vp"]
         cat = v["_catastro"] or {}
@@ -1127,12 +1192,12 @@ class App:
                 ui.pastilla_estado(v.get("estado") or "Activo", p),
             ]),
             ft.ResponsiveRow(celdas, spacing=10, run_spacing=10),
+            # Ocupación del ejercicio: días y rentas tal como los calcula el backend (devengado ≠ cobrado)
+            uc.rejilla_ocupacion(v, self.ejercicio, p),
             ui.leyenda("Importes del inmueble antes de aplicar la titularidad. Adquisición = escritura + gastos registrados.", p),
-            ui.leyenda(f"Precio de escritura: {ui.eur(resumen['escritura']) if resumen['escritura'] is not None else 'sin dato'} · "
-                       f"Gastos de compra: {ui.eur(resumen['gastos']) if resumen['gastos'] is not None else 'sin dato'}", p),
+            *self._fila_periodicidad(v, con_presentado),
+            uc.tabla_comparativa(uc.comparativa_valores(v, resumen, cat, self.ejercicio), p),
             *([ui.leyenda("Total parcial: falta registrar el precio de escritura.", p, p.naranja)] if resumen["parcial"] else []),
-            ui.leyenda(f"Referencia en adquisición: {ui.eur(resumen['referencia_compra']) if resumen['referencia_compra'] is not None else 'sin dato'} · "
-                       f"Referencia Catastro: {ui.eur(resumen['referencia_catastro']) if resumen['referencia_catastro'] is not None else 'sin dato'}", p),
             desglose,
             ui.leyenda(f"Valor usado actualmente en Patrimonio: {ui.eur(vp.valor)} · {vp.fuente}", p),
             ft.Row([
@@ -1153,6 +1218,91 @@ class App:
             ], spacing=8, run_spacing=8, wrap=True),
         ], spacing=14), p)
 
+    def _fila_periodicidad(self, v: dict, con_presentado: bool) -> list[ft.Control]:
+        """Selector Anual/Trimestral del 210 de rentas del inmueble en el ejercicio. Solo si el backend da la
+        periodicidad; bloqueado si ya hay un 210 presentado o el ejercicio es anterior a 2024 (histórico)."""
+        actual = uc.periodicidad_210(v)
+        if actual is None:
+            return []
+        bloqueo = ("Hay un 210 presentado en este ejercicio" if con_presentado else
+                   f"Histórico anterior a {uc.PERIODICIDAD_DESDE}" if self.ejercicio < uc.PERIODICIDAD_DESDE else None)
+        # Cambio en curso de este inmueble: bloqueado y con la fase; ``actual`` ya es lo guardado en BD.
+        pendiente = self._periodicidad_en_curso()
+        progreso = (pendiente["fase"] if pendiente and (pendiente["cid"], pendiente["ej"], pendiente["inmueble"])
+                    == (self.cid, self.ejercicio, v["codigo"]) else None)
+        return [uc.selector_periodicidad(actual, self.p, lambda e, c=v["codigo"], a=actual: self._cambiar_periodicidad(
+            e, c, a), bloqueo, progreso), *uc.desglose_210(v, actual, self.ejercicio, self.p)]
+
+    def _periodicidad_en_curso(self) -> Optional[dict]:
+        pendiente = getattr(self, "_periodicidad_pendiente", None)
+        return pendiente if pendiente is not None and not pendiente["fin"] else None
+
+    def _cambiar_periodicidad(self, e, inmueble: str, actual: str) -> None:
+        """Guarda la periodicidad en un worker. El backend avisa con ``al_recalcular`` tras el COMMIT y antes del
+        Excel: entonces se pinta el desglose ya calculado y el turno sigue ocupado con «Guardando Excel…»."""
+        selector = e.control
+        nueva = uc.PERIODICIDADES_210[int(selector.selected_index)]
+        if nueva == actual:
+            return
+
+        def restaurar():  # el selector vuelve a lo guardado, sin estado pendiente
+            selector.disabled = False
+            selector.selected_index = uc.PERIODICIDADES_210.index(actual)
+            uc.marcar_periodicidad(selector, self.p)
+            uc.mostrar_progreso_periodicidad(selector, None, self.p)
+            self.page.update()
+        turno = getattr(self, "_turno", None)
+        if self.cerrando or self._periodicidad_en_curso() or (turno is not None and turno.locked()):
+            if not self.cerrando:
+                self.avisar("Espera a que termine la tarea en curso.")
+            restaurar()
+            return
+        cid, ej = self.cid, self.ejercicio  # el destino se fija al pulsar, no al terminar
+        estado = {"cid": cid, "ej": ej, "inmueble": inmueble, "fin": False,
+                  "fase": f"Calculando el 210 {nueva.lower()}…"}
+
+        def mostrar_calculo(res: dict) -> None:  # bucle de UI
+            # Llega tarde (la tarea ya terminó y repintó) o hay otro cambio: no reactiva la barra ocupada.
+            if self.cerrando or estado["fin"] or getattr(self, "_periodicidad_pendiente", None) is not estado:
+                return
+            estado["fase"] = "Guardando Excel…"
+            self.set_ocupado(True, "Guardando Excel…")
+            if (self.cid, self.ejercicio) == (cid, ej):  # otro expediente en pantalla: se descarta
+                self._aplicar_resultado(res or {})
+                self._pintar_principal()
+
+        def al_recalcular(res: dict) -> None:  # worker: nunca toca controles ni espera a la UI
+            def aplicar():
+                try:
+                    mostrar_calculo(res)
+                except Exception as exc:
+                    # run_task devuelve antes de ejecutar: el try del backend no cubre este fallo visual.
+                    logging.getLogger(__name__).warning(
+                        "No se pudo mostrar el avance del 210 (%s).", type(exc).__name__)
+            ejecutar_en_ui(self.page, aplicar)
+
+        def trabajo() -> dict:
+            try:
+                return self.ctrl.establecer_periodicidad_210(cid, inmueble, ej, nueva, al_recalcular=al_recalcular)
+            finally:
+                estado["fin"] = True  # antes de que en_segundo_plano programe el cierre en la UI
+
+        previa = getattr(self, "_periodicidad_pendiente", None)
+        self._periodicidad_pendiente = estado
+        selector.disabled = True  # feedback inmediato y sin doble pulsación
+        uc.mostrar_progreso_periodicidad(selector, estado["fase"], self.p)
+        self.page.update()
+        try:
+            aceptado = self.en_segundo_plano(estado["fase"], trabajo,
+                                             f"210 de {inmueble} en {ej}: periodicidad {nueva.lower()}. Excel guardado.")
+        except Exception:  # no se pudo lanzar el worker: el selector no queda bloqueado
+            self._periodicidad_pendiente = previa
+            restaurar()
+            raise
+        if not aceptado:  # había otra tarea: nada queda pendiente
+            self._periodicidad_pendiente = previa
+            restaurar()
+
     def dialogo_adquisicion(self, codigo: str) -> None:
         p = self.p
         cid, ejercicio = self.cid, self.ejercicio
@@ -1168,7 +1318,7 @@ class App:
         originales = {campo: ctl.value for campo, ctl in controles.items()}
         total = ui.cuerpo("", p, size=22, peso=ft.FontWeight.W_600)
         error = ui.cuerpo("", p, p.rojo)
-        estado = {"guardando": False, "cerrado": False}
+        estado = {"guardando": False, "cerrado": False, "dlg": None}
 
         def actualizar(_e=None):
             datos, errores = {}, []
@@ -1194,7 +1344,7 @@ class App:
         def cerrar(_e=None):
             if not estado["guardando"] and not estado["cerrado"]:
                 estado["cerrado"] = True
-                self.cerrar_dialogo()
+                self.cerrar_dialogo(dlg=estado["dlg"])
 
         def bloquear(valor):
             estado["guardando"] = valor
@@ -1243,7 +1393,7 @@ class App:
         cancelar = ui.accion("Cancelar", cerrar, p)
         confirmar = ui.accion("Guardar y recalcular", guardar, p, I.CHECK, "primario")
         actualizar()
-        self._dialogo("Precio y gastos de compra", ft.Column([
+        estado["dlg"] = self._dialogo("Precio y gastos de compra", ft.Column([
             ui.cuerpo(f"{codigo} · {fila.get('direccion') or 'Inmueble'}", p),
             ui.leyenda("Importes del inmueble antes de titularidad. No sumes el valor de referencia al precio de escritura.", p),
             ft.ResponsiveRow([ft.Container(c, col={"xs": 12, "sm": 6}) for c in controles.values()],
@@ -1275,34 +1425,365 @@ class App:
                                       "Corregir a mano"))
         return ui.fila(I.RECEIPT_OUTLINED, p.acento, titulo, detalle, p, derecha)
 
+    def _leer_resumen_alquileres(self) -> tuple[Optional[dict], Optional[Exception]]:
+        """Resumen del año del backend (contratos con días y renta devengada, cobros y totales) y el error si
+        falló. Sin resumen la pestaña sigue con la lista básica, sin cifras inventadas."""
+        resumen = getattr(self.ctrl, "resumen_alquileres", None)
+        if not callable(resumen):
+            return None, None
+        try:
+            return resumen(self.cid, self.ejercicio) or {}, None
+        except Exception as exc:
+            return None, exc
+
+    def _resumen_alquileres(self) -> Optional[dict]:
+        return self._leer_resumen_alquileres()[0]
+
     def _sec_alquileres(self) -> ft.Control:
-        p, lec = self.p, self.ctrl.lector
+        p, lec, ej = self.p, self.ctrl.lector, self.ejercicio
+        anual, fallo_resumen = self._leer_resumen_alquileres()
+        lista = anual.get("contratos", []) if anual is not None else lec.listar("contratos", self.cid)
         contratos = []
-        for c in lec.listar("contratos", self.cid):
+        for c in lista:
             inq = ", ".join(i["nombre"] for i in lec.listar("inquilinos", self.cid, contrato=c["codigo"]) if i.get("nombre"))
             ini, fin = a_fecha(c.get("fecha_inicio")), a_fecha(c.get("fecha_fin_real") or c.get("fecha_fin_prevista"))
             fechas = (f"{ini:%d/%m/%Y}" if ini else "sin inicio") + (f" → {fin:%d/%m/%Y}" if fin else " → indefinido")
+            if c.get("fecha_fin_real"):
+                fechas += " (fin real)"
+            elif c.get("fecha_fin_prevista"):
+                fechas += " (fin previsto)"
+            detalle = f"{fechas} · {uc.importe(c.get('renta_inicial'))} {(c.get('periodicidad') or 'Mensual').lower()}"
+            if anual is not None:
+                detalle += (f" · {ej}: {uc.dias(c.get('_dias_alquilado'))} alquilado, "
+                            f"renta devengada {uc.importe(c.get('_ingresos_devengados'))}")
             contratos.append(ui.fila(
                 I.HANDSHAKE_OUTLINED, p.acento, f"{c['codigo']} · {c.get('inmueble') or '—'} · {inq or 'sin inquilino'}",
-                f"{fechas} · {ui.eur(c.get('renta_inicial'))} {(c.get('periodicidad') or 'Mensual').lower()}", p,
+                detalle, p,
                 [ui.pastilla_estado(c.get("estado"), p),
-                 ui.boton_icono(I.PERSON_ADD_ALT, lambda e, cc=c: self.dialogo_editar(
+                 ui.accion_icono(I.PERSON_ADD_ALT, lambda e, cc=c: self.dialogo_editar(
                      "inquilinos", None, {"contrato": cc["codigo"], "inmueble": cc.get("inmueble")}), p, "Añadir inquilino"),
-                 ui.boton_icono(I.EDIT_OUTLINED, lambda e, cc=c["codigo"]: self.dialogo_editar("contratos", cc), p,
-                                "Corregir contrato")]))
+                 ui.accion_icono(I.EDIT_OUTLINED, lambda e, cc=c["codigo"]: self.dialogo_contrato(cc), p,
+                                 "Corregir contrato")]))
         modelos = [self._fila_modelo(
             "m210_alquiler", f, f"210 rendimientos {f.get('periodo')} · {f.get('inmueble')}",
             f"Ingresos {ui.eur(f.get('ingresos'))} · gastos {ui.eur(f.get('gastos'))} · base {ui.eur(f.get('base'))}"
             f" · tipo {ui.pct(f.get('tipo'))}", f.get("cuota") or 0)
             for f in lec.listar("m210_alquiler", self.cid, ejercicio=self.ejercicio, orden="periodo")]
-        nuevo = ui.boton("Añadir contrato", lambda e: self.dialogo_editar("contratos", None), p, I.ADD, "secundario")
+        nuevo = ui.accion("Añadir contrato", lambda e: self.dialogo_contrato(None), p, I.ADD)
+        cobros = anual.get("cobros", []) if anual is not None else lec.listar("cobros", self.cid, ejercicio=ej)
+        filas_cobro = []
+        for c in cobros:
+            periodo = f"{uc.fecha(c.get('periodo_desde'))} → {uc.fecha(c.get('periodo_hasta'))}"
+            filas_cobro.append(ui.fila(
+                I.PAYMENTS_OUTLINED, p.acento, f"{c.get('contrato') or c.get('inmueble') or '—'} · {periodo}",
+                f"Cobrado el {uc.fecha(c.get('fecha_cobro'))} · contractual {uc.importe(c.get('importe_contractual'))}", p,
+                [ft.Text(uc.importe(c.get("importe_cobrado")), size=14, weight=ft.FontWeight.W_600, color=p.texto),
+                 ui.pastilla_estado(c.get("estado"), p),
+                 ui.accion_icono(I.EDIT_OUTLINED, lambda e, cc=c["codigo"]: self.dialogo_editar("cobros", cc), p,
+                                 "Corregir cobro"),
+                 ui.accion_icono(I.DELETE_OUTLINE, lambda e, cc=c["codigo"]: self.confirmar_borrar("cobros", cc), p,
+                                 "Eliminar cobro", p.texto2, peligro=True)]))
+        nuevo_cobro = ui.accion("Añadir cobro", lambda e: self.dialogo_editar("cobros", None, {"ejercicio": ej}), p,
+                                I.ADD)
+        cabecera = []
+        if anual is not None:  # dos cifras con nombre propio: lo devengado no es lo cobrado
+            # ResponsiveRow: en ventanas estrechas las dos cifras pasan una debajo de otra
+            cabecera = [ft.ResponsiveRow([
+                ft.Container(ui.kpi(f"Renta devengada {ej}", uc.importe(anual.get("ingresos_devengados")), p,
+                                    I.HANDSHAKE_OUTLINED, detalle="Según contratos y fechas"),
+                             col={"xs": 12, "md": 6}),
+                ft.Container(ui.kpi(f"Cobros registrados {ej}", uc.importe(anual.get("ingresos_cobrados")), p,
+                                    I.PAYMENTS_OUTLINED, detalle="Anotados en Cobros; distintos de la renta devengada"),
+                             col={"xs": 12, "md": 6}),
+            ], spacing=12, run_spacing=12)]
+        elif fallo_resumen is not None:  # sin ocultarlo: se ve en la pestaña, sin avisos que se repitan al repintar
+            cabecera = [ft.Row([
+                ft.Icon(I.WARNING_AMBER_ROUNDED, size=16, color=p.naranja),
+                ui.leyenda(f"No se pudo calcular el resumen de {ej} ({fallo_resumen.__class__.__name__}). Se muestra "
+                           "la lista básica, sin días ni renta devengada del ejercicio.", p, p.naranja, 13),
+            ], spacing=6, wrap=True)]
         return ft.Column([
+            *cabecera,
             self._bloque("Contratos de alquiler", contratos, nuevo, "Sube el contrato en PDF o añádelo a mano."),
+            self._bloque(f"Cobros · {ej}", filas_cobro, nuevo_cobro, "Sin cobros anotados en el ejercicio."),
             self._bloque(f"Modelo 210 de arrendamientos · {self.ejercicio}", modelos,
                          vacio="Sin rentas de alquiler en el ejercicio."),
-            ui.leyenda("Los importes del 210 se recalculan solos. Si corriges uno a mano y quieres fijarlo, "
-                       "márcalo como Presentado.", p, p.texto3),
+            ui.leyenda("Para corregir el 210, ajusta las fechas y rentas del contrato o los gastos. Al guardar se "
+                       "recalculan los modelos pendientes y se actualiza el Excel. «Presentado» acredita una "
+                       "declaración efectivamente presentada.", p, p.texto3),
         ], spacing=20)
+
+    def dialogo_contrato(self, codigo: Optional[str]) -> None:
+        """Alta o corrección de un contrato con fechas explícitas y previsualización del ejercicio sin guardar.
+        Los días alquilados y la renta devengada los calcula el controlador; la duración en meses es solo una
+        ayuda para proponer el fin previsto y nunca se guarda."""
+        p, lec = self.p, self.ctrl.lector
+        cid, ej = self.cid, self.ejercicio
+        fila = dict((lec.get("contratos", cid, codigo) if codigo else None) or {})
+        if codigo and not fila:
+            self.avisar("El contrato ya no está disponible.", True)
+            return
+        columnas = {c.campo: c for c in TABLAS["contratos"].columnas_bd}
+
+        def texto(campo: str) -> str:
+            return _texto_valor(columnas[campo], fila.get(campo))
+
+        def opciones(campo: str) -> list[tuple[str, str]]:
+            validas = OPCIONES[("contratos", campo)]
+            extra = [fila[campo]] if fila.get(campo) and fila[campo] not in validas else []
+            return [(o, o) for o in (*validas, *extra)]
+
+        inmuebles = [(i["codigo"], f"{i['codigo']} · {i.get('direccion') or 'sin dirección'}")
+                     for i in lec.listar("inmuebles", cid)]
+        if fila.get("inmueble") and fila["inmueble"] not in dict(inmuebles):
+            inmuebles.append((fila["inmueble"], fila["inmueble"]))
+        controles: dict[str, ft.Control] = {
+            "inmueble": ui.desplegable("Inmueble", inmuebles, p, fila.get("inmueble") or None, expand=True),
+            "tipo": ui.desplegable("Tipo de contrato", opciones("tipo"), p, fila.get("tipo") or None, expand=True),
+            "estado": ui.desplegable("Estado", opciones("estado"), p, fila.get("estado") or ("Vigente" if not codigo else None),
+                                     expand=True),
+            "periodicidad": ui.desplegable("Periodicidad de pago", opciones("periodicidad"), p,
+                                           fila.get("periodicidad") or "Mensual", expand=True),
+            "fecha_inicio": ui.campo("Fecha de inicio", p, texto("fecha_inicio"), "dd/mm/aaaa"),
+            "fecha_fin_prevista": ui.campo("Fin previsto (pactado)", p, texto("fecha_fin_prevista"),
+                                           "Fecha del contrato; no es una rescisión"),
+            "fecha_fin_real": ui.campo("Fin real", p, texto("fecha_fin_real"),
+                                       "Solo si terminó: rescisión o salida efectiva"),
+            "renta_inicial": ui.campo("Renta mensual (€)", p, texto("renta_inicial"), "Importe por periodo de pago"),
+        }
+        # Un contrato nuevo guarda también los valores por defecto (estado y periodicidad); al corregir, solo
+        # viaja lo que el usuario cambió
+        originales = {c: (str(ctl.value or "").strip() if codigo else "") for c, ctl in controles.items()}
+        duracion = ui.campo("Duración en meses (ayuda)", p, "", "Propone un fin previsto; no se guarda")
+        error = ui.leyenda("", p, p.rojo, 13)
+        prev_dias = ft.Text(uc.SIN_DATO, size=17, weight=ft.FontWeight.W_600, color=p.texto, font_family=ui.FUENTE)
+        prev_renta = ft.Text(uc.SIN_DATO, size=17, weight=ft.FontWeight.W_600, color=p.texto, font_family=ui.FUENTE)
+        prev_fin = ft.Text(uc.SIN_DATO, size=17, weight=ft.FontWeight.W_600, color=p.texto, font_family=ui.FUENTE)
+        prev_nota = ui.leyenda("Rellena inmueble, fechas y renta para ver el cálculo del ejercicio.", p, p.texto3)
+        prev_avisos = ft.Column(spacing=4, tight=True)
+        # pendiente: última solicitud de previsualización aún sin calcular; activo: hay un worker en marcha
+        estado = {"version": 0, "guardando": False, "cerrado": False, "fin": None, "dlg": None,
+                  "pendiente": None, "activo": False}
+        cola_previa = threading.Lock()
+
+        def leer(ctl: ft.Control) -> str:
+            return str(ctl.value or "").strip()
+
+        def valores() -> dict[str, str]:
+            return {c: leer(ctl) for c, ctl in controles.items()}
+
+        def renta_por_periodo(_e=None):
+            periodo = leer(controles["periodicidad"]) or "Mensual"
+            controles["renta_inicial"].label = ("Renta mensual (€)" if periodo == "Mensual"
+                                                else f"Renta por periodo · {periodo.lower()} (€)")
+            previsualizar(_e)
+
+        def usar_fin_previsto(_e):
+            if estado["fin"]:
+                controles["fecha_fin_prevista"].value = uc.fecha(estado["fin"])
+                usar_fin.visible = False
+                previsualizar(_e)
+
+        usar_fin = ui.accion("Usar este fin previsto", usar_fin_previsto, p, I.EVENT_AVAILABLE,
+                             tooltip="Copia al campo «Fin previsto» la fecha propuesta. Revísala antes de guardar.")
+        usar_fin.visible = False
+
+        def pintar_previa(version: int, res: dict, fallo: Optional[Exception]) -> None:
+            if (estado["cerrado"] or self.cerrando or version != estado["version"]
+                    or (self.cid, self.ejercicio) != (cid, ej)):
+                return  # el usuario cambió algo después: este resultado ya no vale
+            if fallo is not None:
+                prev_dias.value = prev_renta.value = prev_fin.value = uc.SIN_DATO
+                estado["fin"], usar_fin.visible = None, False
+                prev_avisos.controls = []
+                prev_nota.value, prev_nota.color = f"No se pudo previsualizar: {fallo}", p.rojo
+            else:
+                prev_dias.value = uc.dias(res.get("dias_alquilado"))
+                prev_renta.value = uc.importe(res.get("ingresos_devengados"))
+                estado["fin"] = res.get("fecha_fin_prevista")
+                prev_fin.value = uc.fecha(estado["fin"])
+                usar_fin.visible = bool(estado["fin"]) and uc.fecha(estado["fin"]) != leer(controles["fecha_fin_prevista"])
+                prev_nota.value, prev_nota.color = f"Cálculo de la app para {ej}. Aún no se ha guardado nada.", p.texto3
+                prev_avisos.controls = [ft.Row([ft.Icon(I.WARNING_AMBER_ROUNDED, size=15, color=p.naranja),
+                                                ui.leyenda(str(a), p, p.naranja)], spacing=6, wrap=True)
+                                        for a in res.get("avisos") or []]
+            self.page.update()
+
+        def previsualizar(_e=None):
+            prever = getattr(self.ctrl, "previsualizar_contrato", None)
+            if not callable(prever) or estado["cerrado"] or estado["guardando"]:
+                return
+            # Invalidar incluso una entrada vacía o inválida: no debe llegar una previa antigua.
+            estado["version"] += 1
+            prev_dias.value = prev_renta.value = prev_fin.value = uc.SIN_DATO
+            estado["fin"], usar_fin.visible = None, False
+            prev_avisos.controls = []
+            prev_nota.value, prev_nota.color = "Completa los datos para actualizar la previsualización.", p.texto3
+            meses = leer(duracion)
+            if meses and not (meses.isdigit() and 0 < int(meses) <= MAX_MESES_CONTRATO):
+                duracion.error = f"Número de meses entre 1 y {MAX_MESES_CONTRATO}"
+                self.page.update()
+                return
+            duracion.error = None
+            datos = {k: v for k, v in valores().items() if v}
+            if not datos.get("fecha_inicio") and not meses:
+                self.page.update()
+                return
+            if codigo:
+                datos["codigo"] = codigo
+            if meses:
+                datos["duracion_meses"] = int(meses)  # solo para la previsualización
+            prev_nota.value, prev_nota.color = "Calculando…", p.texto3
+            self.page.update()
+            # Un solo worker por diálogo: la solicitud nueva sustituye a la pendiente y el worker en marcha la
+            # recoge al terminar la suya. Los resultados viejos los descarta pintar_previa por versión.
+            with cola_previa:
+                estado["pendiente"] = (estado["version"], datos)
+                if estado["activo"]:
+                    return
+                estado["activo"] = True
+            try:
+                self.page.run_thread(lambda: calcular_previas(prever))
+            except Exception:
+                with cola_previa:
+                    estado["activo"], estado["pendiente"] = False, None
+                raise
+
+        def calcular_previas(prever) -> None:
+            while True:
+                with cola_previa:
+                    solicitud, estado["pendiente"] = estado["pendiente"], None
+                    if solicitud is None or estado["cerrado"] or self.cerrando:
+                        estado["activo"] = False
+                        return
+                version, datos = solicitud
+                res, fallo = {}, None
+                try:
+                    res = prever(cid, datos, ej) or {}
+                except Exception as exc:
+                    fallo = exc
+                try:
+                    ejecutar_en_ui(self.page, lambda v=version, r=res, f=fallo: pintar_previa(v, r, f))
+                except Exception:
+                    with cola_previa:
+                        estado["activo"], estado["pendiente"] = False, None
+                    raise
+
+        def cerrar(_e=None):
+            if not estado["guardando"] and not estado["cerrado"]:
+                estado["cerrado"] = True
+                self.cerrar_dialogo(dlg=estado["dlg"])
+
+        def mas_campos(_e=None):
+            if estado["guardando"] or estado["cerrado"]:
+                return
+            if valores() != originales:
+                # No se descarta lo escrito ni se abre otro editor encima
+                error.value = "Hay cambios sin guardar. Pulsa Guardar y recalcular o Cancelar antes de abrir Más campos."
+                self.page.update()
+                return
+            cerrar()
+            self.dialogo_editar("contratos", codigo)
+
+        def bloquear(valor: bool):
+            estado["guardando"] = valor
+            for ctl in (*controles.values(), duracion):
+                if isinstance(ctl, ft.TextField):
+                    ctl.read_only = valor
+                else:
+                    ctl.disabled = valor
+            cancelar.disabled = confirmar.disabled = valor
+            if mas is not None:  # «Más campos…» tampoco puede abrir otro editor mientras se guarda
+                mas.disabled = valor
+
+        def terminar():
+            estado["guardando"] = False
+            if not self.cerrando:
+                cerrar()
+
+        def guardar(_e):
+            if estado["guardando"] or estado["cerrado"]:
+                return
+            if self.ocupada():
+                return
+            if (self.cid, self.ejercicio) != (cid, ej):
+                error.value = "Vuelve a abrir el contrato en el cliente y ejercicio correctos."
+                self.page.update()
+                return
+            actuales = valores()
+            if not codigo and not (actuales["inmueble"] and actuales["fecha_inicio"]):
+                error.value = "Indica el inmueble y la fecha de inicio."
+                self.page.update()
+                return
+            cambios = {c: v for c, v in actuales.items() if v != originales[c]}  # sin la duración auxiliar
+            if not cambios:
+                cerrar()
+                return
+            errores = self.ctrl.validar("contratos", {k: v for k, v in cambios.items() if v})
+            if errores:
+                error.value = " · ".join(errores.values())
+                self.page.update()
+                return
+            error.value = ""
+            bloquear(True)
+            self.page.update()
+
+            def trabajo():
+                try:
+                    opciones_guardado = {"esperados": fila} if codigo else {}
+                    return self.ctrl.editar(cid, "contratos", codigo, cambios, ej, **opciones_guardado)
+                finally:  # si falla, el diálogo vuelve a ser editable con lo escrito
+                    ejecutar_en_ui(self.page, lambda: bloquear(False) if not estado["cerrado"] else None)
+            aceptado = self.en_segundo_plano("Guardando contrato y recalculando…", trabajo,
+                                             "Contrato guardado. Días, imputación y 210 recalculados.", despues=terminar)
+            if not aceptado:
+                bloquear(False)
+                self.page.update()
+
+        for c in ("fecha_inicio", "fecha_fin_prevista", "fecha_fin_real", "renta_inicial"):
+            controles[c].on_blur = previsualizar
+            controles[c].on_submit = previsualizar
+        duracion.on_blur = duracion.on_submit = previsualizar
+        for c in ("inmueble", "tipo", "estado"):
+            controles[c].on_select = previsualizar
+        controles["periodicidad"].on_select = renta_por_periodo
+        controles["inmueble" if not codigo else "fecha_inicio"].autofocus = True
+        cancelar = ui.accion("Cancelar", cerrar, p)
+        confirmar = ui.accion("Guardar y recalcular", guardar, p, I.CHECK, "primario")
+        acciones: list[ft.Control] = [cancelar, confirmar]
+        mas = None
+        if codigo:  # fianza, motivo de fin, observaciones…: el editor completo de siempre
+            mas = ui.accion("Más campos…", mas_campos, p, I.TUNE,
+                            tooltip="Fianza, motivo de fin, observaciones y demás columnas")
+            acciones.insert(0, mas)
+        renta_por_periodo()  # etiqueta coherente; con un contrato existente, primera previsualización
+
+        def bloque(*ctls) -> ft.ResponsiveRow:
+            return ft.ResponsiveRow([ft.Container(c, col={"xs": 12, "sm": 6}) for c in ctls], spacing=10, run_spacing=12)
+
+        previa = ft.Container(ft.Column([
+            ui.leyenda(f"PREVISUALIZACIÓN · {ej} · SIN GUARDAR", p, p.texto3, 11),
+            ft.ResponsiveRow([
+                ft.Container(ft.Column([ui.leyenda("Días alquilados", p), prev_dias], spacing=2, tight=True),
+                             col={"xs": 12, "sm": 4}),
+                ft.Container(ft.Column([ui.leyenda("Renta devengada", p), prev_renta], spacing=2, tight=True),
+                             col={"xs": 12, "sm": 4}),
+                ft.Container(ft.Column([ui.leyenda("Fin previsto calculado", p), prev_fin], spacing=2, tight=True),
+                             col={"xs": 12, "sm": 4}),
+            ], spacing=10, run_spacing=8),
+            usar_fin, prev_avisos, prev_nota,
+        ], spacing=8, tight=True), padding=14, border_radius=12, bgcolor=p.campo)
+        estado["dlg"] = self._dialogo(f"Corregir contrato · {codigo}" if codigo else "Nuevo contrato", ft.Column([
+            bloque(controles["inmueble"], controles["tipo"]),
+            bloque(controles["estado"], controles["periodicidad"]),
+            bloque(controles["fecha_inicio"], controles["renta_inicial"]),
+            bloque(controles["fecha_fin_prevista"], controles["fecha_fin_real"]),
+            bloque(duracion),
+            ui.leyenda("Fin previsto: la fecha pactada. Fin real: solo si el contrato terminó. La duración en meses "
+                       "solo sugiere un fin previsto: no es una rescisión ni descarta la prórroga legal. Los días y la "
+                       "renta del ejercicio los calcula la app.", p, p.texto2),
+            previa, error,
+        ], spacing=12, tight=True), acciones, ancho=760, icono=I.HANDSHAKE_OUTLINED)
 
     def _sec_imputacion(self) -> ft.Control:
         p, lec = self.p, self.ctrl.lector
@@ -1592,7 +2073,7 @@ class App:
                     error.value = "Escribe un ejercicio de cuatro cifras entre 1900 y 2200."
                     self.page.update()
                     return
-                self.page.pop_dialog()
+                self.cerrar_dialogo()
                 self._previsualizar_documento(cid, codigo, accion, ej, destino)
 
             campo.autofocus, campo.on_submit = True, continuar
@@ -1653,7 +2134,7 @@ class App:
             if enviado["valor"] or self.ocupada():
                 return
             if (cid, ej) != (self.cid, self.ejercicio):
-                self.page.pop_dialog()
+                self.cerrar_dialogo()
                 self.avisar("El expediente o el ejercicio ha cambiado. Revisa de nuevo el documento antes de confirmar.", True)
                 return
             def trabajo():
@@ -1666,7 +2147,7 @@ class App:
                 return self.ctrl.sustituir_documento(cid, codigo, ruta_pdf, ej,
                     confirmar=lambda ext: self.revisar_extraccion(ext, cid, ej), version_esperada=vista.get("version"))
             enviado["valor"] = True
-            self.page.pop_dialog()
+            self.cerrar_dialogo()
             if not self.en_segundo_plano("Actualizando el expediente…", trabajo,
                                          "Documento actualizado. Revisa los avisos del expediente."):
                 enviado["valor"] = False
@@ -1775,7 +2256,9 @@ class App:
                          "Para corregir el precio de escritura (sin gastos): /corregir INM-001 valor_adquisicion 250000,00. "
                          "Revisa la propuesta y confirma con /confirmar y su token. "
                          "También puedes pedir: «Renombra DOC-001 a Factura Luz T3.pdf» o «Cambia DOC-001 al ejercicio 2026». "
-                         "Las acciones documentales requieren /confirmar_documento y su token.", p, p.texto3)
+                         "Las acciones documentales requieren /confirmar_documento y su token. "
+                         "Para corregir otros datos, indica registro y dato exacto: «CTR-001 terminó el 30/09/2025». "
+                         "Revisa el antes y después y confirma con /confirmar_cambio.", p, p.texto3)
         avisos = [ui.leyenda(aviso_carpeta, p, p.rojo)] if aviso_carpeta else []
         # Las pruebas con la API real mostraron variaciones entre respuestas: el chat orienta, no valida.
         orientativo = ui.leyenda("Respuestas orientativas de IA: comprueba cifras y conclusiones en las fichas "
@@ -1879,7 +2362,9 @@ class App:
                     with self.ctrl._lock:
                         if self.cerrando or (self.cid, self.ejercicio) != (cid, ej):
                             raise ValueError('El expediente activo ha cambiado.')
-                        res = self.ctrl.ejecutar_accion_documental(propuesta)
+                        es_correccion = dict(propuesta.plan).get('accion') == 'editar_registro'
+                        res = (self.ctrl.ejecutar_correccion_expediente(propuesta) if es_correccion else
+                               self.ctrl.ejecutar_accion_documental(propuesta))
                         # Invalidar antes de liberar el turno: ninguna pregunta nueva
                         # puede capturar el contexto anterior, aunque cambie la vista.
                         conv.contexto, conv.huella, conv.modelo = '', '', ''
@@ -1914,7 +2399,8 @@ class App:
                 conv.preguntar(pregunta, contexto, ajustes, al_texto)
                 for plan in conv.acciones_propuestas:
                     with self.ctrl._lock:
-                        propuesta_texto = gestor_documental.proponer(plan, cid, ej, self.ctrl.preparar_accion_documental)
+                        preparar = (lambda c, p: self.ctrl.preparar_correccion_expediente(c, ej, p)) if plan.get('accion') == 'editar_registro' else self.ctrl.preparar_accion_documental
+                        propuesta_texto = gestor_documental.proponer(plan, cid, ej, preparar)
                     conv.turnos[-1].texto = propuesta_texto
                     solicitud['texto'] = propuesta_texto
             except OSError:
@@ -2179,7 +2665,7 @@ class App:
             if self._turno.locked():
                 return "Hay una tarea en curso. Espera a que termine y pulsa Procesar de nuevo."
             self._revision_abierta = False
-            self.page.pop_dialog()
+            self.cerrar_dialogo()
             self.procesar_pdfs(rutas, comentario_guia=comentario)
             return None
 
@@ -2298,8 +2784,109 @@ class App:
             self._pintar_cola()
 
     def sincronizar(self, _e=None) -> None:
+        # Una sincronización manual vuelve a permitir avisar de un conflicto del Excel de este expediente
+        getattr(self, "_excel_avisados", set()).discard((self.cid, self.ejercicio))
         self.en_segundo_plano("Sincronizando Excel…", lambda cid=self.cid, ej=self.ejercicio: self.ctrl.sincronizar(cid, ej),
                               "Excel sincronizado y obligaciones recalculadas.")
+
+    INTERVALO_EXCEL = 3.0  # segundos mínimos entre dos comprobaciones automáticas del Excel
+
+    def _reintentar_excel(self) -> None:
+        """Una comprobación omitida por turno ocupado se lanza una sola vez al liberarlo, con el cliente y el
+        ejercicio de ese momento. Si vuelve a encontrar el turno ocupado no se encola otra vez."""
+        if getattr(self, "_excel_pendiente", False) and not self.cerrando:
+            self._excel_pendiente = False
+            self._comprobar_excel("reintento", reintento=True)
+
+    def _comprobar_excel(self, motivo: str = "", reintento: bool = False) -> bool:
+        """Al volver a la ventana o cambiar de pestaña pregunta al controlador si el Excel del cliente cambió
+        (firma/mtime). Sin cambios no hay recálculo, exportación ni repintado. Nunca espera ni avisa de
+        «tarea en curso»: si la app está ocupada, se omite y queda pendiente para cuando termine esa tarea
+        (``_reintentar_excel``). Mientras comprueba se ve la barra de progreso. Un conflicto o un Excel
+        bloqueado se avisa una vez por expediente, no en cada foco. Devuelve True si lanzó la comprobación."""
+        sincronizar = getattr(self.ctrl, "sincronizar_excel_si_cambio", None)
+        if (not callable(sincronizar) or getattr(self, "cerrando", False) or not self.cid
+                or getattr(self, "informe", None) is None or getattr(self, "_excel_comprobando", False)):
+            return False
+        ahora = time.monotonic()
+        if not reintento and ahora - getattr(self, "_excel_ultima", float("-inf")) < self.INTERVALO_EXCEL:
+            return False
+        if not self._turno.acquire(blocking=False):
+            if not reintento:
+                self._excel_pendiente = True
+            return False
+        self._excel_ultima, self._excel_comprobando, self._excel_pendiente = ahora, True, False
+        self.set_ocupado(True, "Comprobando cambios del Excel…")
+        if not hasattr(self, "_excel_avisados"):
+            self._excel_avisados = set()
+        cid, ej = self.cid, self.ejercicio  # contexto capturado al empezar
+
+        def terminar(res: dict, error: Optional[Exception]) -> None:
+            try:
+                if self.cerrando:
+                    return
+                clave = (cid, ej)
+                if (self.cid, self.ejercicio) != clave:
+                    return
+                if error is not None:
+                    if clave in self._excel_avisados:
+                        return
+                    self._excel_avisados.add(clave)
+                    if isinstance(error, excel_generator.ExcelConflictoImportacion):
+                        mensaje = ui.cuerpo(str(error), self.p)
+                        mensaje.selectable = True
+                        entendido = ui.accion("Entendido", self.cerrar_dialogo, self.p, tipo="primario")
+                        entendido.autofocus = True
+                        self._dialogo("Revisar cambios del Excel", mensaje, [entendido], icono=I.INFO_OUTLINE)
+                    else:
+                        self.avisar(f"No se pudo leer el Excel: {error}", True)
+                    return
+                if not res:
+                    self._excel_avisados.discard(clave)
+                    return
+                if res.get("error_excel"):  # importado, pero el Excel sigue abierto: un aviso, no un diálogo
+                    if clave not in self._excel_avisados:
+                        self._excel_avisados.add(clave)
+                        self.avisar("Cambios del Excel guardados. Cierra el Excel y pulsa Sincronizar para "
+                                    "regenerarlo.", True)
+                else:
+                    self._excel_avisados.discard(clave)
+                if (self.cid, self.ejercicio) != clave:
+                    return  # resultado tardío de otro expediente: ya está en la BD, no se pinta encima
+                if res.get("informe") is not None:  # sin tocar conversaciones ni cachés
+                    self.informe = res["informe"]
+                    self.estados_aut = res.get("estados_autonomo", [])
+                self._pintar_principal()
+                if not res.get("error_excel"):
+                    self.avisar("Cambios del Excel incorporados y recalculados.")
+            finally:
+                self._excel_comprobando = False
+                self._turno.release()
+                if not self.cerrando:
+                    self.set_ocupado(False)
+
+        def tarea():
+            res, error = {}, None
+            try:
+                if not self.cerrando:
+                    res = sincronizar(cid, ej) or {}
+            except Exception as exc:
+                error = exc
+            try:
+                ejecutar_en_ui(self.page, lambda: terminar(res, error))
+            except Exception:
+                self._excel_comprobando = False
+                if self._turno.locked():
+                    self._turno.release()
+                raise
+        try:
+            self.page.run_thread(tarea)
+        except Exception:
+            self._excel_comprobando = False
+            self._turno.release()
+            self.set_ocupado(False)
+            return False
+        return True
 
     def _abrir_excel(self, _e=None) -> None:
         ruta = self.ctrl.lector.ruta_excel(self.cliente)
@@ -2518,7 +3105,7 @@ class App:
             decision["guardar"] = True
             decision["resuelta"] = True
             try:
-                self.page.pop_dialog()
+                self.cerrar_dialogo()
             finally:
                 evento.set()
 
@@ -2528,7 +3115,7 @@ class App:
             decision["resuelta"] = True
             try:
                 if cerrar:
-                    self.page.pop_dialog()
+                    self.cerrar_dialogo()
             finally:
                 evento.set()
 
@@ -2632,10 +3219,21 @@ class App:
                 if tabla == "residencias" and col.campo == "ejercicio" and codigo:
                     ayuda = "Para trasladar un certificado usa Documentos → Corregir ejercicio."
                 ctl = ui.campo(nombres[col.campo], p, valor, ayuda=ayuda,
-                               solo_lectura=(tabla == "residencias" and col.campo == "ejercicio" and bool(codigo)))
+                               solo_lectura=((tabla == "residencias" and col.campo == "ejercicio" and bool(codigo))
+                                             or (col.campo in calculados and fila.get('estado') != 'Presentado')))
             controles[col.campo] = ctl
             bloques.append(ft.Container(ctl, col={"xs": 12, "sm": 6}))
         error = ui.leyenda("", p, p.rojo, 13)
+
+        def cambiar_estado(_e):
+            presentado = controles['estado'].value == 'Presentado'
+            for campo in calculados & controles.keys():
+                if isinstance(controles[campo], ft.TextField):
+                    controles[campo].read_only = not presentado
+            self.page.update()
+
+        if calculados and 'estado' in controles:
+            controles['estado'].on_change = cambiar_estado
 
         def leer(ctl: ft.Control) -> str:
             if isinstance(ctl, ft.Row):  # interruptor
@@ -2645,22 +3243,24 @@ class App:
         def guardar(_e):
             cambios = {c: leer(ctl) for c, ctl in controles.items() if leer(ctl) != originales[c]}
             if not cambios:
-                self.page.pop_dialog()
+                self.cerrar_dialogo()
                 return
             errores = self.ctrl.validar(tabla, {k: v for k, v in cambios.items() if v != ""})
             if errores:
                 error.value = " · ".join(errores.values())
                 self.page.update()
                 return
-            self.page.pop_dialog()
+            self.cerrar_dialogo()
             self.en_segundo_plano("Guardando y recalculando…",
-                                  lambda cid=self.cid, ej=self.ejercicio: self.ctrl.editar(cid, tabla, codigo, cambios, ej),
+                                  lambda cid=self.cid, ej=self.ejercicio: self.ctrl.editar(
+                                      cid, tabla, codigo, cambios, ej, esperados=fila if codigo else None),
                                   "Cambios guardados. Excel actualizado.")
 
         hoja = TABLAS[tabla].hoja.split("_", 1)[-1].replace("_", " ").title()
         titulo = f"Corregir · {hoja} {codigo}" if codigo else f"Nuevo · {hoja}"
-        aviso = [ui.leyenda("Los campos «Se recalcula solo» los calcula la app. Si pones el estado en Presentado, "
-                            "la fila queda fijada.", p, p.texto3)] if calculados else []
+        aviso = [ui.leyenda("Los campos «Se recalcula solo» dependen de los datos de origen: corrige contratos, "
+                            "rentas, gastos o catastro para actualizarlos. «Presentado» se reserva al justificante "
+                            "de una declaración efectivamente presentada.", p, p.texto3)] if calculados else []
         self._dialogo(titulo, ft.Column([*aviso, ft.ResponsiveRow(bloques, spacing=10, run_spacing=12), error],
                                         spacing=12, tight=True),
                       [ui.boton("Cancelar", self.cerrar_dialogo, p, tipo="texto"),
@@ -2684,7 +3284,7 @@ class App:
                 error.value = " · ".join(errores.values())
                 self.page.update()
                 return
-            self.page.pop_dialog()
+            self.cerrar_dialogo()
             self.en_segundo_plano("Marcando como presentada…", lambda cid=self.cid, ej=self.ejercicio: self.ctrl.marcar_presentado(
                 cid, tabla, codigo, ej, f_fecha.value or None, f_importe.value or None,
                 f_just.value if f_just else None), "Declaración marcada como presentada.")
@@ -2711,7 +3311,7 @@ class App:
                 error.value = " · ".join(errores.values())
                 self.page.update()
                 return
-            self.page.pop_dialog()
+            self.cerrar_dialogo()
             self.en_segundo_plano("Registrando la venta…", lambda cid=self.cid, ej=self.ejercicio: self.ctrl.marcar_vendido(
                 cid, cod, f_fecha.value, f_precio.value, ej,
                 database.a_num(f_gastos.value) if f_gastos.value else None),
@@ -2728,7 +3328,7 @@ class App:
         p = self.p
 
         def borrar(_e):
-            self.page.pop_dialog()
+            self.cerrar_dialogo()
             self.en_segundo_plano("Eliminando…", lambda cid=self.cid, ej=self.ejercicio: self.ctrl.borrar_registro(cid, tabla, codigo, ej),
                                   f"{codigo} eliminado.")
         self._dialogo(f"¿Eliminar {codigo}?",
@@ -2792,7 +3392,7 @@ class App:
                 error.value, error.visible = "No se pudo crear el cliente. Revisa que la carpeta esté disponible y vuelve a intentarlo.", True
                 self.page.update()
                 return
-            self.page.pop_dialog()
+            self.cerrar_dialogo()
             destino = cartera_de(nuevo.get("tipo_cliente"))
             if destino != self.cartera:  # el cliente nace en su cartera: se muestra esa cartera
                 self._filtros[self.cartera], self._paginas[self.cartera] = self.filtro, self._pagina_clientes
@@ -2866,7 +3466,7 @@ class App:
                         self._turno.release()
                     raise
             try:
-                self.page.pop_dialog()
+                self.cerrar_dialogo()
                 self.page.run_thread(tarea)
             except Exception:
                 self._turno.release()
@@ -2911,26 +3511,13 @@ class App:
             ) if v != anterior}
             nuevo_tipo = dd_tipo.value or c.get("tipo_cliente")
             if nuevo_tipo != c.get("tipo_cliente") and cartera_de(nuevo_tipo) != cartera_de(c.get("tipo_cliente")):
-                self.page.pop_dialog()
+                self.cerrar_dialogo()
                 self._confirmar_cambio_cartera(cid, nuevo_tipo, ej)
                 return
-            self.page.pop_dialog()
+            self.cerrar_dialogo()
 
             def trabajo():
-                with self.ctrl._lock:
-                    self.ctrl._importar(cid)
-                    if nuevo_tipo != c.get("tipo_cliente"):
-                        self.ctrl.db.actualizar_cliente(cid, tipo_cliente=nuevo_tipo)
-                    self.ctrl.db.actualizar_cliente(cid, **datos)
-                    if residencia:
-                        cambios = dict(residencia)
-                        if cambios.get("pais"):
-                            cambios["grupo"] = tax_calculator.grupo_territorio(cambios["pais"])
-                        codigo = self.ctrl.db.guardar_residencia(cid, ej, **cambios)
-                        for campo, valor in residencia.items():
-                            if valor == "":
-                                self.ctrl.db.vaciar_campo("residencias", cid, codigo, campo)
-                    return self.ctrl._recalcular_y_exportar(cid, {ej}, ej)
+                return self.ctrl.editar_datos_cliente(cid, ej, datos, residencia, nuevo_tipo)
             self.en_segundo_plano("Guardando datos del cliente…", trabajo, "Datos del cliente actualizados.")
             self._refrescar_clientes()
 
@@ -2948,7 +3535,7 @@ class App:
         destino = cartera_de(nuevo_tipo)
 
         def mover(_e):
-            self.page.pop_dialog()
+            self.cerrar_dialogo()
 
             def trabajo():
                 return self.ctrl.cambiar_tipo_cliente(cid, nuevo_tipo, ejercicio)
@@ -3069,7 +3656,7 @@ class App:
                 self.page.update()
                 return
             limpiar_secretos()
-            self.page.pop_dialog()
+            self.cerrar_dialogo()
             self._pintar_principal()
             self.avisar("Ajustes y clave guardados." if clave_nueva else "Ajustes guardados.")
 
@@ -3083,13 +3670,13 @@ class App:
                 self.page.update()
                 return
             limpiar_secretos()
-            self.page.pop_dialog()
+            self.cerrar_dialogo()
             self._pintar_principal()
             self.avisar("Clave API eliminada de este equipo; no se revoca en Anthropic.")
 
         def cancelar(_e=None):
             limpiar_secretos()
-            self.page.pop_dialog()
+            self.cerrar_dialogo()
 
         dlg = self._dialogo("Ajustes e IA", ft.Column([
             ft.Row([ft.Column([ui.cuerpo("Leer los PDFs con IA (Claude)", p, peso=ft.FontWeight.W_600),
@@ -3131,11 +3718,11 @@ class App:
                 if self.cerrando or (self.cid, self.ejercicio) != (cid, ej):
                     return "El expediente cambió. Cancela y selecciona el destino correcto."
                 decision.update(rutas=elegidas, comentario=comentario)
-                self.page.pop_dialog()
+                self.cerrar_dialogo()
                 evento.set()
             def cancelar(_e=None):
                 decision["cancelado"] = True
-                self.page.pop_dialog()
+                self.cerrar_dialogo()
                 evento.set()
             revision = adj.RevisionDocumentos(self.p, lote.adjuntos, adj.Destino(nombre, cliente.get("nif") or "", ej),
                 aceptar, cancelar, destino_vigente=lambda: not self.cerrando and (self.cid, self.ejercicio) == (cid, ej),
@@ -3201,6 +3788,7 @@ class App:
                 if not self.cerrando:
                     self.set_ocupado(False)
                     self._pintar_principal()
+                    self._reintentar_excel()
 
             try:
                 seleccion = self._revisar_lote_bandeja(cid, ej, pendientes[:adj.MAX_ARCHIVOS])

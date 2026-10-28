@@ -24,6 +24,7 @@ def _libro(db, cid, ruta):
     cartera = db.get_cliente(cid)["cartera"]
     wb = openpyxl.Workbook()
     wb.active.title = "00_RESUMEN"
+    wb['00_RESUMEN'][database.CELDAS_RESUMEN[cartera]['nif']] = db.get_cliente(cid)['nif']
     for tabla, hoja in database.hojas_cartera(cartera):
         ws = wb.create_sheet(hoja)
         for col in eg._columnas(tabla):

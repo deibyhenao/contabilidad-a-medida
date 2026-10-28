@@ -311,7 +311,7 @@ def test_excel_antiguo_no_revierte_correccion_y_permite_conciliar(entorno, monke
         ctrl.retirar_documento(cid, codigo, 2026)
     guardar = eg._guardar_atomico
     pendiente = ruta.with_stem(ruta.stem + '_PENDIENTE_PRUEBA')
-    def bloqueado(wb, destino, carpeta):
+    def bloqueado(wb, destino, carpeta, **opciones):
         wb.save(pendiente)
         raise eg.ExcelBloqueadoError(pendiente)
     monkeypatch.setattr(eg, '_guardar_atomico', bloqueado)
@@ -355,7 +355,7 @@ def test_excel_bloqueado_sin_edicion_reintenta_exportar(entorno, monkeypatch):
     codigo, _ = importar_certificado(entorno)
     ruta = ctrl.db.ruta_excel(ctrl.db.get_cliente(cid))
     guardar = eg._guardar_atomico
-    def bloqueado(wb, destino, carpeta):
+    def bloqueado(wb, destino, carpeta, **opciones):
         raise eg.ExcelBloqueadoError(destino.with_stem(destino.stem + '_PENDIENTE'))
     monkeypatch.setattr(eg, '_guardar_atomico', bloqueado)
     assert ctrl.retirar_documento(cid, codigo, 2026)['error_excel']

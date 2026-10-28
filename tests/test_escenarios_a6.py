@@ -149,6 +149,7 @@ def test_factura_pdf_a_bd_calculo_excel_y_soporte(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ia_extractor, "obtener_clave", lambda: None)
     ctrl = Controlador(tmp_path / "flujo.db")
+    ctrl.db.set_config("periodicidad_210_alquiler", "Trimestral")  # se contrasta explícitamente el 1T
     try:
         ctrl.cambiar_carpeta_clientes(tmp_path / "Clientes")
         cliente = ctrl.crear_cliente("Caso", "Factura", "FACT-A6", pais="Francia", ejercicio=2026)

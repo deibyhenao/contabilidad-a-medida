@@ -64,6 +64,8 @@ def test_presentada_no_se_traslada_a_destino_provisional(expediente,monkeypatch,
     ctrl=object.__new__(Controlador);ctrl.db=db;ctrl._lock=threading.RLock()
     monkeypatch.setattr(ctrl,'_importar',lambda *a:None)
     monkeypatch.setattr(ctrl,'_recalcular_y_exportar',lambda *a:{})
+    monkeypatch.setattr(ctrl,'_recalcular_bd',lambda *a:{})
+    monkeypatch.setattr(ctrl,'_exportar_informe',lambda cid,ej,resultado:resultado)
     anterior=db.get('m210_imputacion',cid,codigo)
     datos={'inmueble':otro,'ejercicio':2026}
     if incluye_estado:datos['estado']='Presentado'

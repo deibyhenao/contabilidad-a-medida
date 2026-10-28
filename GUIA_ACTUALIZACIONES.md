@@ -1,5 +1,20 @@
 # Instalador y actualizaciones de Contabilidad a Medida
 
+## Novedades de la versión 1.0.6
+
+- Contratos editables con fecha de fin real y vista previa de días y renta. Admiten alquileres de varios trimestres o de parte de un trimestre. Guardar recalcula los modelos pendientes y actualiza el Excel.
+- Selector anual/trimestral por inmueble y ejercicio. La actualización conserva los calendarios anteriores y las declaraciones presentadas.
+- Los libros de clientes existentes incorporan el bloque «Ocupación y rentas» al abrirlos tras actualizar, importando primero sus ediciones. Las referencias de compra y del ejercicio se distinguen con comentarios.
+- Las imputaciones pendientes redondean base y cuota a dos decimales, igual que la app. Las presentadas conservan los importes del justificante con comentario. Las plantillas originales permanecen intactas.
+- Correcciones de periodos antiguos del 210 y alertas para datos ambiguos: se conserva el histórico y se aísla el inmueble afectado, sin bloquear los demás.
+- Valoración de Patrimonio respetando los datos de adquisición explícitos del asesor y actualización de los plazos del 210 correspondientes.
+- Correcciones desde el asistente mediante acciones locales tipadas, con revisión y confirmación; el contenido documental no autoriza cambios por sí solo.
+- Respaldo específico antes de transformar datos por versión y respaldo del Excel anterior fuera de la rotación ordinaria.
+- Protección frente a libros cruzados, filas duplicadas, fechas inválidas, ejercicios decimales y guardados externos concurrentes. Los conflictos requieren resolver los datos; no se sobrescriben silenciosamente.
+- Conservación del libro conocido al cambiar el nombre del cliente y recuperación segura de un libro renombrado. Si falta la carpeta del expediente o hay varios libros candidatos, se avisa antes de crear o reemplazar archivos.
+
+Para actualizar: cierra Excel y termina las operaciones del expediente. Pulsa **Versión** en la barra lateral, luego **Actualizar** y, cuando termine la descarga, **Reiniciar**. No cambies la carpeta de datos ni vuelvas a crear clientes existentes. Si aparece un aviso, conserva el libro principal y las copias; consulta el mensaje antes de repetir.
+
 ## Novedades de la versión 1.0.5
 
 1. Lectura híbrida: Haiku procesa los documentos; Sonnet interviene solo si no se reconocen, la confianza es menor de 0,50 o hay un error de esquema o negativa compatible con respaldo.
@@ -24,8 +39,8 @@ También se evita duplicar imágenes compartidas al preparar PDF largos. La vist
 1. Descarga `ContabilidadAMedida-<versión>-windows-x64-Setup.exe` de **Releases** del repositorio oficial.
 2. El instalador está en español, no requiere Python ni permisos de administrador. Permite escoger dónde guardar los datos. La carpeta del programa y la de los datos deben estar separadas.
 3. Abre la aplicación desde el menú Inicio. Al iniciar comprueba si existe una versión estable nueva. Si no hay conexión puedes seguir trabajando y buscar actualizaciones después.
-4. El aviso **Actualizar ahora** descarga el instalador en segundo plano. Puedes cancelar la descarga o seguir trabajando.
-5. Cuando aparece **Reiniciar e instalar**, guarda tu trabajo y púlsalo. Si hay una importación, IA o exportación en marcha, espera a que termine. La aplicación se cierra, el instalador sustituye sus archivos y vuelve a abrirla.
+4. La línea **Versión** de la barra lateral permite buscar actualizaciones. Si hay una nueva, aparece **Actualizar** y descarga el instalador en segundo plano. Puedes cancelar la descarga o seguir trabajando.
+5. Cuando aparece **Reiniciar**, guarda tu trabajo y púlsalo. Si hay una importación, IA o exportación en marcha, espera a que termine. La aplicación se cierra, el instalador sustituye sus archivos y vuelve a abrirla.
 
 Las actualizaciones y la desinstalación conservan los datos. El programa no ejecuta SQL ni mueve expedientes desde el actualizador. Las migraciones de esquema del programa se siguen realizando al abrir la base de datos mediante el motor existente.
 

@@ -430,7 +430,11 @@ def _normalizar(col: Columna, valor: Any) -> Any:
             return round(fraccion(n), 6)
         return redondear_eur(n)
     if col.tipo == "int":
-        return int(a_num(valor))
+        n = a_num(valor)
+        decimal_finito(n)
+        if not n.is_integer():
+            raise ValueError('Se requiere un número entero, sin decimales.')
+        return int(n)
     return str(valor).strip() if isinstance(valor, str) else valor
 
 
@@ -899,16 +903,58 @@ class Database:
         return PLANTILLAS[cartera_de(cliente.get("tipo_cliente"))]
 
     def ruta_excel(self, cliente: dict) -> Path:
-        base = Path(cliente["carpeta"])
-        prefijo = PREFIJO_EXCEL[cartera_de(cliente.get("tipo_cliente"))]
-        anterior = (f"{prefijo}_{slug(cliente['apellidos'], True)}_{slug(cliente['nombre'], True)}_"
-                    f"{slug(cliente['nif'], True)}.xlsx")
-        try:
-            if (base / anterior).is_file():
-                return base / anterior
-        except OSError:
-            pass  # nombre legado demasiado largo
-        return base / self.nombre_excel(cliente)
+        base = Path(cliente['carpeta'])
+        fijo = self.get_config(f"excel_nombre|{cliente.get('id')}")
+        if fijo:
+            if (Path(fijo).name != fijo or PureWindowsPath(fijo).drive
+                    or PureWindowsPath(fijo).is_reserved()
+                    or re.search(r'[<>:"/\\|?*\x00-\x1f]', fijo)
+                    or not fijo.lower().endswith('.xlsx') or fijo.endswith((' ', '.'))):
+                raise ValueError('El nombre guardado del Excel no es válido.')
+            previsto = base / fijo
+        else:
+            prefijo = PREFIJO_EXCEL[cartera_de(cliente.get('tipo_cliente'))]
+            anterior = (f"{prefijo}_{slug(cliente['apellidos'], True)}_{slug(cliente['nombre'], True)}_"
+                        f"{slug(cliente['nif'], True)}.xlsx")
+            try:
+                if (base / anterior).is_file():
+                    return base / anterior
+            except OSError:
+                pass
+            previsto = base / self.nombre_excel(cliente)
+        if previsto.exists():
+            return previsto
+        # Un renombrado externo no debe crear otro libro ni ignorar sus ediciones.
+        # Solo se reconoce un único expediente completo con la misma identidad.
+        import openpyxl
+        cartera = cartera_de(cliente.get('tipo_cliente'))
+        requeridas = {'00_RESUMEN'} | {h for _t, h in hojas_cartera(cartera) if h}
+        identidad = str(cliente.get('nif') or '').strip().casefold()
+        encontrados, hay_otros = [], False
+        for candidato in base.glob('*.xlsx'):
+            if candidato.name.startswith(('~$', '.nr_')):
+                continue
+            hay_otros = True
+            if 'PENDIENTE' in candidato.name.upper():
+                continue
+            libro = None
+            try:
+                candidato = sanitize_safe_path(base, candidato)
+                libro = openpyxl.load_workbook(candidato, read_only=True, data_only=False)
+                if requeridas <= set(libro.sheetnames) and identidad and str(
+                        libro['00_RESUMEN'][CELDAS_RESUMEN[cartera]['nif']].value or '').strip().casefold() == identidad:
+                    encontrados.append(candidato)
+            except Exception:
+                continue
+            finally:
+                if libro is not None:
+                    libro.close()
+        if len(encontrados) == 1:
+            return encontrados[0]
+        if encontrados or hay_otros:
+            raise ValueError('No se puede identificar un único Excel principal del cliente. '
+                             'Revisa el nombre y las copias de su carpeta. No se ha creado ni sobrescrito ningún libro.')
+        return previsto
 
     # ------------------------------------------------------------------ CRUD genérico
     def _tabla(self, tabla: str) -> TablaDef:
@@ -1082,6 +1128,9 @@ class Database:
 
     def borrar(self, tabla: str, cliente_id: int, codigo: str) -> None:
         self._tabla(tabla)
+        if tabla == "inmuebles":
+            prefijo = f"periodicidad_210|{cliente_id}|{codigo}|"
+            self.con.execute("DELETE FROM config WHERE substr(clave,1,?)=?", (len(prefijo), prefijo))
         self.con.execute(f"DELETE FROM {tabla} WHERE cliente_id=? AND codigo=?", (cliente_id, codigo))
         self._confirmar()
 
@@ -1100,6 +1149,14 @@ class Database:
         campos.update(codigo=str(ejercicio), ejercicio=ejercicio)
         return self.upsert("residencias", cliente_id, campos)
 
+    def valor_referencia_ejercicio(self, cliente_id: int, inmueble: str, ejercicio: int) -> Optional[float]:
+        """Referencia acreditada de ese año exacto, sin heredar la de otro ejercicio."""
+        fila = self.con.execute(
+            "SELECT valor_referencia FROM catastro WHERE cliente_id=? AND inmueble=? AND ejercicio=? "
+            "AND valor_referencia IS NOT NULL AND valor_referencia!='' ORDER BY codigo DESC,id DESC LIMIT 1",
+            (cliente_id, inmueble, int(ejercicio))).fetchone()
+        return float(fila[0]) if fila and fila[0] not in (None, "") else None
+
     def catastro(self, cliente_id: int, inmueble: str, ejercicio: int) -> Optional[dict]:
         """Catastro del ejercicio; si falta, el del año anterior más próximo (y lo indica con '_heredado')."""
         actual = self.con.execute("SELECT * FROM catastro WHERE cliente_id=? AND inmueble=? AND ejercicio=? "
@@ -1108,13 +1165,17 @@ class Database:
             r = dict(actual)
             if not r.get("valor_catastral"):
                 previa = self.con.execute("SELECT * FROM catastro WHERE cliente_id=? AND inmueble=? "
-                    "AND ejercicio<? AND valor_catastral IS NOT NULL AND valor_catastral!=0 "
+                    "AND ejercicio<=? AND valor_catastral IS NOT NULL AND valor_catastral!=0 "
                     "ORDER BY ejercicio DESC,codigo DESC,id DESC LIMIT 1", (cliente_id, inmueble, ejercicio)).fetchone()
                 if previa:
-                    for campo in ("valor_catastral", "valor_suelo", "valor_construccion", "anio_revision"):
+                    campos = ("valor_catastral", "valor_suelo", "valor_construccion", "anio_revision")
+                    if previa["ejercicio"] == ejercicio:
+                        campos += ("pct_imputacion", "revision_pendiente", "observaciones")
+                    for campo in campos:
                         if r.get(campo) in (None, ""):
                             r[campo] = previa[campo]
-                    r["_heredado"] = previa["ejercicio"]
+                    if previa["ejercicio"] != ejercicio:
+                        r["_heredado"] = previa["ejercicio"]
             return r
         previa = self.con.execute("SELECT * FROM catastro WHERE cliente_id=? AND inmueble=? AND ejercicio<? "
                                   "ORDER BY ejercicio DESC,codigo DESC,id DESC LIMIT 1",

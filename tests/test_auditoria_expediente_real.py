@@ -80,6 +80,7 @@ def test_editar_imputacion_ya_presentada_no_se_bloquea(ctrl):
 
 
 def test_prorroga_sigue_alquilado_y_avisa(ctrl):
+    ctrl.db.set_config("periodicidad_210_alquiler", "Trimestral")  # este caso contrasta 2T y 4T
     cid, inm, _t, _v = _expediente(ctrl)
     inf = tc.recalcular_cliente(ctrl.db, cid, 2026)
     filas = {f["periodo"]: f for f in ctrl.db.listar("m210_alquiler", cid, ejercicio=2026)}

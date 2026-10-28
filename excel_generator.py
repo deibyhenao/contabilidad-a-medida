@@ -5,6 +5,7 @@ import os
 import math
 import json
 import hashlib
+import logging
 import shutil
 import tempfile
 import re
@@ -19,11 +20,23 @@ from openpyxl.comments import Comment
 
 import database
 import valores_inmuebles
+from version import VERSION
 from carteras import NR, RES, cartera_de
 from database import Database, a_fecha
 from gastos import ejercicio_registrado, fraccion
 from rutas_seguras import sanitize_safe_path
 
+FIRMA_NO_ESPECIFICADA = object()
+
+
+def _formula_imputacion_redondeada(formula):
+    """Excepción autorizada: base y cuota no presentadas con dos decimales."""
+    if not isinstance(formula, str):
+        return None
+    original = re.fullmatch(r'=IF\((A\d+)="","",(.+)\)', formula)
+    if not original:
+        return None
+    return f'=IF({original[1]}="","",ROUND({original[2]},2))'
 
 class ExcelBloqueadoError(Exception):
     """El libro anterior se conserva; la nueva versión queda pendiente."""
@@ -33,13 +46,23 @@ class ExcelBloqueadoError(Exception):
     def __init__(self, ruta_pendiente: Path):
         self.ruta_pendiente = Path(ruta_pendiente)
         super().__init__(
-            "Cierra el Excel abierto y pulsa Sincronizar. "
+            "Cierra el Excel abierto, comprueba los permisos de su carpeta y de _backups, y pulsa Sincronizar. "
             f"Se guardó una copia en {self.ruta_pendiente}"
         )
 
 
 class ExcelConflictoImportacion(ValueError):
     """Un libro pendiente contiene datos anteriores a una corrección documental."""
+
+
+class ExcelCambioConcurrenteError(ExcelBloqueadoError):
+    """El usuario guardó durante la serialización; el principal se conserva."""
+
+    def __init__(self, ruta_pendiente: Path):
+        self.ruta_pendiente = Path(ruta_pendiente)
+        Exception.__init__(self, 'El Excel cambió mientras se preparaba la exportación. '
+                           'Se ha conservado tu archivo principal. La versión calculada quedó en '
+                           + self.ruta_pendiente.name + '. Revisa ambas versiones antes de sincronizar.')
 
 def _conflicto_excel(db, cid, ruta, celda, campo, candidato, actual):
     pendiente = db.get_config(f"excel_pendiente|{cid}")
@@ -84,6 +107,9 @@ def _ruta(db: Database, cid: int, ruta: Path | None) -> Path:
         raise ValueError(f"Cliente inexistente: {cid}")
     base = Path(cliente["carpeta"])
     sanitize_safe_path(base, base.absolute())
+    if not base.is_dir():
+        raise FileNotFoundError('No se encuentra la carpeta del expediente. No se ha recreado; '
+                                'comprueba su ubicación y que la unidad esté conectada.')
     destino = Path(ruta) if ruta is not None else db.ruta_excel(cliente)
     # La exportación/importación explícita permite una copia elegida por el usuario.
     # El destino automático siempre permanece dentro del expediente.
@@ -93,6 +119,13 @@ def _ruta(db: Database, cid: int, ruta: Path | None) -> Path:
 
 # Tablas en las que una fila escrita a mano en el Excel (sin ID) es un alta y su ausencia, una baja
 MANUALES_EXCEL = ("gastos", "facturas_emitidas", "facturas_recibidas")
+
+
+def _firma_fila_manual(tabla, fila) -> str:
+    campos = {c.campo: fila.get(c.campo) for c in _columnas(database.TABLAS[tabla])}
+    campos['origen'] = fila.get('origen')
+    contenido = json.dumps(campos, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(contenido.encode('utf-8')).hexdigest()
 
 
 def _columnas(tabla):
@@ -154,19 +187,51 @@ def _ampliar_fila(ws, fila: int, tabla, limite: int) -> None:
             celda.value = Translator(origen.value, origin=origen.coordinate).translate_formula(celda.coordinate)
 
 
-def _guardar_atomico(wb, destino: Path, carpeta_cliente: Path) -> None:
+def _guardar_atomico(wb, destino: Path, carpeta_cliente: Path, *,
+                     firma_esperada=FIRMA_NO_ESPECIFICADA, guardar_version: bool = False) -> None:
     destino = sanitize_safe_path(destino.parent, destino.absolute())
     carpeta_cliente = sanitize_safe_path(carpeta_cliente, carpeta_cliente.absolute())
-    destino.parent.mkdir(parents=True, exist_ok=True)
+    if not carpeta_cliente.is_dir():
+        raise FileNotFoundError('No se encuentra la carpeta del expediente; no se ha recreado.')
+    if destino.parent != carpeta_cliente:
+        destino.parent.mkdir(parents=True, exist_ok=True)
+    if firma_esperada is FIRMA_NO_ESPECIFICADA:
+        firma_esperada = _firma_excel(destino) if destino.exists() else None
+
+    def pendiente_de(temporal):
+        sello = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        pendiente = destino.with_name(f"{destino.stem}_PENDIENTE_{sello}.xlsx")
+        if len(str(pendiente)) > 247:
+            descriptor, nombre = tempfile.mkstemp(prefix="PENDIENTE_", suffix=".xlsx", dir=destino.parent)
+            os.close(descriptor)
+            pendiente = Path(nombre)
+        shutil.copyfile(temporal, pendiente)
+        return pendiente
+
+    def comprobar_firma(temporal):
+        actual = _firma_excel(destino) if destino.exists() else None
+        if actual != firma_esperada:
+            raise ExcelCambioConcurrenteError(pendiente_de(temporal))
     descriptor, nombre_tmp = tempfile.mkstemp(prefix=".nr_", suffix=".xlsx", dir=destino.parent)
     os.close(descriptor)
     temporal = Path(nombre_tmp)
     try:
         wb.save(temporal)
         try:
+            comprobar_firma(temporal)
             if destino.exists():
                 backups = sanitize_safe_path(carpeta_cliente, "_backups")
                 backups.mkdir(parents=True, exist_ok=True)
+                if guardar_version:
+                    digest = hashlib.sha256(destino.read_bytes()).hexdigest()
+                    nombre_version = f"ANTES_{VERSION}_{digest[:12]}.xlsx"
+                    if len(str(backups / nombre_version)) > 247:
+                        nombre_version = f"V{VERSION.replace('.', '')}_{digest[:8]}.xlsx"
+                    duradera = sanitize_safe_path(backups, backups / nombre_version)
+                    if duradera.exists() and hashlib.sha256(duradera.read_bytes()).hexdigest() != digest:
+                        raise ValueError('La copia previa a la versión fue modificada; se conserva sin sobrescribir.')
+                    if not duradera.exists():
+                        shutil.copy2(destino, duradera)
                 sello = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                 corto = "CAM_" + hashlib.sha256(destino.name.encode("utf-8")).hexdigest()[:12]
                 nombre = f"{destino.stem}_{sello}.xlsx"
@@ -175,8 +240,7 @@ def _guardar_atomico(wb, destino: Path, carpeta_cliente: Path) -> None:
                     # Evita superar MAX_PATH únicamente al añadir el sello de copia.
                     nombre = f"{corto}_{sello}.xlsx"
                 copia = sanitize_safe_path(backups, backups / nombre)
-                shutil.copy2(destino, copia)
-                patron = re.compile("(?:" + re.escape(destino.stem) + "|" + corto + r")_\d{8}_\d{6}_\d{6}\.xlsx")
+                patron = re.compile("(?:" + re.escape(destino.stem) + "|" + corto + r")_(\d{8}_\d{6}_\d{6})\.xlsx")
                 copias = []
                 for candidata in backups.glob("*.xlsx"):
                     if not patron.fullmatch(candidata.name):
@@ -187,26 +251,38 @@ def _guardar_atomico(wb, destino: Path, carpeta_cliente: Path) -> None:
                         continue
                     if candidata.is_file():
                         copias.append(candidata)
-                copias.sort(key=lambda p: p.stat().st_mtime_ns, reverse=True)
-                for antigua in copias[10:]:
-                    antigua.unlink()
+                # El sello del nombre es la fecha de copia; copy2 conserva la
+                # fecha del original, que puede ser antigua al restaurar un libro.
+                copias.sort(key=lambda p: patron.fullmatch(p.name).group(1), reverse=True)
+                if copias and hashlib.sha256(copias[0].read_bytes()).hexdigest() == hashlib.sha256(destino.read_bytes()).hexdigest():
+                    copia = copias[0]  # Reintentos bloqueados no duplican el mismo respaldo.
+                else:
+                    shutil.copy2(destino, copia)
+                    copias.insert(0, copia)
+            else:
+                copias = []
+            comprobar_firma(temporal)
             os.replace(temporal, destino)
+            # No purgar el historial si Windows rechazó el reemplazo del principal.
+            # Un fallo al depurar tampoco invalida un Excel ya guardado correctamente.
+            for antigua in copias[10:]:
+                try:
+                    antigua.unlink()
+                except OSError:
+                    logging.getLogger(__name__).warning('No se pudieron depurar algunas copias antiguas; se conservan.')
         except PermissionError as exc:
-            sello = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            pendiente = destino.with_name(f"{destino.stem}_PENDIENTE_{sello}.xlsx")
-            if len(str(pendiente)) > 247:
-                descriptor, nombre = tempfile.mkstemp(prefix="PENDIENTE_", suffix=".xlsx", dir=destino.parent)
-                os.close(descriptor)
-                pendiente = Path(nombre)
-            shutil.copyfile(temporal, pendiente)
-            raise ExcelBloqueadoError(pendiente) from exc
+            raise ExcelBloqueadoError(pendiente_de(temporal)) from exc
     finally:
         temporal.unlink(missing_ok=True)
 
 
 def _firma_excel(ruta: Path) -> str:
     st = ruta.stat()
-    return f"{st.st_mtime_ns}|{st.st_size}"
+    h = hashlib.sha256()
+    with ruta.open('rb') as entrada:
+        for bloque in iter(lambda: entrada.read(1024 * 1024), b''):
+            h.update(bloque)
+    return f"{st.st_mtime_ns}|{st.st_size}|{h.hexdigest()}"
 
 
 def excel_modificado(db: Database, cliente_id: int) -> bool:
@@ -216,6 +292,20 @@ def excel_modificado(db: Database, cliente_id: int) -> bool:
         return False
     ruta = db.ruta_excel(cliente)
     return ruta.exists() and db.get_config(f"excel_firma|{cliente_id}") != _firma_excel(ruta)
+
+
+def necesita_actualizar_formato(db: Database, cliente_id: int) -> bool:
+    """Un libro de una versión anterior se importa y regenera al primer uso.
+
+    La marca solo se confirma al guardar el libro canónico: un PENDIENTE nunca
+    da por actualizado un Excel antiguo. Un fichero eliminado se reconstruye de BD.
+    """
+    cliente = db.get_cliente(cliente_id)
+    if not cliente:
+        return False
+    return (not db.ruta_excel(cliente).exists()
+            or db.get_config(f'excel_version|{cliente_id}') != VERSION
+            or bool(db.get_config(f'excel_pendiente|{cliente_id}')))
 
 
 def _resumen_gastos(ws, inmuebles, limite: int = 3000) -> None:
@@ -233,7 +323,7 @@ def _resumen_gastos(ws, inmuebles, limite: int = 3000) -> None:
     for col in range(1, 9):
         ws.cell(29, col)._style = copy(ws["A18"]._style)
         ws.cell(30, col)._style = copy(ws["A19"]._style)
-    ws["A29"] = "GASTOS DEDUCIBLES DEL EJERCICIO POR INMUEBLE"
+    ws["A29"] = "GASTOS REGISTRADOS DEL EJERCICIO POR INMUEBLE"
     ws.merge_cells("A29:H29")
     ws.row_dimensions[29].height = ws.row_dimensions[18].height
     ws.row_dimensions[30].height = 45
@@ -245,7 +335,7 @@ def _resumen_gastos(ws, inmuebles, limite: int = 3000) -> None:
         cell = ws.cell(30, col, f"{inmueble['codigo']}\n{direccion}")
         cell.data_type = "s"
     if resto:
-        ws["H30"] = "Resto"
+        ws["H30"] = "Resto / sin asignar"
 
     def rango(col):
         return "'08_GASTOS'!$" + col + "$2:$" + col + "$" + str(limite)
@@ -285,7 +375,8 @@ def _resumen_gastos(ws, inmuebles, limite: int = 3000) -> None:
         cell.number_format = '#,##0.00 [$€-es-ES]'
         cell.value = f"=SUM({cell.column_letter}31:{cell.column_letter}{fila_total - 1})"
     nota = ws.cell(fila_nota, 1,
-                   "Detalle y PDFs de cada gasto en 08_GASTOS (columna U) y 13_DOCUMENTACION (columna J).")
+                   "Gastos registrados; la deducción fiscal depende del régimen y del cálculo del 210. "
+                   "Detalle y PDFs en 08_GASTOS (columna U) y 13_DOCUMENTACION (columna J).")
     fuente = copy(ws["A20"].font)
     fuente.color = "808080"
     fuente.italic = True
@@ -315,7 +406,13 @@ def _resumen_valores(wb, db: Database, cid: int, ejercicio: int) -> None:
     ws.row_dimensions[inicio + 2].height = 44
     for i, inmueble in enumerate(db.iterar("inmuebles", cid), 2):
         fila = inicio + 1 + i
+        fin = max(fin, fila)  # la siguiente sección empieza después de la última fila realmente exportada
         cat = db.catastro(cid, inmueble["codigo"], int(ejercicio)) or {}
+        compra = a_fecha(inmueble.get("fecha_adquisicion"))
+        referencia_compra = (db.valor_referencia_ejercicio(cid, inmueble["codigo"], compra.year)
+                             if compra else None)
+        referencia_actual = db.valor_referencia_ejercicio(cid, inmueble["codigo"], ejercicio)
+        referencia_alternativa = str(referencia_compra) if referencia_compra is not None else '""'
         vista = valores_inmuebles.resumen(inmueble, cat)
         origen = "'02_INMUEBLES'!"
         valores = [inmueble["codigo"] + "\n" + (inmueble.get("direccion") or "Sin dirección"), vista["catastral"],
@@ -323,7 +420,8 @@ def _resumen_valores(wb, db: Database, cid: int, ejercicio: int) -> None:
             f'=IF(COUNT(G{fila}:H{fila})=0,"",IF(ISNUMBER(H{fila}),H{fila},G{fila}))',
             f'=IF(ISBLANK({origen}J{i}),"",{origen}J{i})',
             f'=IF(COUNT({origen}K{i}:P{i})=0,"",ROUND(SUM({origen}K{i}:P{i}),2))',
-            f'=IF(ISBLANK({origen}R{i}),"",{origen}R{i})', vista["referencia_catastro"]]
+            f'=IF(ISBLANK({origen}R{i}),{referencia_alternativa},'
+            f'{origen}R{i})', referencia_actual]
         for c, valor in enumerate(valores, 1):
             celda = ws.cell(fila, c, valor)
             if c == 1:
@@ -334,6 +432,11 @@ def _resumen_valores(wb, db: Database, cid: int, ejercicio: int) -> None:
         ws.row_dimensions[fila].height = 32
         if cat.get("_heredado"):
             ws.cell(fila, 2).comment = Comment(f"Dato catastral heredado de {cat['_heredado']}. Se actualiza al sincronizar.", "Contabilidad a Medida")
+        ws.cell(fila, 7).comment = Comment(
+            f"Referencia en adquisición: {compra.year if compra else 'año sin dato'}. "
+            "Se mantiene separada de la referencia del ejercicio consultado.", "Contabilidad a Medida")
+        ws.cell(fila, 8).comment = Comment(
+            f"Referencia acreditada para {ejercicio}; vacío si no consta en ese ejercicio.", "Contabilidad a Medida")
         if vista["parcial"]:
             ws.cell(fila, 3).comment = Comment("Al sincronizar faltaba registrar el precio de escritura; revisa el total tras completar los datos.", "Contabilidad a Medida")
     hoja = wb["02_INMUEBLES"]
@@ -347,6 +450,46 @@ def _resumen_valores(wb, db: Database, cid: int, ejercicio: int) -> None:
     }.items():
         hoja[celda].comment = Comment(texto, "Contabilidad a Medida")
     wb["03_CATASTRO_IBI"]["E1"].comment = Comment("Valor catastral del ejercicio. Se conserva separado del precio de escritura, los gastos y el valor de referencia.", "Contabilidad a Medida")
+    _resumen_ocupacion(wb, db, cid, int(ejercicio), fin + 3)
+
+
+def _resumen_ocupacion(wb, db: Database, cid: int, ejercicio: int, inicio: int) -> None:
+    """Consulta del motor al sincronizar; no duplica las reglas fiscales en fórmulas de Excel."""
+    import tax_calculator as tc
+    ws = wb["00_RESUMEN"]
+    inmuebles = db.listar("inmuebles", cid)
+    fin = inicio + 2 + len(inmuebles)
+    if any(c.value is not None for row in ws.iter_rows(min_row=inicio, max_row=fin, max_col=8) for c in row):
+        raise ValueError("El área del resumen de ocupación debe estar vacía en la plantilla.")
+    if any(r.min_row <= fin and r.max_row >= inicio and r.min_col <= 8 for r in ws.merged_cells.ranges):
+        raise ValueError("El resumen de ocupación coincide con celdas combinadas de la plantilla.")
+    ws.cell(inicio, 1, f"OCUPACIÓN Y RENTAS · EJERCICIO {ejercicio}")
+    ws.cell(inicio + 1, 1, "Consulta al sincronizar con la app. Devengado y cobrado son conceptos distintos.")
+    encabezados = ("Inmueble", "Fecha de compra", "Días propiedad", "Días alquilados", "Días vacíos",
+                   "Renta devengada", "Cobros registrados", "Ejercicio")
+    for col, texto in enumerate(encabezados, 1):
+        celda = ws.cell(inicio + 2, col, texto)
+        celda._style = copy(wb["02_INMUEBLES"].cell(1, col)._style)
+        alineacion = copy(celda.alignment)
+        alineacion.wrap_text = True
+        celda.alignment = alineacion
+    ws.row_dimensions[inicio + 2].height = 44
+    for fila, inm in enumerate(inmuebles, inicio + 3):
+        contratos = db.listar("contratos", cid, inmueble=inm["codigo"])
+        rentas = {c["codigo"]: db.listar("rentas", cid, contrato=c["codigo"]) for c in contratos}
+        resumen = tc.resumen_arrendamiento(inm, contratos, rentas, ejercicio)
+        cobros = db.listar("cobros", cid, inmueble=inm["codigo"], ejercicio=ejercicio)
+        valores = (inm["codigo"], a_fecha(inm.get("fecha_adquisicion")), resumen["dias_propiedad"],
+                   resumen["dias_alquilado"], resumen["dias_vacio"], resumen["ingresos_devengados"],
+                   tc.r2(sum(float(c.get("importe_cobrado") or 0) for c in cobros)), ejercicio)
+        for col, valor in enumerate(valores, 1):
+            celda = ws.cell(fila, col, valor)
+            if col == 1:
+                celda.data_type = "s"
+            elif col == 2:
+                celda.number_format = "dd/mm/yyyy"
+            elif col in (6, 7):
+                celda.number_format = '#,##0.00 [$€-es-ES]'
 
 
 def _aclaraciones_resumen(wb, db: Database, cid: int, ejercicio: int) -> None:
@@ -359,6 +502,12 @@ def _aclaraciones_resumen(wb, db: Database, cid: int, ejercicio: int) -> None:
         "E12": "Suma de importes anotados en gastos. Contrasta la deducción fiscal con residencia, límites y modelos 210; no acredita por sí sola gastos efectivamente deducidos.",
         "H10": "Cuenta documentos faltantes de todo el expediente, no solo del ejercicio seleccionado. Filtra 13_DOCUMENTACION por ejercicio para revisarlos.",
     }
+    from tax_calculator import conflictos_210_alquiler
+    conflictos = conflictos_210_alquiler(db, cid, ejercicio)
+    if conflictos:
+        aviso = "PENDIENTE DE REVISIÓN: " + " ".join(conflictos.values())
+        notas["H7"] += " " + aviso + " Los pagos registrados no constituyen un total conciliado."
+        notas["E13"] = aviso + " Se conservan los importes históricos; no hay un cálculo actualizado del alquiler afectado."
     pendientes = [f for f in db.listar("m210_imputacion", cid, ejercicio=ejercicio)
                   if f.get("estado") not in ("Presentado", "No procede")]
     total = sum(float(f.get("cuota") or 0) for f in pendientes)
@@ -380,7 +529,8 @@ def _aclaraciones_resumen(wb, db: Database, cid: int, ejercicio: int) -> None:
         ws[coordenada].comment = comentario
 
 
-def exportar_cliente(db: Database, cliente_id: int, ejercicio: int, destino: Path | None = None) -> Path:
+def exportar_cliente(db: Database, cliente_id: int, ejercicio: int, destino: Path | None = None, *,
+                     firma_esperada=FIRMA_NO_ESPECIFICADA) -> Path:
     """Exporta BD; el controlador debe importar el Excel ANTES de modificar BD.
 
     Importar aquí revertiría los datos que acaba de aplicar el PDF/calculadora.
@@ -392,15 +542,21 @@ def exportar_cliente(db: Database, cliente_id: int, ejercicio: int, destino: Pat
     cliente = db.get_cliente(cliente_id)
     cartera = cartera_de(cliente.get("tipo_cliente"))
     canonico = destino.resolve() == db.ruta_excel(cliente).resolve()
+    if firma_esperada is FIRMA_NO_ESPECIFICADA or not canonico:
+        firma_esperada = _firma_excel(destino) if destino.exists() else None
+    guardar_version = canonico and db.get_config(f'excel_version|{cliente_id}') != VERSION
     if canonico:
         db.set_config(f"excel_pendiente|{cliente_id}", "1")
     wb = openpyxl.load_workbook(database.PLANTILLAS[cartera])
+    firmas_filas = {t: {} for t in MANUALES_EXCEL}
     try:
         for tabla, hoja in database.hojas_cartera(cartera):
             nombre = tabla.nombre
             ws = wb[hoja]
             limite = ws.max_row
             for fila, datos in enumerate(db.iterar(nombre, cliente_id, incluir_retirados=True), tabla.fila_inicio):
+                if nombre in MANUALES_EXCEL:
+                    firmas_filas[nombre][datos['codigo']] = _firma_fila_manual(nombre, datos)
                 if nombre == "documentos":
                     gestion = db.con.execute("SELECT en_papelera,ruta_papelera FROM documentos_gestion WHERE cliente_id=? AND codigo=?",
                                              (cliente_id, datos["codigo"])).fetchone()
@@ -430,6 +586,18 @@ def exportar_cliente(db: Database, cliente_id: int, ejercicio: int, destino: Pat
                                 "Importe de la declaración presentada (justificante). Sustituye a la fórmula para "
                                 "conservar lo declarado; si deja de estar presentada, vuelve la fórmula.",
                                 "Contabilidad a Medida")
+                elif nombre == "m210_imputacion":
+                    for campo in ("renta_imputada_formula", "cuota_formula"):
+                        col = next((c for c in tabla.columnas_excel if c.campo == campo), None)
+                        if col:
+                            celda = ws[f"{col.letra}{fila}"]
+                            formula = _formula_imputacion_redondeada(celda.value)
+                            if formula:
+                                celda.value = formula
+                                celda.comment = Comment(
+                                    "Importe no presentado: se redondea a dos decimales, igual que en la aplicación. "
+                                    "La cuota se calcula sobre la renta imputada ya redondeada.",
+                                    "Contabilidad a Medida")
         resumen = {
             **cliente,
             "nombre_completo": f"{cliente['nombre']} {cliente['apellidos']}".strip(),
@@ -451,12 +619,17 @@ def exportar_cliente(db: Database, cliente_id: int, ejercicio: int, destino: Pat
             wb.calculation = CalcProperties()
         wb.calculation.fullCalcOnLoad = True
         wb.calculation.forceFullCalc = True
-        _guardar_atomico(wb, destino, Path(cliente["carpeta"]))
+        _guardar_atomico(wb, destino, Path(cliente["carpeta"]), firma_esperada=firma_esperada,
+                         guardar_version=guardar_version)
         if canonico:
-            db.set_config(f"excel_firma|{cliente_id}", _firma_excel(destino))
-            db.set_config(f"excel_resumen|{cliente_id}", json.dumps({c: cliente.get(c) for c in
-                ("pasaporte", "nacionalidad", "email", "telefono", "responsable")}, ensure_ascii=False))
-            db.set_config(f"excel_pendiente|{cliente_id}", "")
+            with db.transaccion():
+                db.set_config(f"excel_firma|{cliente_id}", _firma_excel(destino))
+                db.set_config(f"excel_version|{cliente_id}", VERSION)
+                db.set_config(f"excel_nombre|{cliente_id}", destino.name)
+                db.set_config(f"excel_filas|{cliente_id}", json.dumps(firmas_filas, ensure_ascii=False))
+                db.set_config(f"excel_resumen|{cliente_id}", json.dumps({c: cliente.get(c) for c in
+                    ("pasaporte", "nacionalidad", "email", "telefono", "responsable")}, ensure_ascii=False))
+                db.set_config(f"excel_pendiente|{cliente_id}", "")
     except ExcelBloqueadoError as exc:
         if canonico:
             db.set_config(f"excel_pendiente|{cliente_id}", str(exc.ruta_pendiente))
@@ -482,15 +655,29 @@ def import_excel_to_db(db: Database, cliente_id: int, ruta: Path | None = None) 
             return {}
     cartera = cartera_de((cliente or {}).get("tipo_cliente"))
     pendiente = bool(db.get_config(f"excel_pendiente|{cliente_id}"))
+    try:
+        filas_exportadas = json.loads(db.get_config(f'excel_filas|{cliente_id}', '{}'))
+    except (ValueError, TypeError):
+        filas_exportadas = {}
     hojas = database.hojas_cartera(cartera)
     wb = openpyxl.load_workbook(ruta, data_only=False)
-    faltan = [hoja for _, hoja in hojas if hoja not in wb.sheetnames]
+    faltan = [hoja for hoja in ['00_RESUMEN', *(h for _, h in hojas)] if hoja not in wb.sheetnames]
     if faltan:
         wb.close()
         raise ValueError(f"El Excel no corresponde a la plantilla de {'residentes' if cartera == RES else 'no residentes'}"
                          f" (faltan {', '.join(faltan[:3])}).")
     conteos: dict[str, int] = {}
     try:
+        # El nombre y la carpeta no prueban la identidad del contenido: el asesor
+        # puede haber copiado por error el libro de otro expediente sobre este.
+        celda_nif = database.CELDAS_RESUMEN[cartera]['nif']
+        nif_libro = str(wb['00_RESUMEN'][celda_nif].value or '').strip().upper()
+        if not nif_libro:
+            raise ValueError('Falta el NIF/NIE en el resumen del Excel. No se ha importado: '
+                             'comprueba que corresponde a este cliente y restaura su identificación.')
+        if nif_libro != str((cliente or {}).get('nif') or '').strip().upper():
+            raise ValueError('El Excel corresponde a otro cliente (NIF/NIE diferente). '
+                             'No se ha importado ni sobrescrito ningún dato del expediente.')
         with db.transaccion():
             # Instantánea anterior a las notas generadas por la propia sincronización.
             anteriores_tablas = {t.nombre: {r["codigo"]: r for r in db.iterar(t.nombre, cliente_id, incluir_retirados=True)} for t, _ in hojas}
@@ -538,7 +725,11 @@ def import_excel_to_db(db: Database, cliente_id: int, ruta: Path | None = None) 
                                 ):
                                     datos["codigo"] = cod
                                     break
-                    previo = anteriores.get(datos.get("codigo"))
+                    codigo = datos.get('codigo')
+                    if codigo is not None and codigo in vistos:
+                        raise ValueError(f'Código duplicado {codigo} en {hoja}, fila {fila}. '
+                                         'Revisa la fila copiada; no se ha importado el libro.')
+                    previo = anteriores.get(codigo)
                     if nombre == "documentos" and previo:
                         gestion = db.con.execute("SELECT en_papelera FROM documentos_gestion WHERE cliente_id=? AND codigo=?",
                                                  (cliente_id, previo["codigo"])).fetchone()
@@ -551,6 +742,18 @@ def import_excel_to_db(db: Database, cliente_id: int, ruta: Path | None = None) 
                         vistos.add(previo["codigo"])
                         conteos[nombre] += 1
                         continue
+                    if nombre == 'contratos':
+                        campos_fecha = ('fecha_inicio', 'fecha_fin_prevista', 'fecha_fin_real')
+                        fechas = {campo: a_fecha(datos.get(campo)) for campo in campos_fecha}
+                        # No bloquear un histórico intacto por una anomalía anterior;
+                        # sí impedir que una edición nueva introduzca un intervalo invertido.
+                        cambio_fechas = not previo or any(
+                            fechas[campo] != a_fecha(previo.get(campo)) for campo in campos_fecha)
+                        if cambio_fechas and fechas['fecha_inicio'] and any(
+                                fechas[campo] and fechas[campo] < fechas['fecha_inicio']
+                                for campo in ('fecha_fin_prevista', 'fecha_fin_real')):
+                            raise ValueError(f'{hoja}, fila {fila}: la fecha de fin del contrato '
+                                             'no puede ser anterior al inicio. No se ha importado el libro.')
                     if pendiente:
                         _comprobar_datos_pendientes(db, cliente_id, nombre, columnas, datos, previo, hoja, fila, ruta)
                     nuevo = db.upsert(nombre, cliente_id, datos, respetar_manuales=False)
@@ -568,7 +771,22 @@ def import_excel_to_db(db: Database, cliente_id: int, ruta: Path | None = None) 
                 for codigo, previo in anteriores.items():
                     if codigo in vistos or previo.get("estado") == "Presentado":
                         continue
-                    if nombre in MANUALES_EXCEL and previo.get("origen") == "excel" and not pendiente:
+                    if nombre in MANUALES_EXCEL and previo.get("origen") == "excel":
+                        anterior = filas_exportadas.get(nombre, {}).get(codigo)
+                        if pendiente and anterior is None and nombre in filas_exportadas:
+                            # La fila nació en BD después del último libro confirmado:
+                            # el usuario nunca la vio allí y no puede haberla borrado.
+                            db.nota(cliente_id, "Sincronización", f"Fila nueva pendiente: {codigo}",
+                                    f"{codigo} de {hoja} aún no estaba en el último Excel guardado; "
+                                    "se conserva el registro nuevo de la aplicación.",
+                                    clave=f"NUEVA_PENDIENTE|{nombre}|{codigo}")
+                            continue
+                        if pendiente and anterior != _firma_fila_manual(nombre, previo):
+                            raise ExcelConflictoImportacion(
+                                f'La fila {codigo} de {hoja} se eliminó del Excel, pero hay una exportación '
+                                'pendiente y no se puede confirmar que la ficha siga igual. Se conservan ambas '
+                                'versiones; no se ha borrado ni restaurado la fila automáticamente. '
+                                'Revisa la copia pendiente y concilia el libro antes de sincronizar.')
                         db.borrar(nombre, cliente_id, codigo)
                     else:
                         db.nota(cliente_id, "Sincronización", f"Fila ausente: {codigo}",
@@ -645,7 +863,9 @@ def verificar_estructura(ruta: Path, plantilla_ruta: Path | None = None) -> list
             combinadas = set(map(str, ws.merged_cells.ranges))
             esperadas = set(map(str, original.merged_cells.ranges))
             # Única extensión autorizada del resumen: el título del desglose de gastos.
-            if ws.title == "00_RESUMEN" and ws["A29"].value == "GASTOS DEDUCIBLES DEL EJERCICIO POR INMUEBLE":
+            if ws.title == "00_RESUMEN" and ws["A29"].value in (
+                    "GASTOS DEDUCIBLES DEL EJERCICIO POR INMUEBLE",
+                    "GASTOS REGISTRADOS DEL EJERCICIO POR INMUEBLE"):
                 esperadas.add("A29:H29")
             if combinadas != esperadas:
                 diferencias.append(f"{ws.title}: celdas combinadas diferentes")
@@ -656,6 +876,12 @@ def verificar_estructura(ruta: Path, plantilla_ruta: Path | None = None) -> list
             for fila in original:
                 for celda in fila:
                     if celda.coordinate in congeladas:
+                        continue
+                    if (ws.title == "10_210_IMPUTACION" and celda.column_letter in ("H", "J")
+                            and ws[f"A{celda.row}"].value not in (None, "")
+                            and ws[f"O{celda.row}"].value != "Presentado"
+                            and celda.data_type == "f"
+                            and ws[celda.coordinate].value == _formula_imputacion_redondeada(celda.value)):
                         continue
                     if celda.data_type == "f" and ws[celda.coordinate].value != celda.value:
                         diferencias.append(f"{ws.title}!{celda.coordinate}: fórmula diferente o ausente")

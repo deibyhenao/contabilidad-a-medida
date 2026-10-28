@@ -172,6 +172,7 @@ def db(tmp_path):
 
 
 def test_pendientes_documentos_y_declaraciones(db):
+    db.set_config("periodicidad_210_alquiler", "Trimestral")  # comprueba expresamente el vencimiento del 3T
     cid = db.crear_cliente("Pepito", "Pérez", "X1234567A")["id"]
     db.guardar_residencia(cid, 2026, pais="Francia")
     inm = db.upsert("inmuebles", cid, {"fecha_adquisicion": "2019-01-01", "pct_titularidad": 1})

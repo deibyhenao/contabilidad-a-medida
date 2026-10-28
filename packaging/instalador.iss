@@ -121,6 +121,12 @@ var
   Datos, Programa: String;
 begin
   Result := '';
+  if (ExpandConstant('{param:CAMUPDATE|0}') <> '0') and
+     (not FileExists(ConfigPath) or
+      (Trim(GetIniString('Datos', 'Carpeta', '', ConfigPath)) = '')) then begin
+    Result := 'No se encuentra la ubicación de tus datos. Abre la versión anterior y comprueba su configuración antes de actualizar.';
+    Exit;
+  end;
   Datos := AddBackslash(Lowercase(ExpandFileName(DatosPage.Values[0])));
   Programa := AddBackslash(Lowercase(ExpandFileName(WizardDirValue)));
   if not SinEnlaces(DatosPage.Values[0]) or not SinEnlaces(WizardDirValue) or not SinEnlaces(ConfigPath) then begin

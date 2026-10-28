@@ -126,7 +126,7 @@ def test_gasto_manual_sin_id_sobrevive_y_descuenta_210(db, cliente):
     gasto = db.listar("gastos", cid)[0]
     assert gasto["origen"] == "excel" and gasto["observaciones"] == "Introducido a mano"
     assert gasto["codigo"].startswith("GAS-")
-    modelo = db.get_por_clave("m210_alquiler", cid, f"210A|2026|{inm}|3T")
+    modelo = db.get_por_clave("m210_alquiler", cid, f"210A|2026|{inm}|Anual")
     assert modelo["gastos"] == 150
     wb = openpyxl.load_workbook(ruta)
     try:
@@ -272,7 +272,8 @@ def test_import_excel_to_db_omite_apertura_si_firma_coincide(db, cliente, monkey
     cid = cliente["id"]
     ruta = eg.exportar_cliente(db, cid, 2026)
     firma = db.get_config(f"excel_firma|{cid}")
-    assert firma == f"{ruta.stat().st_mtime_ns}|{ruta.stat().st_size}"
+    assert firma == eg._firma_excel(ruta)
+    assert len(firma.split("|")[-1]) == 64
 
     load_original = eg.openpyxl.load_workbook
     aperturas = []

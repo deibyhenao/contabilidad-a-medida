@@ -27,7 +27,8 @@ def test_tres_valores_no_se_mezclan_y_no_cambia_patrimonio():
     assert (r['catastral'],r['adquisicion'],r['referencia'])==(150000,226500,240000)
     assert r['gastos']==26500 and r['referencia_compra']==230000
     assert tc.valor_patrimonial(DATOS,cat)==antes
-    assert antes.valor==240000
+    # Sin fecha de compra desde 2022 la referencia no cuenta en Patrimonio (AEAT): manda la adquisición con gastos
+    assert antes.valor==226500
 
 
 @pytest.mark.parametrize('datos,valor,parcial', [({},None,False),({'precio_escritura':0},0,False),

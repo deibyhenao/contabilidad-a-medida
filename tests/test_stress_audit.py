@@ -538,6 +538,9 @@ def preparar_controlador_lote(tmp_path):
 def test_controlador_agrupa_recalculo_en_un_commit(tmp_path):
     c,cid = preparar_controlador_lote(tmp_path)
     try:
+        # La creación inicial del Excel confirma sus metadatos por separado.
+        # Medimos aquí la transacción del recálculo de un expediente ya abierto.
+        c.sincronizar(cid, 2026)
         eventos = []
         c.db.con.set_trace_callback(eventos.append)
         res = c.abrir_cliente(cid,2026)
@@ -567,14 +570,18 @@ def test_controlador_no_deja_recalculo_parcial(tmp_path,monkeypatch):
 
 def test_error_exportacion_no_deshace_datos_confirmados(tmp_path,monkeypatch):
     import excel_generator as eg
+    from controlador import CalculoConfirmadoSinExcel
     c,cid = preparar_controlador_lote(tmp_path)
     try:
         def fallar(*args,**kwargs):
             assert not c.db.con.in_transaction  # Excel fuera de la transacción SQLite
             raise PermissionError('Fallo ficticio al exportar')
         monkeypatch.setattr(eg,'exportar_cliente',fallar)
-        with pytest.raises(PermissionError,match='Fallo ficticio'):
+        with pytest.raises(CalculoConfirmadoSinExcel,match='no se pudo completar') as fallo:
             c.sincronizar(cid,2026)
+        assert isinstance(fallo.value.__cause__, PermissionError)
+        assert 'Fallo ficticio' in str(fallo.value.__cause__)
+        assert fallo.value.resultado['informe'].ejercicio == 2026
         assert c.db.listar('m210_imputacion',cid)[0]['cuota'] == 480
         assert c.db.get_cliente(cid)
     finally:
