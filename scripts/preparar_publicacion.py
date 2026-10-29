@@ -21,7 +21,7 @@ def archivos_publicables():
     for patron in ['assets/icono.ico','assets/icono.png','plantillas/Plantilla_Expediente_No_Residente_v2.xlsx',
                    'plantillas/Plantilla_Expediente_Residente_v1.xlsx','packaging/ContabilidadAMedida.spec',
                    'packaging/instalador.iss','packaging/aplicar_actualizacion.ps1',
-                   'scripts/build_release.py','scripts/preparar_publicacion.py','.github/workflows/*.yml']:
+                   'scripts/build_release.py','scripts/preparar_publicacion.py','scripts/verificar_release.py','.github/workflows/*.yml']:
         rutas += [p for p in ROOT.glob(patron) if p.is_file()]
     # Solo pruebas seguidas por Git, además de las nuevas incluidas en esta entrega.
     rutas += [ROOT/p for p in tracked if p.startswith('tests/') and p.endswith('.py')]
