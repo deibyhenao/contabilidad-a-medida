@@ -29,14 +29,15 @@ def expediente(tmp_path):
         ctrl.cerrar()
 
 
-def test_trimestrales_pendientes_anteriores_conservan_calendario(expediente):
+def test_trimestrales_pendientes_anteriores_se_concilian_con_anual_sin_borrar_filas(expediente):
     ctrl, cid, inm = expediente
     for p in ('1T', '2T', '3T', '4T'):
         ctrl.db.upsert('m210_alquiler', cid, {'ejercicio': 2025, 'inmueble': inm,
             'periodo': p, 'estado': 'Pendiente'}, clave=f'210A|2025|{inm}|{p}')
-    assert tc.periodicidad_210_alquiler(ctrl.db, cid, inm, 2025) == 'Trimestral'
+    assert tc.periodicidad_210_alquiler(ctrl.db, cid, inm, 2025) == 'Anual'
     informe = tc.recalcular_cliente(ctrl.db, cid, 2025)
-    assert all(ctrl.db.get('m210_alquiler', cid, c)['periodo'] != 'Anual' for c in informe.filas_210_alquiler)
+    assert [ctrl.db.get('m210_alquiler', cid, c)['periodo'] for c in informe.filas_210_alquiler] == ['Anual']
+    assert all(f['estado'] == 'No procede' for f in ctrl.db.listar('m210_alquiler', cid) if f['periodo'] != 'Anual')
 
 
 def test_cliente_sin_modelos_anteriores_recibe_anual(expediente):
@@ -272,7 +273,7 @@ def test_preferencia_global_no_cambia_calendario_ya_trabajado(expediente):
     ctrl.db.upsert('m210_alquiler', cid, {'ejercicio': 2025, 'inmueble': inm,
         'periodo': '1T', 'estado': 'Pendiente'}, clave=f'210A|2025|{inm}|1T')
     ctrl.db.set_config('periodicidad_210_alquiler', 'Anual')
-    assert tc.periodicidad_210_alquiler(ctrl.db, cid, inm, 2025) == 'Trimestral'
+    assert tc.periodicidad_210_alquiler(ctrl.db, cid, inm, 2025) == 'Anual'
     # La elección expresa para ESTE inmueble/año sí tiene prioridad.
     ctrl.db.set_config(f'periodicidad_210|{cid}|{inm}|2025', 'Anual')
     assert tc.periodicidad_210_alquiler(ctrl.db, cid, inm, 2025) == 'Anual'

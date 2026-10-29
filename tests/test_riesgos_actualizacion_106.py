@@ -141,7 +141,7 @@ def test_error_recalculando_ficha_revierte_datos_del_cliente(expediente, monkeyp
     app._refrescar_clientes = lambda: None
     dialogo, trabajos = {}, []
     app._dialogo = lambda titulo, contenido, acciones, **kw: dialogo.update(contenido=contenido, acciones=acciones)
-    app.en_segundo_plano = lambda titulo, fn, *a: trabajos.append(fn)
+    app.en_segundo_plano = lambda titulo, fn, *a, **kw: trabajos.append(fn)
     app.dialogo_editar_cliente()
     nombre = next(c for c in _controles(dialogo['contenido']) if getattr(c, 'label', None) == 'Nombre')
     nombre.value = 'NO CONFIRMAR SI FALLA'

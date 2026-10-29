@@ -225,8 +225,8 @@ def filas_desglose_210(v: dict, periodicidad: Optional[str]) -> Optional[list[di
     if not isinstance(filas, list):
         return None
     visibles = [f for f in filas if isinstance(f, dict)
-                and str(f.get("estado") or "").strip().lower() != "no procede"]
-    if periodicidad in PERIODICIDADES_210:
+                and (str(f.get("estado") or "").strip().lower() != "no procede" or v.get("_revision_210"))]
+    if periodicidad in PERIODICIDADES_210 and not v.get("_revision_210"):
         anual = periodicidad == "Anual"
         visibles = [f for f in visibles if _es_anual(f.get("periodo")) == anual]
     return sorted(visibles, key=lambda f: _ORDEN_PERIODOS.get(str(f.get("periodo") or "").strip(), 9))
@@ -253,6 +253,19 @@ def desglose_210(v: dict, periodicidad: Optional[str], ejercicio: int, p: ui.Pal
         ui.leyenda("Importes del contribuyente según titularidad. La ocupación y la renta devengada de arriba "
                    "son del inmueble al 100 %.", p),
     ]
+    ocupacion = v.get("_ocupacion_trimestral") or []
+    if ocupacion:
+        controles.extend([
+            ui.leyenda("OCUPACIÓN POR TRIMESTRE · INFORMATIVO", p, p.texto3, 11),
+            ui.leyenda("Días y rentas del inmueble al 100 %. Este bloque no sustituye las declaraciones fiscales.", p),
+        ])
+        for tramo in ocupacion:
+            controles.append(ft.Container(ft.ResponsiveRow([
+                ft.Text(str(tramo["periodo"]), color=p.texto, col=2),
+                _cifra("Alquilado", dias(tramo.get("dias_alquilado")), p),
+                _cifra("Vacío", dias(tramo.get("dias_vacio")), p),
+                _cifra("Renta devengada", importe(tramo.get("ingresos_devengados")), p),
+            ], spacing=8, run_spacing=6), padding=12, border_radius=12, bgcolor=p.campo))
     if v.get("_revision_210"):
         controles.append(ui.leyenda("PENDIENTE DE REVISIÓN · " + str(v["_revision_210"])
                                     + " Importes históricos conservados; no son un cálculo actualizado.", p, p.naranja))

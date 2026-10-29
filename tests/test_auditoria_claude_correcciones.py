@@ -30,7 +30,7 @@ def test_fila_210_con_periodo_vacio_o_desconocido_no_bloquea_el_recalculo(ctrl):
                                          "estado": "En preparación"}, clave=clave)
     tc.recalcular_cliente(db, cid, 2025)                         # antes: ValueError en todo el cliente
     assert tc.periodicidad_210_alquiler(db, cid, inm, 2025) == "Anual"
-    with pytest.raises(ValueError, match="otra periodicidad"):   # el selector pide revisarlas antes de cambiar
+    with pytest.raises(ValueError, match="agrupación"):   # desde 2024 no se ofrece agrupación trimestral
         ctrl.establecer_periodicidad_210(cid, inm, 2025, "Trimestral")
 
 

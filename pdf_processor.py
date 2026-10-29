@@ -401,11 +401,16 @@ def extraer_local(ruta: Path) -> Extraccion:
 
         texto_campo("proveedor", "proveedor", "emisor", "razón social", "entidad emisora", "acreedor")
         patron_nif = rf"\b(?:[A-HJNP-SUVW]\d{{7}}[0-9A-J]|{PATRON_NIF})\b"
-        nif_etiquetado = _dato(texto, "nif proveedor", "cif proveedor", "nif del proveedor",
-                              "nif emisor", "cif emisor", "cif", "nif")
+        # Un NIF genérico dentro del bloque Cliente pertenece al destinatario.
+        # No convertir una factura recibida en emitida tomando ese NIF como emisor.
+        bloque_receptor = re.search(r"(?im)^[ \t]*(?:cliente|destinatario|receptor|facturado a)[ \t]*[:=]", texto)
+        texto_emisor = texto[:bloque_receptor.start()] if bloque_receptor else texto
+        texto_receptor = texto[bloque_receptor.end():] if bloque_receptor else ""
+        nif_etiquetado = (_dato(texto, "nif proveedor", "cif proveedor", "nif del proveedor",
+                               "nif emisor", "cif emisor") or _dato(texto_emisor, "cif", "nif"))
         nif = re.search(patron_nif, nif_etiquetado or "", re.I)
         if not nif:
-            nif = re.search(patron_nif, texto, re.I)
+            nif = re.search(patron_nif, texto_emisor, re.I)
         if nif:
             campos["nif_proveedor"] = nif.group().upper()
         if not campos.get("proveedor"):
@@ -458,7 +463,9 @@ def extraer_local(ruta: Path) -> Extraccion:
             if valor is not None:
                 if campo == "retencion":
                     # Una rectificativa invierte también la retención, aunque se imprima como descuento.
-                    valor = -abs(valor) if campos.get("base", 0) < 0 else abs(valor)
+                    referencia = next((campos.get(k) for k in ('base', 'total', 'iva')
+                                       if campos.get(k) is not None), 0)
+                    valor = -abs(valor) if referencia < 0 else abs(valor)
                 campos[campo] = valor
         for campo, patron in (("tipo_iva", r"\biva\s*\(?\s*(\d{1,2}(?:[.,]\d+)?)\s*%"),
                               ("tipo_retencion", r"\b(?:retencion|irpf)[^\n%]{0,20}?(\d{1,2}(?:[.,]\d+)?)\s*%")):
@@ -468,6 +475,8 @@ def extraer_local(ruta: Path) -> Extraccion:
         texto_campo("receptor", "cliente", "destinatario", "receptor", "facturado a")
         nif_receptor = _dato(texto, "nif cliente", "cif cliente", "nif del cliente", "nif destinatario",
                              "nif receptor")
+        if not nif_receptor and texto_receptor:
+            nif_receptor = _dato(texto_receptor, "cif", "nif")
         m = re.search(patron_nif, nif_receptor or "", re.I)
         if m:
             campos["nif_receptor"] = m.group().upper()
@@ -607,7 +616,7 @@ def _mismo_nif(a, b) -> bool:
     return bool(limpiar(a)) and limpiar(a) == limpiar(b)
 
 
-def factura_residente(cliente: dict, c: dict, texto: str, huella: str) -> tuple[str, dict, str]:
+def factura_residente(cliente: dict, c: dict, texto: str, huella: str, ejercicio: int | None = None) -> tuple[str, dict, str]:
     """(tabla, datos, clave) de una factura de autónomo/pyme. Emitida si el emisor es el propio cliente."""
     nombre = _normal(f"{cliente.get('nombre', '')} {cliente.get('apellidos', '')}".strip())
     emisor = _normal(str(c.get("proveedor") or ""))
@@ -615,6 +624,9 @@ def factura_residente(cliente: dict, c: dict, texto: str, huella: str) -> tuple[
                or (bool(nombre) and nombre in emisor)) and not _mismo_nif(c.get("nif_receptor"), cliente.get("nif"))
     base, iva, total = c.get("base"), c.get("iva"), c.get("total")
     retencion, tipo_iva = c.get("retencion"), c.get("tipo_iva")
+    referencia_signo = next((v for v in (base, total, iva) if v not in (None, '')), 0)
+    if float(referencia_signo) < 0 and retencion not in (None, ''):
+        retencion = -abs(float(retencion))
     if base in (None, "") and total not in (None, ""):
         base = round(float(total) - float(iva or 0) + float(retencion or 0), 2)
     if iva in (None, "") and base not in (None, "") and tipo_iva not in (None, ""):
@@ -624,16 +636,18 @@ def factura_residente(cliente: dict, c: dict, texto: str, huella: str) -> tuple[
     comunes = {"fecha": c.get("fecha"), "numero": c.get("n_factura"), "concepto": c.get("concepto"),
                "base": base, "tipo_iva": tipo_iva, "cuota_iva": iva, "tipo_retencion": c.get("tipo_retencion"),
                "retencion": retencion}
+    fecha = a_fecha(c.get('fecha'))
+    anio_factura = fecha.year if fecha else ejercicio or c.get('ejercicio')
     if emitida:
         datos = {**comunes, "receptor": c.get("receptor"), "nif_receptor": c.get("nif_receptor"),
                  "estado_cobro": "Pendiente"}
         ident = "|".join(str(x or "") for x in (c.get("n_factura"), c.get("nif_receptor")))
-        clave = f"FE|{ident}" if c.get("n_factura") else f"FE|{huella[:16]}"
+        clave = f"FE|{anio_factura}|{ident}" if c.get("n_factura") and anio_factura else f"FE|{huella[:16]}"
         return "facturas_emitidas", datos, clave
     datos = {**comunes, "proveedor": c.get("proveedor"), "nif_proveedor": c.get("nif_proveedor"),
              "categoria": categoria_residente(c, texto), "pct_iva_deducible": 1, "pct_deducible_irpf": 1}
     ident = "|".join(str(x or "") for x in (c.get("nif_proveedor") or c.get("proveedor"), c.get("n_factura")))
-    clave = f"FR|{ident}" if c.get("n_factura") else f"FR|{huella[:16]}"
+    clave = f"FR|{anio_factura}|{ident}" if c.get("n_factura") and anio_factura else f"FR|{huella[:16]}"
     return "facturas_recibidas", datos, clave
 
 
@@ -954,17 +968,37 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
                                                    "direccion": c.get("direccion"), "estado": "En revisión"})
             mensajes.append("Se creó un inmueble mínimo En revisión: completa los datos de adquisición y titularidad.")
         datos = _permitidos("catastro", c)
+        previo_cat = db.get_por_clave("catastro", cid, f"CAT|{inmueble}|{ej}") or {}
+        revision_previa = (not previo_cat.get('revision_pendiente') and
+            any(previo_cat.get(k) not in (None, '') for k in ('anio_revision', 'pct_imputacion')))
         if tipo == TipoDocumento.CATASTRO_IBI and not revision_acreditada(
                 c.get("anio_revision"), ej, ext.evidencias.get("anio_revision"), ext.texto, ext.revision_confirmada):
             datos.pop("anio_revision", None)
-            datos["revision_pendiente"] = 1
-            previo_cat = db.get_por_clave("catastro", cid, f"CAT|{inmueble}|{ej}") or {}
-            notas = str(previo_cat.get("observaciones") or datos.get("observaciones") or "")
-            datos["observaciones"] = notas if PENDIENTE_REVISION in notas else "; ".join(
-                filter(None, [notas, PENDIENTE_REVISION]))
-            mensajes.append(PENDIENTE_REVISION + ". Cálculo provisional; revisa Catastro antes de presentar.")
+            if revision_previa:
+                datos.pop('revision_pendiente', None)
+                mensajes.append('Se conserva la revisión catastral o el porcentaje ya confirmado por el asesor.')
+            else:
+                datos["revision_pendiente"] = 1
+                notas = str(previo_cat.get("observaciones") or datos.get("observaciones") or "")
+                datos["observaciones"] = notas if PENDIENTE_REVISION in notas else "; ".join(
+                    filter(None, [notas, PENDIENTE_REVISION]))
+                mensajes.append(PENDIENTE_REVISION + ". Cálculo provisional; revisa Catastro antes de presentar.")
         datos.update(ejercicio=ej, inmueble=inmueble, ruta=relativo)
-        codigo = db.upsert("catastro", cid, datos, clave=f"CAT|{inmueble}|{ej}")
+        financieros = ('valor_catastral', 'valor_suelo', 'valor_construccion', 'valor_referencia')
+        conflicto = any(previo_cat.get(k) not in (None, '') and datos.get(k) not in (None, '')
+                        and a_num(previo_cat[k]) != a_num(datos[k]) for k in financieros)
+        combinados = [a_num(datos.get(k) if datos.get(k) not in (None, '') else previo_cat.get(k))
+                      for k in financieros[:3]]
+        incoherente = all(v is not None for v in combinados) and abs(combinados[0] - combinados[1] - combinados[2]) > .02
+        if previo_cat and (conflicto or incoherente):
+            codigo = previo_cat['codigo']
+            mensajes.append(f'Catastro {ej}: se conservan los valores existentes; revisa la diferencia con el documento. '
+                            'No se mezclan valoraciones ni se sobrescriben datos confirmados.')
+        else:
+            if incoherente:
+                raise ValueError('El total catastral no coincide con suelo y construcción. Revisa el documento.')
+            protegidos = ('pct_imputacion', 'anio_revision') if revision_previa else ('pct_imputacion',)
+            codigo = db.upsert("catastro", cid, datos, clave=f"CAT|{inmueble}|{ej}", solo_si_vacio=protegidos)
         codigos["catastro"] = codigo
         if tipo == TipoDocumento.CATASTRO_IBI and c.get("ibi_ejercicio") is not None:
             codigos["gasto"] = db.upsert("gastos", cid, {
@@ -1060,18 +1094,20 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
                 if previo and previo.get("importe_cobrado") is not None and previo.get("ruta") != relativo:
                     raise ValueError("Ya hay un cobro para ese periodo con otro soporte. Revisa la diferencia antes de sustituirlo.")
             else:
+                clave = f"DOCFILA|{documento}|{numero}"
                 if datos.get("n_factura"):
                     anteriores = db.con.execute("SELECT * FROM gastos WHERE cliente_id=? AND n_factura=?",
                                                (cid, datos["n_factura"])).fetchall()
                     for anterior in anteriores:
                         previo_gasto = dict(anterior)
+                        if previo_gasto.get("clave") == clave:
+                            continue  # Revisión del mismo documento, no una segunda factura.
                         proveedor = datos.get("nif_proveedor") or datos.get("proveedor")
                         otro_proveedor = previo_gasto.get("nif_proveedor") or previo_gasto.get("proveedor")
                         if (not proveedor or not otro_proveedor or _normal(proveedor) == _normal(otro_proveedor)):
                             raise ValueError("Esa factura ya consta en otro registro. Revisa los soportes antes de duplicarla.")
                 datos["categoria"] = categoria_gasto(datos.get("categoria"))
                 datos.update(origen="documento", incluido_210="Pendiente")
-                clave = f"DOCFILA|{documento}|{numero}"
             if (tabla, clave) in claves_filas:
                 raise ValueError("Hay varios cobros para el mismo mes en este documento. Revisa el desglose antes de guardarlos.")
             claves_filas.add((tabla, clave))
@@ -1169,11 +1205,29 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
                             "cámbialo a Residentes en «Datos del cliente» (su carpeta se moverá de cartera).")
         afectados.add((a_fecha(c.get("fecha_alta")) or date(ej, 1, 1)).year)
     elif tipo == TipoDocumento.FACTURA_GASTO and cartera_de(cliente.get("tipo_cliente")) == RES:
-        tabla, datos, clave = factura_residente(cliente, c, ext.texto, huella)
+        tabla, datos, clave = factura_residente(cliente, c, ext.texto, huella, ej)
         if factura_existente:
             if factura_existente[0] != tabla or not db.get(tabla, cid, factura_existente[1]):
                 raise ValueError("La lectura del PDF no coincide con la clasificación de la factura. Revisa sus datos antes de trasladarla.")
             datos["codigo"] = factura_existente[1]
+        elif c.get('n_factura'):
+            # Compatibilidad 1.0.6: la clave antigua no incluía el ejercicio.
+            # Reutilizarla solo si corresponde al mismo año evita duplicados
+            # al releer y evita sobrescribir otra factura de otro ejercicio.
+            partes = (c.get('n_factura'), c.get('nif_receptor')) if tabla == 'facturas_emitidas' else (
+                c.get('nif_proveedor') or c.get('proveedor'), c.get('n_factura'))
+            clave_anterior = ('FE|' if tabla == 'facturas_emitidas' else 'FR|') + '|'.join(str(v or '') for v in partes)
+            anterior = db.get_por_clave(tabla, cid, clave_anterior)
+            if anterior:
+                fecha_anterior = a_fecha(anterior.get('fecha'))
+                anio_anterior = fecha_anterior.year if fecha_anterior else anterior.get('ejercicio')
+                fecha_nueva = a_fecha(c.get('fecha'))
+                anio_nuevo = fecha_nueva.year if fecha_nueva else ej
+                if not anio_anterior:
+                    raise ValueError('Existe una factura anterior con ese número sin ejercicio. '
+                                     'Confirma su fecha antes de importar otra para evitar sobrescribirla.')
+                if int(anio_anterior) == int(anio_nuevo):
+                    datos['codigo'] = anterior['codigo']
         datos.update(ruta=relativo, origen="pdf")
         codigos["factura"] = db.upsert(tabla, cid, datos, clave=clave, solo_si_vacio=("estado_cobro",))
         fila = db.get(tabla, cid, codigos["factura"]) or {}
@@ -1199,7 +1253,16 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
                 datos["observaciones"] = str(c["concepto"])[:250]
             # Misma factura (proveedor + número) = mismo gasto, aunque el PDF se vuelva a escanear
             id_factura = "|".join(str(c.get(k) or "") for k in ("nif_proveedor", "proveedor", "n_factura")).strip("|")
-            clave = f"FAC|{inmueble}|{id_factura}" if c.get("n_factura") else f"FAC|{inmueble}|{huella[:16]}"
+            clave = f"FAC|{inmueble}|{ej}|{id_factura}" if c.get("n_factura") else f"FAC|{inmueble}|{huella[:16]}"
+            if c.get("n_factura") and not factura_existente:
+                anterior = db.get_por_clave("gastos", cid, f"FAC|{inmueble}|{id_factura}")
+                if anterior:
+                    from tax_calculator import ejercicio_registrado
+                    anio_anterior = ejercicio_registrado(anterior)
+                    if anio_anterior is None:
+                        raise ValueError("Hay una factura antigua con el mismo número sin ejercicio identificable. Revísala antes de sustituirla.")
+                    if anio_anterior == ej:
+                        clave = anterior["clave"]  # Compatibilidad con la clave anterior a 1.0.7.
             codigos["gasto"] = db.upsert("gastos", cid, datos, clave=clave, solo_si_vacio=("incluido_210",))
             afectados.add(ej)
         elif not inmueble:

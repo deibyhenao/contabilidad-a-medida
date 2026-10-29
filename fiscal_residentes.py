@@ -21,6 +21,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Optional
+import hashlib
+import json
+import math
 
 from carteras import TIPO_AUTONOMO, TIPO_PYME
 from database import Database, a_fecha
@@ -33,6 +36,56 @@ PCT_DIFICIL_JUSTIFICACION = 0.05
 PCT_PAGO_130 = 0.20
 CATEGORIA_ALQUILER = "Alquiler local"
 MODELOS_CALCULADOS = ("303", "130", "111", "115")
+
+
+def firma_saldo_303(fila: dict) -> str:
+    """Hechos del justificante; no metadatos de reimportación ni cálculos de otros periodos."""
+    campos = ('cliente_id', 'codigo', 'ejercicio', 'periodo', 'estado', 'resultado', 'a_ingresar',
+              'a_compensar', 'compensacion_anterior', 'nrc', 'fecha_presentacion')
+    datos = {k: fila.get(k) for k in campos}
+    return hashlib.sha256(json.dumps(datos, sort_keys=True, default=str).encode('utf-8')).hexdigest()
+
+
+def minimo_saldo_303(fila: dict) -> float:
+    """El importe negativo del justificante manda; en filas normales se usa resultado."""
+    declarado = _num(fila.get('a_ingresar'))
+    return r2(-declarado if declarado < 0 else max(0.0, -_num(fila.get('resultado'))))
+
+
+def saldo_303(db: Database, cid: int, fila: Optional[dict]) -> dict:
+    """Saldo utilizable, separado del justificante presentado que permanece intacto."""
+    fila = fila or {}
+    requiere = tc._presentado(fila) and (any(_num(fila.get(k)) < 0 for k in ('resultado', 'a_ingresar'))
+                                         or _num(fila.get('a_compensar')) > 0)
+    registrado = max(0.0, _num(fila.get('a_compensar')))
+    if not requiere:
+        return {'requiere': False, 'pendiente': False, 'saldo': registrado, 'destino': 'prevision'}
+    try:
+        dato = json.loads(db.get_config(f"saldo303|{cid}|{fila['codigo']}") or '{}')
+        saldo = dato.get('saldo')
+        destino = dato.get('destino')
+        minimo = minimo_saldo_303(fila)
+        valido = (dato.get('version') == 1 and dato.get('firma') == firma_saldo_303(fila)
+                  and destino in ('compensar', 'devolver') and type(saldo) in (int, float)
+                  and math.isfinite(saldo) and 0 <= saldo <= 1e12
+                  and (destino != 'compensar' or saldo + .005 >= minimo)
+                  and len(str(dato.get('justificacion') or '').strip()) >= 8
+                  and (destino != 'devolver' or (fila.get('periodo') == '4T' and saldo == 0)))
+        if valido:
+            return {'requiere': True, 'pendiente': False, 'saldo': r2(saldo), 'destino': destino,
+                    'justificacion': dato['justificacion'], 'firma': dato['firma']}
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return {'requiere': True, 'pendiente': True, 'saldo': 0.0, 'destino': 'pendiente',
+            'firma': firma_saldo_303(fila)}
+
+
+def pendientes_saldo_303(db: Database, cid: int, ejercicio: int, periodo: str) -> list[dict]:
+    """Solo periodos anteriores: impide presentar una liquidación dependiente de un saldo desconocido."""
+    orden = {p:i for i,p in enumerate(TRIMESTRES)}
+    limite = (int(ejercicio), orden.get(periodo, -1))
+    return [f for f in db.listar('m303', cid) if f.get('ejercicio') and f.get('periodo') in orden
+            and (int(f['ejercicio']), orden[f['periodo']]) < limite and saldo_303(db, cid, f)['pendiente']]
 PLAZOS_PYME = {"202": (("1P", (4, 20)), ("2P", (10, 20)), ("3P", (12, 20))), "200": (("Anual", (7, 25)),)}
 
 
@@ -47,9 +100,8 @@ def fin_trimestre(ejercicio: int, periodo: str) -> date:
     return (date(ejercicio + (mes == 12), 1 if mes == 12 else mes + 1, 1) - timedelta(days=1))
 
 
-def plazo_trimestral(ejercicio: int, periodo: str) -> date:
-    return {"1T": date(ejercicio, 4, 20), "2T": date(ejercicio, 7, 20), "3T": date(ejercicio, 10, 20),
-            "4T": date(ejercicio + 1, 1, 30)}[periodo]
+def plazo_trimestral(ejercicio: int, periodo: str, modelo: str = '303') -> date:
+    return dict(tc.plazos_autonomo(modelo, ejercicio))[periodo]
 
 
 def _num(v) -> float:
@@ -123,7 +175,7 @@ def calcular_303(emitidas: list[dict], recibidas: list[dict], periodo: str,
     if resultado < 0 and periodo == "4T":
         obs.append("4T negativo: elegir compensar en el ejercicio siguiente o solicitar devolución · VERIFICAR")
     return Resultado303(periodo, r2(sum(_num(f.get("base")) for f in em)), devengado,
-                        r2(sum(_num(f.get("base")) for f in re_ if iva_deducible(f) > 0)), deducible,
+                        r2(sum(_num(f.get("base")) for f in re_ if iva_deducible(f) != 0)), deducible,
                         r2(compensacion_anterior), resultado, max(0.0, resultado), max(0.0, r2(-resultado)), obs)
 
 
@@ -142,7 +194,7 @@ class Resultado130:
 
 
 def calcular_130(emitidas: list[dict], recibidas: list[dict], periodo: str, pagos_anteriores: float,
-                 simplificada: bool = True) -> Resultado130:
+                 simplificada: bool = True, ejercicio: Optional[int] = None) -> Resultado130:
     """Acumulado del 1 de enero al fin del trimestre ``periodo``."""
     hasta = TRIMESTRES.index(periodo)
     dentro = lambda f: f.get("trimestre") in TRIMESTRES[:hasta + 1]  # noqa: E731
@@ -150,9 +202,10 @@ def calcular_130(emitidas: list[dict], recibidas: list[dict], periodo: str, pago
     gastos = r2(sum(gasto_irpf(f) for f in recibidas if dentro(f)))
     obs = []
     if simplificada:
-        dificil = r2(min(PCT_DIFICIL_JUSTIFICACION * max(0.0, ingresos - gastos), LIMITE_DIFICIL_JUSTIFICACION))
+        porcentaje = 0.07 if ejercicio == 2023 else PCT_DIFICIL_JUSTIFICACION
+        dificil = r2(min(porcentaje * max(0.0, ingresos - gastos), LIMITE_DIFICIL_JUSTIFICACION))
         if dificil:
-            obs.append(f"Incluye {fmt_eur(dificil)} de gastos de difícil justificación (5 %, máx. 2.000 €)")
+            obs.append(f"Incluye {fmt_eur(dificil)} de gastos de difícil justificación ({porcentaje:.0%}, máx. 2.000 €)")
         gastos = r2(gastos + dificil)
     rendimiento = r2(ingresos - gastos)
     pago = r2(PCT_PAGO_130 * max(0.0, rendimiento))
@@ -243,6 +296,9 @@ def _guardar(db: Database, tabla: str, cid: int, clave: str, datos: dict, estado
                 aviso = "Importe del justificante distinto del calculado · VERIFICAR"
                 datos["observaciones"] = "; ".join(filter(None, (datos.get("observaciones"), aviso)))
             datos[campo] = importe  # La declaración presentada manda, incluido importe cero.
+            if tabla == 'm303' and _num(importe) > 0:
+                # Un justificante a ingresar no acredita un crédito simultáneo.
+                datos['a_compensar'] = 0.0
     codigo = db.upsert(tabla, cid, datos, clave=clave)
     return db.get(tabla, cid, codigo)
 
@@ -298,7 +354,8 @@ def recalcular_residente(db: Database, cid: int, ejercicio: int, hoy: Optional[d
 
     # ---- 303
     previo_4t = db.get_por_clave("m303", cid, f"303|{ejercicio - 1}|4T")
-    compensar = _num((previo_4t or {}).get("a_compensar"))
+    compensar = saldo_303(db, cid, previo_4t)['saldo']
+    pendientes_saldo = pendientes_saldo_303(db, cid, ejercicio, '1T')
     for periodo in TRIMESTRES:
         clave = f"303|{ejercicio}|{periodo}"
         if regimen_iva != "General":
@@ -311,9 +368,19 @@ def recalcular_residente(db: Database, cid: int, ejercicio: int, hoy: Optional[d
             "ejercicio": ejercicio, "periodo": periodo, "base_devengada": r.base_devengada,
             "iva_devengado": r.iva_devengado, "base_deducible": r.base_deducible, "iva_deducible": r.iva_deducible,
             "compensacion_anterior": r.compensacion_anterior, "resultado": r.resultado, "a_ingresar": r.a_ingresar,
-            "a_compensar": r.a_compensar, "observaciones": "; ".join(r.observaciones) or None}, "Pendiente",
+            "a_compensar": r.a_compensar, "observaciones": "; ".join(r.observaciones + (
+                ['PROVISIONAL: hay un saldo 303 anterior pendiente de confirmar por el asesor.']
+                if pendientes_saldo else [])) or None}, "Pendiente",
             justificantes.get(("303", periodo)))
-        compensar = _num(fila.get("a_compensar"))  # una fila presentada manda en la cadena
+        resolucion = saldo_303(db, cid, fila)
+        compensar = resolucion['saldo']
+        if resolucion['pendiente']:
+            pendientes_saldo.append(fila)
+    for fila_pendiente in pendientes_saldo:
+        informe.alertas.append(Alerta('grave', None, '303',
+            f"303 {fila_pendiente['periodo']}/{fila_pendiente['ejercicio']}: confirma con el asesor si el saldo "
+            "se dejó a compensar o se solicitó devolución. Los cálculos posteriores son provisionales; "
+            "no se aplica un crédito desconocido ni se modifica la declaración presentada."))
 
     # ---- 130
     pagos = 0.0
@@ -324,7 +391,7 @@ def recalcular_residente(db: Database, cid: int, ejercicio: int, hoy: Optional[d
                 _guardar(db, "m130", cid, clave, {"observaciones": "Sin pago fraccionado 130 para este cliente "
                                                   f"({tipo}, {regimen_irpf}) · VERIFICAR"}, "No procede")
             continue
-        r = calcular_130(emitidas, recibidas, periodo, pagos, regimen_irpf == "Directa simplificada")
+        r = calcular_130(emitidas, recibidas, periodo, pagos, regimen_irpf == "Directa simplificada", ejercicio)
         fila = _guardar(db, "m130", cid, clave, {
             "ejercicio": ejercicio, "periodo": periodo, "ingresos": r.ingresos, "gastos": r.gastos,
             "rendimiento": r.rendimiento, "pago_20": r.pago_20, "retenciones": r.retenciones,
@@ -344,8 +411,10 @@ def recalcular_residente(db: Database, cid: int, ejercicio: int, hoy: Optional[d
                          "Pendiente", justificantes.get((modelo, periodo)))
             elif db.get_por_clave("m111_115", cid, clave) or (modelo, periodo) in justificantes:
                 justificante = justificantes.get((modelo, periodo))
-                _guardar(db, "m111_115", cid, clave, {"ejercicio": ejercicio, "periodo": periodo, "modelo": modelo,
-                         "perceptores": 0, "base": 0, "retenciones": 0},
+                datos = {"ejercicio": ejercicio, "periodo": periodo, "modelo": modelo}
+                if justificante:
+                    datos.update(perceptores=0, base=0, retenciones=0)
+                _guardar(db, "m111_115", cid, clave, datos,
                          "Pendiente" if justificante else "No procede", justificante)
 
     # ---- resumen por trimestre (con las filas finales, presentadas incluidas)
@@ -359,12 +428,16 @@ def recalcular_residente(db: Database, cid: int, ejercicio: int, hoy: Optional[d
                              r2(sum(cuota_iva(f) for f in em)), r2(sum(iva_deducible(f) for f in rc)),
                              n_emitidas=len(em), n_recibidas=len(rc))
         if periodo in m303 and m303[periodo].get("estado") != "No procede":
-            t.a_ingresar_303 = _num(m303[periodo].get("a_ingresar"))
-            t.a_compensar_303 = _num(m303[periodo].get("a_compensar"))
-        if calcula_130 and periodo in m130:
+            # Un resultado presentado negativo no reduce impuestos a ingresar:
+            # su destino se acredita aparte, sin alterar el justificante.
+            t.a_ingresar_303 = max(0.0, _num(m303[periodo].get("a_ingresar")))
+            t.a_compensar_303 = saldo_303(db, cid, m303[periodo])['saldo']
+        if calcula_130 and periodo in m130 and m130[periodo].get('estado') != 'No procede':
             t.a_ingresar_130 = _num(m130[periodo].get("a_ingresar"))
-        t.retenciones_111 = _num((ret.get((periodo, "111")) or {}).get("retenciones"))
-        t.retenciones_115 = _num((ret.get((periodo, "115")) or {}).get("retenciones"))
+        for modelo in ('111', '115'):
+            fila_ret = ret.get((periodo, modelo)) or {}
+            setattr(t, 'retenciones_' + modelo,
+                    _num(fila_ret.get('retenciones')) if fila_ret.get('estado') != 'No procede' else 0.0)
         informe.trimestres.append(t)
 
     _calendario(db, cid, ejercicio, informe, m303, m130, ret, tipo)
@@ -378,19 +451,24 @@ def _calendario(db: Database, cid: int, ejercicio: int, informe: InformeResident
     presentados = {(m["modelo"], m.get("periodo")): m for m in db.listar("modelos_presentados", cid,
                                                                           ejercicio=ejercicio)}
     for periodo in TRIMESTRES:
-        limite = plazo_trimestral(ejercicio, periodo)
         filas = [("303", "303 IVA", m303.get(periodo)), ("130", "130 IRPF", m130.get(periodo)),
                  ("111", "111 Retenciones", ret.get((periodo, "111"))),
                  ("115", "115 Alquileres", ret.get((periodo, "115")))]
         for modelo, tipo_ob, fila in filas:
             if not fila:
                 continue
+            limite = dict(tc.plazos_autonomo(modelo, ejercicio))[periodo]
             estado = fila.get("estado") or "Pendiente"
             importe = fila.get("a_ingresar") if modelo in ("303", "130") else fila.get("retenciones")
+            pagado = tc.pago_inferido_por_nrc({'estado': estado, 'cuota': importe, 'nrc': fila.get('nrc')})
+            notas = f"Modelo {modelo} {periodo}: {fmt_eur(_num(importe))}"
+            if pagado is not None:
+                notas = tc._anadir_nota_nrc(notas)
+            elif estado == 'Presentado':
+                notas += ' · Presentación acreditada; pago no confirmado automáticamente.'
             tc._obligacion(db, cid, ejercicio, tipo_ob, None, f"OBL|{modelo}|{ejercicio}|{periodo}", limite,
-                           fila["codigo"], estado, f"Modelo {modelo} {periodo}: {fmt_eur(_num(importe))}",
-                           fila.get("a_ingresar") if estado == "Presentado" and modelo in ("303", "130") else None,
-                           fila.get("fecha_presentacion"))
+                           fila["codigo"], estado, notas, pagado, fila.get("fecha_presentacion"),
+                           completar_pago_vacio=pagado is not None)
             if estado == "No procede":
                 continue
             informe.estados.append(f"Modelo {modelo} {periodo}/{ejercicio}: " + (
@@ -399,7 +477,7 @@ def _calendario(db: Database, cid: int, ejercicio: int, informe: InformeResident
     modelos = _modelos_actividad(informe.actividad, tipo, informe.regimen_iva, informe.calcula_130)
     claves_aut = set()
     for modelo in sorted(m for m in modelos if m not in MODELOS_CALCULADOS):
-        plazos = ([(p, date(ejercicio + (modelo == "200"), mes, dia)) for p, (mes, dia) in PLAZOS_PYME[modelo]]
+        plazos = ([(p, tc.siguiente_habil(date(ejercicio + (modelo == "200"), mes, dia))) for p, (mes, dia) in PLAZOS_PYME[modelo]]
                   if modelo in PLAZOS_PYME else tc.plazos_autonomo(modelo, ejercicio))
         for periodo, limite in plazos:
             p = presentados.get((modelo, periodo))
@@ -407,8 +485,9 @@ def _calendario(db: Database, cid: int, ejercicio: int, informe: InformeResident
             clave_aut = f"AUT|{modelo}|{ejercicio}|{periodo}"
             claves_aut.add(clave_aut)
             tc._obligacion(db, cid, ejercicio, "Otra", None, clave_aut, limite,
-                           p["codigo"] if p else None, estado, f"Modelo {modelo} {periodo}",
-                           p.get("importe") if p else None, p.get("fecha_presentacion") if p else None)
+                           p["codigo"] if p else None, estado, f"Modelo {modelo} {periodo}" +
+                           (' · Presentación acreditada; el pago se registra con su justificante.' if p else ''),
+                           None, p.get("fecha_presentacion") if p else None)
             informe.estados.append(f"Modelo {modelo} {periodo}/{ejercicio}: "
                                    + ("PRESENTADO [OK]" if p else f"pendiente (límite {limite:%d/%m/%Y})"))
     for ob in db.listar("obligaciones", cid, ejercicio=ejercicio):

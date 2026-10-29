@@ -503,11 +503,11 @@ def test_caso_12_proteccion_presentado_y_avisos_revisar(expediente_ag):
     # 2026 ya tenía un cálculo anual: la preferencia general no lo sustituye.
     assert {r["periodo"] for r in db.listar("m210_alquiler", cid, ejercicio=2026)
             if r["estado"] != "No procede"} == {"Anual"}
-    # Una elección expresa para este inmueble y ejercicio sí permite cambiarlo.
+    # Una preferencia heredada no habilita agrupación trimestral desde 2024.
     db.set_config(f"periodicidad_210|{cid}|{inm}|2026", "Trimestral")
     tax.recalcular_cliente(db, cid, 2026)
     assert {r["periodo"] for r in db.listar("m210_alquiler", cid, ejercicio=2026)
-            if r["estado"] != "No procede"} == {"1T", "2T", "3T", "4T"}
+            if r["estado"] != "No procede"} == {"Anual"}
     assert db.get("m210_alquiler", cid, fila_25["codigo"]) == congelada
 
 

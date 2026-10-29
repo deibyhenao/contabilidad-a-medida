@@ -83,7 +83,7 @@ def test_gananciales_forzado():
 
 def test_pct_imputacion():
     assert tc.pct_imputacion(2018, 2026) == 0.011
-    assert tc.pct_imputacion(2015, 2026) == 0.02
+    assert tc.pct_imputacion(2015, 2026) == 0.011  # DA 55: revisión colectiva desde 2012, 2023–2026.
     assert tc.pct_imputacion(None, 2026) == 0.02
     assert tc.pct_imputacion(2015, 2026, manual=0.011) == 0.011
 
@@ -149,13 +149,13 @@ def test_recalcular_cliente_pepito(db, pepito):
     inf = tc.recalcular_cliente(db, cid, 2026)
     assert "Tiene 1 piso," in inf.mensaje_patrimonio and "NO está obligado" in inf.mensaje_patrimonio
     assert inf.patrimonio.valor_bienes == 90_000  # 180.000 × 50 %
-    assert len(inf.filas_210_alquiler) == 2      # 1T y 2T
+    assert len(inf.filas_210_alquiler) == 1      # agrupación anual; ocupación solo 1T y 2T
     imp = db.get("m210_imputacion", cid, inf.filas_210_imputacion[0])
     assert imp["dias"] == 184 and imp["estado"] == "Pendiente"
     assert any("FALTA por presentar 210 Imputación" in e for e in inf.estados)
     # idempotente: segunda pasada no duplica
     tc.recalcular_cliente(db, cid, 2026)
-    assert len(db.listar("m210_alquiler", cid)) == 2 and len(db.listar("m210_imputacion", cid)) == 1
+    assert len(db.listar("m210_alquiler", cid)) == 1 and len(db.listar("m210_imputacion", cid)) == 1
 
 
 def test_presentado_no_se_recalcula(db, pepito):

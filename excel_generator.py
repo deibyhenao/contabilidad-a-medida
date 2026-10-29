@@ -27,6 +27,7 @@ from gastos import ejercicio_registrado, fraccion
 from rutas_seguras import sanitize_safe_path
 
 FIRMA_NO_ESPECIFICADA = object()
+REVISION_FORMATO = "1.0.7-fiscal-20261029"
 
 
 def _formula_imputacion_redondeada(formula):
@@ -36,7 +37,10 @@ def _formula_imputacion_redondeada(formula):
     original = re.fullmatch(r'=IF\((A\d+)="","",(.+)\)', formula)
     if not original:
         return None
-    return f'=IF({original[1]}="","",ROUND({original[2]},2))'
+    expresion = original[2]
+    # Conserva los días naturales de D; limita únicamente la proporción anual.
+    expresion = re.sub(r'\b(D\d+)/365\b', r'MIN(\1,365)/365', expresion)
+    return f'=IF({original[1]}="","",ROUND({expresion},2))'
 
 class ExcelBloqueadoError(Exception):
     """El libro anterior se conserva; la nueva versión queda pendiente."""
@@ -305,10 +309,11 @@ def necesita_actualizar_formato(db: Database, cliente_id: int) -> bool:
         return False
     return (not db.ruta_excel(cliente).exists()
             or db.get_config(f'excel_version|{cliente_id}') != VERSION
+            or db.get_config(f'excel_revision|{cliente_id}') != REVISION_FORMATO
             or bool(db.get_config(f'excel_pendiente|{cliente_id}')))
 
 
-def _resumen_gastos(ws, inmuebles, limite: int = 3000) -> None:
+def _resumen_gastos(ws, inmuebles, limite: int = 3000, *, sin_asignar: bool = False) -> None:
     """Añade el desglose en celdas vacías; las fórmulas siguen el ejercicio E4."""
     categorias = database.CATEGORIAS_GASTO
     fila_total = 31 + len(categorias)
@@ -328,7 +333,7 @@ def _resumen_gastos(ws, inmuebles, limite: int = 3000) -> None:
     ws.row_dimensions[29].height = ws.row_dimensions[18].height
     ws.row_dimensions[30].height = 45
     ws["A30"], ws["B30"] = "Categoría", "Total"
-    resto = len(inmuebles) > 6
+    resto = len(inmuebles) > 6 or sin_asignar
     visibles = inmuebles[:5 if resto else 6]
     for col, inmueble in enumerate(visibles, 3):
         direccion = " ".join(str(inmueble.get("direccion") or "").split())[:36]
@@ -544,7 +549,9 @@ def exportar_cliente(db: Database, cliente_id: int, ejercicio: int, destino: Pat
     canonico = destino.resolve() == db.ruta_excel(cliente).resolve()
     if firma_esperada is FIRMA_NO_ESPECIFICADA or not canonico:
         firma_esperada = _firma_excel(destino) if destino.exists() else None
-    guardar_version = canonico and db.get_config(f'excel_version|{cliente_id}') != VERSION
+    guardar_version = canonico and (
+        db.get_config(f'excel_version|{cliente_id}') != VERSION
+        or db.get_config(f'excel_revision|{cliente_id}') != REVISION_FORMATO)
     if canonico:
         db.set_config(f"excel_pendiente|{cliente_id}", "1")
     wb = openpyxl.load_workbook(database.PLANTILLAS[cartera])
@@ -554,6 +561,10 @@ def exportar_cliente(db: Database, cliente_id: int, ejercicio: int, destino: Pat
             nombre = tabla.nombre
             ws = wb[hoja]
             limite = ws.max_row
+            # Guardar la fórmula de plantilla antes de que una primera fila
+            # presentada la sustituya por un importe fijo.
+            formulas_imputacion = ({letra: ws[f"{letra}{tabla.fila_inicio}"].value for letra in ("H", "J")}
+                                   if nombre == "m210_imputacion" else {})
             for fila, datos in enumerate(db.iterar(nombre, cliente_id, incluir_retirados=True), tabla.fila_inicio):
                 if nombre in MANUALES_EXCEL:
                     firmas_filas[nombre][datos['codigo']] = _firma_fila_manual(nombre, datos)
@@ -563,6 +574,9 @@ def exportar_cliente(db: Database, cliente_id: int, ejercicio: int, destino: Pat
                     if gestion and gestion["en_papelera"]:
                         datos = {**datos, "estado": "En papelera", "ruta": gestion["ruta_papelera"]}
                 _ampliar_fila(ws, fila, tabla, limite)
+                if nombre == 'm303':
+                    import fiscal_residentes as fr
+                    decision_303 = fr.saldo_303(db, cliente_id, datos)
                 for col in _columnas(tabla):
                     celda = ws[f"{col.letra}{fila}"]
                     valor = datos.get(col.campo)
@@ -576,6 +590,23 @@ def exportar_cliente(db: Database, cliente_id: int, ejercicio: int, destino: Pat
                         celda.value = _valor_excel(col, valor)
                         if isinstance(celda.value, str):
                             celda.data_type = "s"
+                    if nombre == 'm303' and col.campo == 'a_compensar' and decision_303['requiere']:
+                        mensaje = ('PENDIENTE DE CONFIRMAR POR EL ASESOR. Este importe histórico no se aplica '
+                                   'a los periodos siguientes; sus cálculos son provisionales.'
+                                   if decision_303['pendiente'] else
+                                   f"Destino confirmado: {decision_303['destino']}. Saldo aplicado en los cálculos posteriores: "
+                                   f"{decision_303['saldo']:.2f} euros. {decision_303.get('justificacion', '')}")
+                        celda.comment = Comment(mensaje + ' Se conserva aquí el dato histórico presentado.', 'Contabilidad a Medida')
+                    if nombre == 'm303' and col.campo == 'a_ingresar' and valor is not None and float(valor) < 0:
+                        # El resumen suma esta columna como deuda, no como resultado
+                        # de liquidación. No restar devoluciones de otros impuestos.
+                        celda.value = 0
+                        celda.comment = Comment(
+                            f'Resultado negativo del justificante conservado en la base de datos: {float(valor):.2f} euros. '
+                            'A ingresar se muestra como cero porque no es una deuda negativa. '
+                            'El destino y saldo para periodos posteriores requieren confirmación del asesor; '
+                            'consulta el comentario de a compensar. No se modifica el justificante presentado.',
+                            'Contabilidad a Medida')
                 if nombre == "m210_imputacion" and datos.get("estado") == "Presentado":
                     # Congelada: renta y cuota son las del justificante (la fórmula usaría los datos de la app)
                     for formula, campo in (("renta_imputada_formula", "renta_imputada"), ("cuota_formula", "cuota")):
@@ -591,12 +622,17 @@ def exportar_cliente(db: Database, cliente_id: int, ejercicio: int, destino: Pat
                         col = next((c for c in tabla.columnas_excel if c.campo == campo), None)
                         if col:
                             celda = ws[f"{col.letra}{fila}"]
-                            formula = _formula_imputacion_redondeada(celda.value)
+                            modelo = formulas_imputacion.get(col.letra)
+                            origen = f"{col.letra}{tabla.fila_inicio}"
+                            formula = _formula_imputacion_redondeada(
+                                Translator(modelo, origin=origen).translate_formula(celda.coordinate)
+                                if isinstance(modelo, str) and modelo.startswith("=") else celda.value)
                             if formula:
                                 celda.value = formula
                                 celda.comment = Comment(
                                     "Importe no presentado: se redondea a dos decimales, igual que en la aplicación. "
-                                    "La cuota se calcula sobre la renta imputada ya redondeada.",
+                                    "La cuota se calcula sobre la renta imputada ya redondeada. "
+                                    "La proporción no supera el año completo; D conserva los días naturales.",
                                     "Contabilidad a Medida")
         resumen = {
             **cliente,
@@ -612,7 +648,12 @@ def exportar_cliente(db: Database, cliente_id: int, ejercicio: int, destino: Pat
                 ws[coordenada].data_type = "s"
         ws[celdas["carpeta"]].hyperlink = Path(cliente["carpeta"]).resolve().as_uri()
         if cartera == NR:  # el desglose dinámico por inmueble solo existe en la plantilla de no residentes
-            _resumen_gastos(ws, db.listar("inmuebles", cliente_id), max(3000, wb["08_GASTOS"].max_row))
+            sin_asignar = db.con.execute(
+                "SELECT 1 FROM gastos g WHERE g.cliente_id=? AND NOT EXISTS "
+                "(SELECT 1 FROM inmuebles i WHERE i.cliente_id=g.cliente_id AND i.codigo=g.inmueble) LIMIT 1",
+                (cliente_id,)).fetchone() is not None
+            _resumen_gastos(ws, db.listar("inmuebles", cliente_id), max(3000, wb["08_GASTOS"].max_row),
+                            sin_asignar=sin_asignar)
             _resumen_valores(wb, db, cliente_id, ejercicio)
             _aclaraciones_resumen(wb, db, cliente_id, ejercicio)
         if wb.calculation is None:
@@ -625,6 +666,7 @@ def exportar_cliente(db: Database, cliente_id: int, ejercicio: int, destino: Pat
             with db.transaccion():
                 db.set_config(f"excel_firma|{cliente_id}", _firma_excel(destino))
                 db.set_config(f"excel_version|{cliente_id}", VERSION)
+                db.set_config(f"excel_revision|{cliente_id}", REVISION_FORMATO)
                 db.set_config(f"excel_nombre|{cliente_id}", destino.name)
                 db.set_config(f"excel_filas|{cliente_id}", json.dumps(firmas_filas, ensure_ascii=False))
                 db.set_config(f"excel_resumen|{cliente_id}", json.dumps({c: cliente.get(c) for c in
@@ -754,6 +796,29 @@ def import_excel_to_db(db: Database, cliente_id: int, ruta: Path | None = None) 
                                 for campo in ('fecha_fin_prevista', 'fecha_fin_real')):
                             raise ValueError(f'{hoja}, fila {fila}: la fecha de fin del contrato '
                                              'no puede ser anterior al inicio. No se ha importado el libro.')
+                    if nombre in ('m303', 'obligaciones') and datos.get('estado') == 'Presentado':
+                        import fiscal_residentes as fr
+                        modelo_303 = (datos if nombre == 'm303' else
+                            db.get('m303', cliente_id, datos.get('id_modelo') or (previo or {}).get('id_modelo') or ''))
+                        if modelo_303 and fr.pendientes_saldo_303(db, cliente_id,
+                                int(modelo_303.get('ejercicio') or (previo or {}).get('ejercicio')),
+                                modelo_303.get('periodo') or (previo or {}).get('periodo')):
+                            raise ValueError(f'{hoja}, fila {fila}: confirma en la app el destino de los saldos 303 anteriores. '
+                                             'No se ha importado el libro ni presentado nada.')
+                    if (nombre == 'obligaciones' and previo
+                            and str(previo.get('clave') or '').startswith('VENTA|')
+                            and datos.get('estado') == 'Presentado'):
+                        from tax_calculator import amortizacion_venta_confirmada
+                        if amortizacion_venta_confirmada(db, cliente_id, previo.get('inmueble')) is None:
+                            raise ValueError(f'{hoja}, fila {fila}: confirma primero en la app la amortización '
+                                             'acumulada acreditada de la venta. El libro no se ha importado.')
+                    if ((nombre == 'm210_imputacion' or
+                         (nombre == 'obligaciones' and
+                          (datos.get('tipo') or (previo or {}).get('tipo')) == '210 Imputación'))
+                            and datos.get('estado') == 'Presentado'
+                            and int(datos.get('ejercicio') or (previo or {}).get('ejercicio') or 0) >= 2027):
+                        raise ValueError(f'{hoja}, fila {fila}: la previsión desde 2027 requiere validar '
+                                         'la nueva normativa antes de presentarse desde este cálculo.')
                     if pendiente:
                         _comprobar_datos_pendientes(db, cliente_id, nombre, columnas, datos, previo, hoja, fila, ruta)
                     nuevo = db.upsert(nombre, cliente_id, datos, respetar_manuales=False)

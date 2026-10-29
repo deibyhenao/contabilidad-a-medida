@@ -27,7 +27,7 @@ def expediente(tmp_path, monkeypatch):
         'fecha_fin_prevista': '2027-12-31', 'fecha_fin_real': '2025-12-31', 'renta_inicial': 1000,
         'periodicidad': 'Mensual', 'tipo': 'Vivienda', 'estado': 'Vigente'})
     c.sincronizar(cid, 2025)
-    c.establecer_periodicidad_210(cid, inm, 2025, 'Trimestral')
+    c.establecer_periodicidad_210(cid, inm, 2025, 'Anual')
     try:
         yield c, cid, inm, ctr
     finally:
@@ -45,7 +45,9 @@ def test_fin_real_prevalece_y_actualiza_excel_en_el_mismo_guardado(
     salida = c.editar(cid, 'contratos', ctr, {'fecha_fin_real': fin}, 2025)
     assert not salida.get('error_excel')
     modelos = [f for f in c.db.listar('m210_alquiler', cid, ejercicio=2025) if f['estado'] != 'No procede']
-    assert len(modelos) == periodos
+    assert len(modelos) == 1 and modelos[0]['periodo'] == 'Anual'
+    vista = c.vista_inmuebles(cid, 2025)[0]
+    assert len([p for p in vista['_ocupacion_trimestral'] if p['dias_alquilado']]) == periodos
     assert round(sum(f['cuota'] for f in modelos), 2) == cuota
     assert c.db.listar('m210_imputacion', cid, ejercicio=2025)[0]['cuota'] == imputacion
     wb = openpyxl.load_workbook(salida['excel'])
@@ -55,7 +57,7 @@ def test_fin_real_prevalece_y_actualiza_excel_en_el_mismo_guardado(
         assert [ws.cell(fila, col).value for col in (3, 4, 5, 6)] == [365, dias, 365 - dias, ingresos]
         letra = next(col.letra for col in database.TABLAS['contratos'].columnas_excel if col.campo == 'fecha_fin_real')
         assert str(wb['04_CONTRATOS'][letra + '2'].value).startswith(fin)
-        assert wb['10_210_IMPUTACION']['H2'].value == '=IF(A2="","",ROUND(E2*F2*G2*D2/365,2))'
+        assert wb['10_210_IMPUTACION']['H2'].value == '=IF(A2="","",ROUND(E2*F2*G2*MIN(D2,365)/365,2))'
         assert wb['10_210_IMPUTACION']['J2'].value == '=IF(A2="","",ROUND(H2*I2,2))'
     finally:
         wb.close()
@@ -87,7 +89,9 @@ def test_recortar_alquiler_conserva_cobro_manual_posterior(expediente):
     assert actual['importe_cobrado'] == 200 and actual['importe_contractual'] == 0
     assert actual['fecha_cobro'] == '2025-07-15'
     activos = [f['periodo'] for f in c.db.listar('m210_alquiler', cid, ejercicio=2025) if f['estado'] != 'No procede']
-    assert set(activos) == {'1T', '2T'}
+    assert set(activos) == {'Anual'}
+    assert [p['periodo'] for p in c.vista_inmuebles(cid, 2025)[0]['_ocupacion_trimestral']
+            if p['dias_alquilado']] == ['1T', '2T']
     assert not salida.get('error_excel')
 
 

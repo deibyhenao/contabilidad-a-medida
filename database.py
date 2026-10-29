@@ -385,7 +385,19 @@ def a_iso(valor: Any) -> Optional[str]:
     s = str(valor).strip()
     for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%Y/%m/%d"):
         try:
-            return datetime.strptime(s[:10], fmt).date().isoformat()
+            return datetime.strptime(s, fmt).date().isoformat()
+        except ValueError:
+            continue
+    # Admitir marcas de tiempo válidas sin aceptar sufijos arbitrarios ni horas
+    # corruptas que el antiguo recorte a diez caracteres ocultaba.
+    try:
+        return datetime.fromisoformat(s[:-1] + "+00:00" if s.endswith("Z") else s).date().isoformat()
+    except ValueError:
+        pass
+    for fmt in (fecha + ' ' + hora for fecha in ('%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y', '%d.%m.%Y', '%Y/%m/%d')
+                for hora in ('%H:%M', '%H:%M:%S')):
+        try:
+            return datetime.strptime(s, fmt).date().isoformat()
         except ValueError:
             continue
     raise ValueError(f"Fecha no reconocida: {valor!r}")
@@ -409,10 +421,20 @@ def a_num(valor: Any) -> Optional[float]:
         s = s.replace(".", "").replace(",", ".")
     elif "," in s:
         s = s.replace(",", ".")
-    elif re.fullmatch(r"[-+]?[1-9]\d{0,2}(?:\.\d{3})+", s):
+    elif not pct and re.fullmatch(r"[-+]?[1-9]\d{0,2}(?:\.\d{3})+", s):
         s = s.replace(".", "")
     n = float(s)
     return n / 100 if pct else n
+
+
+def a_euros(valor: Any) -> Optional[float]:
+    """Importe monetario explícito: nunca interpreta un porcentaje ni un booleano."""
+    if isinstance(valor, bool) or isinstance(valor, str) and valor.strip().endswith('%'):
+        raise ValueError('Introduce un importe en euros, no un porcentaje ni un valor lógico.')
+    numero = a_num(valor)
+    if numero is not None:
+        decimal_finito(numero)
+    return numero
 
 
 def _normalizar(col: Columna, valor: Any) -> Any:
@@ -421,6 +443,10 @@ def _normalizar(col: Columna, valor: Any) -> Any:
     if col.tipo == "date":
         return a_iso(valor)
     if col.tipo in ("eur", "pct"):
+        if isinstance(valor, bool):
+            raise ValueError("Un importe o porcentaje no puede ser un valor lógico.")
+        if col.tipo == "eur" and isinstance(valor, str) and valor.strip().endswith("%"):
+            raise ValueError("Introduce un importe en euros, no un porcentaje.")
         n = a_num(valor)
         decimal_finito(n)
         if col.tipo == "pct":
@@ -824,10 +850,12 @@ class Database:
         cols = ["nombre", "apellidos", "nif", "carpeta", "creado", "cartera", *extra]
         vals = [nombre.strip(), apellidos.strip(), nif, str(carpeta), datetime.now().isoformat(timespec="seconds"),
                 cartera, *extra.values()]
-        cur = self.con.execute(f"INSERT INTO clientes({','.join(cols)}) VALUES({','.join('?' * len(cols))})", vals)
-        self._confirmar()
-        cliente = self.get_cliente(cur.lastrowid)
-        self.asegurar_carpetas(cliente)
+        # Si Windows rechaza una ruta o sus permisos, no dejar un alta parcial
+        # confirmada en BD que después parezca un expediente desaparecido.
+        with self.transaccion():
+            cur = self.con.execute(f"INSERT INTO clientes({','.join(cols)}) VALUES({','.join('?' * len(cols))})", vals)
+            cliente = self.get_cliente(cur.lastrowid)
+            self.asegurar_carpetas(cliente)
         return cliente
 
     def asegurar_carpetas(self, cliente: dict) -> None:
@@ -1129,8 +1157,10 @@ class Database:
     def borrar(self, tabla: str, cliente_id: int, codigo: str) -> None:
         self._tabla(tabla)
         if tabla == "inmuebles":
-            prefijo = f"periodicidad_210|{cliente_id}|{codigo}|"
-            self.con.execute("DELETE FROM config WHERE substr(clave,1,?)=?", (len(prefijo), prefijo))
+            self.con.execute("DELETE FROM config WHERE clave=?", (f"amortizacion_venta|{cliente_id}|{codigo}",))
+            for marca in ("periodicidad_210", "conciliacion_210", "revision_calendario_210"):
+                prefijo = f"{marca}|{cliente_id}|{codigo}|"
+                self.con.execute("DELETE FROM config WHERE substr(clave,1,?)=?", (len(prefijo), prefijo))
         self.con.execute(f"DELETE FROM {tabla} WHERE cliente_id=? AND codigo=?", (cliente_id, codigo))
         self._confirmar()
 

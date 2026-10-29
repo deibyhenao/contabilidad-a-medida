@@ -356,4 +356,4 @@ def test_presentado_no_admite_cambio_silencioso_de_periodicidad(expediente):
     assert db.get_config("periodicidad_210_alquiler") == "Trimestral"
     assert {r["periodo"] for r in db.listar("m210_alquiler", cid, ejercicio=2025)} == {"Anual"}
     assert {r["periodo"] for r in db.listar("m210_alquiler", cid, ejercicio=2026)
-            if r["estado"] != "No procede"} == {"1T", "2T", "3T", "4T"}
+            if r["estado"] != "No procede"} == {"Anual"}

@@ -185,8 +185,9 @@ def test_periodicidad_por_inmueble_y_ejercicio_sin_falsos_pendientes(expediente)
     c.editar(cid, 'contratos', None, datos, 2025)
     modelos = c.db.listar('m210_alquiler', cid, inmueble=inm, ejercicio=2025)
     assert [m['periodo'] for m in modelos] == ['Anual']
-    c.establecer_periodicidad_210(cid, inm, 2025, 'Trimestral')
-    assert tc.periodicidad_210_alquiler(c.db, cid, inm, 2025) == 'Trimestral'
+    with pytest.raises(ValueError, match='agrupación'):
+        c.establecer_periodicidad_210(cid, inm, 2025, 'Trimestral')
+    assert tc.periodicidad_210_alquiler(c.db, cid, inm, 2025) == 'Anual'
     assert tc.periodicidad_210_alquiler(c.db, cid, inm, 2026) == 'Anual'
     c.establecer_periodicidad_210(cid, inm, 2025, 'Anual')
     trimestrales = [m for m in c.db.listar('m210_alquiler', cid, ejercicio=2025) if m['periodo'] != 'Anual']
@@ -197,7 +198,7 @@ def test_periodicidad_por_inmueble_y_ejercicio_sin_falsos_pendientes(expediente)
     c.db.upsert('m210_alquiler', cid, {'codigo': anual['codigo'], 'estado': 'Presentado', 'cuota': 777})
     # Reflejar la presentación en Excel antes de otra acción que importa sus ediciones.
     c.commit_and_sync_excel(cid, 2025)
-    with pytest.raises(ValueError, match='presentado'):
+    with pytest.raises(ValueError, match='agrupación'):
         c.establecer_periodicidad_210(cid, inm, 2025, 'Trimestral')
     assert c.db.get('m210_alquiler', cid, anual['codigo'])['cuota'] == 777
 
@@ -229,7 +230,7 @@ def test_borrador_manual_conserva_calendario_y_exige_revision_antes_de_cambiar(e
     c, cid, inm = expediente
     c.db.upsert('m210_alquiler', cid, {'ejercicio': 2025, 'inmueble': inm, 'periodo': '1T',
                                      'estado': 'En preparación', 'cuota': 123})
-    assert tc.periodicidad_210_alquiler(c.db, cid, inm, 2025) == 'Trimestral'
+    assert tc.periodicidad_210_alquiler(c.db, cid, inm, 2025) == 'Anual'
     with pytest.raises(ValueError, match='preparación'):
         c.establecer_periodicidad_210(cid, inm, 2025, 'Anual')
     assert c.db.listar('m210_alquiler', cid)[0]['cuota'] == 123
@@ -285,9 +286,10 @@ def test_periodicidad_publica_desglose_confirmado_antes_de_exportar_excel(expedi
 
     def al_recalcular(resultado):
         assert c.db._nivel_transaccion == 0
-        assert c.lector.get_config(f'periodicidad_210|{cid}|{inm}|2025') == 'Trimestral'
+        assert c.lector.get_config(f'periodicidad_210|{cid}|{inm}|2025') == 'Anual'
         vista = c.vista_inmuebles(cid, 2025)[0]
-        assert {f['periodo'] for f in vista['_desglose_210']} == {'3T', '4T'}
+        assert {f['periodo'] for f in vista['_desglose_210']} == {'Anual'}
+        assert [p['ingresos_devengados'] for p in vista['_ocupacion_trimestral']] == [0, 0, 1000, 3000]
         assert all(f['estado'] != 'No procede' for f in vista['_desglose_210'])
         assert sum(f['ingresos'] for f in vista['_desglose_210']) == 4000
         assert resultado['informe']
@@ -299,7 +301,7 @@ def test_periodicidad_publica_desglose_confirmado_antes_de_exportar_excel(expedi
         return exportar(*args)
 
     monkeypatch.setattr(c, '_exportar_informe', guardar)
-    resultado = c.establecer_periodicidad_210(cid, inm, 2025, 'Trimestral', al_recalcular=al_recalcular)
+    resultado = c.establecer_periodicidad_210(cid, inm, 2025, 'Anual', al_recalcular=al_recalcular)
     assert pasos == ['calculo', 'excel'] and not resultado.get('error_excel')
 
 
@@ -314,7 +316,7 @@ def test_fallo_de_notificacion_visual_no_impide_guardar_excel(expediente, monkey
     def notificacion_fallida(_resultado):
         raise RuntimeError('fallo ficticio de UI')
     monkeypatch.setattr(c, '_exportar_informe', guardar)
-    resultado = c.establecer_periodicidad_210(cid, inm, 2025, 'Trimestral', al_recalcular=notificacion_fallida)
+    resultado = c.establecer_periodicidad_210(cid, inm, 2025, 'Anual', al_recalcular=notificacion_fallida)
     assert exportado == [True] and not resultado.get('error_excel')
 
 
@@ -330,14 +332,14 @@ def test_vista_no_espera_al_lock_del_exportador_para_mostrar_nuevo_desglose(expe
         return exportar(*args)
     monkeypatch.setattr(c, '_exportar_informe', exportacion_lenta)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        guardar = pool.submit(c.establecer_periodicidad_210, cid, inm, 2025, 'Trimestral',
+        guardar = pool.submit(c.establecer_periodicidad_210, cid, inm, 2025, 'Anual',
                               lambda _res: calculado.set())
         try:
             assert calculado.wait(5)
             leer = pool.submit(c.vista_inmuebles, cid, 2025)
             vista = leer.result(timeout=3)[0]
-            assert vista['_periodicidad_210'] == 'Trimestral'
-            assert {m['periodo'] for m in vista['_desglose_210']} == {'3T', '4T'}
+            assert vista['_periodicidad_210'] == 'Anual'
+            assert {m['periodo'] for m in vista['_desglose_210']} == {'Anual'}
             assert not guardar.done()  # los datos se leen mientras el worker sigue guardando
         finally:
             continuar.set()
@@ -351,8 +353,8 @@ def test_error_exportando_conserva_informe_del_calculo_ya_confirmado(expediente,
         raise PermissionError('fallo ficticio')
     monkeypatch.setattr(c, '_exportar_informe', fallar_exportacion)
     with pytest.raises(CalculoConfirmadoSinExcel) as error:
-        c.establecer_periodicidad_210(cid, inm, 2025, 'Trimestral')
+        c.establecer_periodicidad_210(cid, inm, 2025, 'Anual')
     assert (error.value.cliente_id, error.value.ejercicio) == (cid, 2025)
     assert error.value.resultado['informe']
-    assert c.lector.get_config(f'periodicidad_210|{cid}|{inm}|2025') == 'Trimestral'
+    assert c.lector.get_config(f'periodicidad_210|{cid}|{inm}|2025') == 'Anual'
     assert 'fallo ficticio' not in str(error.value)

@@ -105,7 +105,9 @@ def _selector(tarjeta):
 
 def test_periodicidad_trimestral_se_guarda_en_worker_con_contexto_capturado(app):
     selector = _selector(app._tarjeta_inmueble(_vista(_periodicidad_210="Anual")))
-    assert selector.selected_index == 0 and not selector.disabled
+    assert selector.selected_index == 0 and selector.disabled
+    # El cambio trimestral ya no se ofrece. Se invoca el callback heredado
+    # directamente para conservar la prueba de captura del contexto del worker.
     selector.selected_index = 1
     selector.on_change(NS(control=selector))
     app.ctrl.establecer_periodicidad_210.assert_called_once_with(7, "INM-001", 2025, "Trimestral",
@@ -202,12 +204,12 @@ def test_callback_pinta_calculo_antes_del_excel_y_mantiene_turno():
     durante = _selector(visto["tarjeta"])
     assert durante.disabled and durante.selected_index == 1 and "Guardando Excel…" in textos(visto["tarjeta"])
     assert all(f"{i}T" in textos(visto["tarjeta"]) for i in range(1, 5))
-    assert visto["otro"].selected_index == 0 and not visto["otro"].disabled
+    assert visto["otro"].selected_index == 0 and visto["otro"].disabled
     a.ctrl.establecer_periodicidad_210.assert_called_once()
     # Al acabar el Excel: turno libre, barra apagada, nada pendiente y selector reconstruido.
     assert not a._turno.locked() and a.set_ocupado.call_args == call(False)
     assert a._periodicidad_en_curso() is None
-    assert not _selector(a._tarjeta_inmueble(_vista(_periodicidad_210="Trimestral"))).disabled
+    assert _selector(a._tarjeta_inmueble(_vista(_periodicidad_210="Trimestral"))).disabled
 
 
 def test_callback_de_otro_expediente_se_descarta():
@@ -288,7 +290,7 @@ def test_rechazo_por_ocupado_restaura_selector_sin_pendiente():
     a, workers = app_periodicidad(lambda *x, **k: {})
     a._turno.acquire()
     selector = _pulsar(a)
-    assert selector.selected_index == 0 and not selector.disabled and not selector.data.visible
+    assert selector.selected_index == 0 and selector.disabled and not selector.data.visible
     assert a._periodicidad_en_curso() is None and not workers
     a.ctrl.establecer_periodicidad_210.assert_not_called()
     a.avisar.assert_called_once()

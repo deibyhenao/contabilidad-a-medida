@@ -17,6 +17,7 @@ from __future__ import annotations
 from validacion_catastro import PENDIENTE_REVISION, revision_pendiente
 
 import calendar
+import hashlib
 import json
 import math
 import re
@@ -27,6 +28,7 @@ from typing import Iterable, Optional
 
 from database import Database, a_fecha
 from gastos import decimal_finito, ejercicio_registrado, fraccion, redondear_eur
+from calendario_fiscal import siguiente_habil
 
 # ============================================================================================ constantes
 TIPO_UE_EEE = 0.19
@@ -78,6 +80,10 @@ _PAISES_UE_EEE = {
     "germany", "belgium", "croatia", "cyprus", "denmark", "slovakia", "slovenia", "finland", "france", "greece",
     "hungary", "ireland", "italy", "latvia", "lithuania", "luxembourg", "netherlands", "poland", "romania",
     "sweden", "czech republic", "czechia", "iceland", "norway",
+    # Denominaciones habituales en certificados extranjeros del mismo país.
+    "deutschland", "nederland", "the netherlands", "österreich", "sverige", "polska",
+    "suomi", "eesti", "latvija", "lietuva", "hrvatska", "slovensko", "slovenija",
+    "danmark", "norge", "magyarország", "éire", "românia", "ellada", "el",
 }
 
 
@@ -114,17 +120,22 @@ class Residencia:
 
 
 def resolver_residencia(fila: Optional[dict]) -> Residencia:
-    if not fila or not (fila.get("pais") or fila.get("grupo")):
+    fila = fila or {}
+    pais = str(fila.get("pais") or "").strip()
+    if pais.casefold() in ("none", "null", "nan"):
+        pais = ""
+    grupo_guardado = str(fila.get("grupo") or "").strip()
+    if not pais and grupo_guardado not in (GRUPO_UE, GRUPO_EXTRA):
         return Residencia("", GRUPO_EXTRA, TIPO_EXTRA_UE, False, asumida=True)
     # El país manda (auditoría A1-P4). El grupo guardado solo se usa si no consta país.
-    if fila.get("pais"):
-        grupo = grupo_territorio(fila.get("pais"))
+    if pais:
+        grupo = grupo_territorio(pais)
     else:
-        grupo = fila.get("grupo") if fila.get("grupo") in (GRUPO_UE, GRUPO_EXTRA) else GRUPO_EXTRA
+        grupo = grupo_guardado
     deduce = gastos_deducibles(grupo)
-    if (fila.get("gastos_deducibles") or "").startswith("No"):
+    if str(fila.get("gastos_deducibles") or "").strip().casefold().startswith("no"):
         deduce = False
-    return Residencia(fila.get("pais") or "", grupo, tipo_gravamen_210(grupo), deduce)
+    return Residencia(pais, grupo, tipo_gravamen_210(grupo), deduce)
 
 
 # ============================================================================================ fechas
@@ -188,8 +199,12 @@ def periodicidad_210_alquiler(db: Database, cid: int, inmueble: str, ejercicio: 
         return "Anual"
     if presentados and presentados <= {"1T", "2T", "3T", "4T"}:
         return "Trimestral"
+    # Desde 2024 la agrupación de alquileres es anual. Un desglose visual
+    # trimestral no convierte tres devengos en una autoliquidación válida.
+    if int(ejercicio) >= 2024:
+        return "Anual"
     elegido = db.get_config(f"periodicidad_210|{cid}|{inmueble}|{int(ejercicio)}")
-    if elegido in ("Anual", "Trimestral"):
+    if elegido == "Trimestral":
         return elegido
     # El calendario ya existente se conserva, también si las filas eran Pendiente.
     # Solo un cálculo sin histórico ni preferencia recibe el nuevo valor por defecto.
@@ -204,15 +219,17 @@ def periodicidad_210_alquiler(db: Database, cid: int, inmueble: str, ejercicio: 
         return "Anual"
     # Una preferencia general solo sirve de valor inicial para cálculos nuevos.
     elegido = db.get_config("periodicidad_210_alquiler")
-    if elegido in ("Anual", "Trimestral"):
+    if elegido == "Trimestral":
         return elegido
     return "Anual" if int(ejercicio) >= 2024 else "Trimestral"
 
 
 def resumen_arrendamiento(inm: dict, contratos: list[dict], rentas_por_contrato: dict,
-                         ejercicio: int) -> dict:
+                         ejercicio: int, ventana: Optional[tuple[date, date]] = None) -> dict:
     """Ocupación sin duplicar días solapados e ingresos contractuales del inmueble al 100 %."""
     tenencia = periodo_tenencia(inm, int(ejercicio))
+    if tenencia and ventana:
+        tenencia = interseccion(tenencia, ventana)
     propiedad = dias(*tenencia) if tenencia else 0
     alquilados = dias_totales(intervalos_alquilados(contratos, tenencia)) if tenencia else 0
     devengados = (r2(sum(renta_devengada(c, rentas_por_contrato.get(c["codigo"], []), *tenencia)
@@ -228,31 +245,39 @@ def trimestres(ejercicio: int) -> list[tuple[str, date, date]]:
             ("4T", date(ejercicio, 10, 1), date(ejercicio, 12, 31))]
 
 
-def plazo_210_alquiler(ejercicio: int, periodo: str) -> date:
+def plazo_210_alquiler(ejercicio: int, periodo: str, cuota: Optional[float] = None) -> Optional[date]:
     """Plazo del 210 de arrendamientos (Orden EHA/3316/2010, art. 5, según la AEAT a 26/10/2026):
     - anual (agrupación desde 2024): 1-20 de enero del año siguiente para 2024 y 2025; 1-20 de abril desde 2026;
     - declaración separada por trimestre: 20 primeros días del mes siguiente al trimestre hasta los devengos de
       septiembre de 2026; desde octubre de 2026, 1-20 de abril del año siguiente."""
+    # Art. 5.c: cuota cero conserva enero; la devolución empieza en febrero.
+    # En devolución no hay un único vencimiento deducible de estos argumentos:
+    # depende también del período de la retención. No usar el inicio como límite.
+    if cuota is not None:
+        if r2(cuota) == 0:
+            return siguiente_habil(date(ejercicio + 1, 1, 20))
+        if cuota < 0:
+            return None
     periodo = periodo_210_o_none(periodo) or periodo
     trimestral = {"1T": date(ejercicio, 4, 20), "2T": date(ejercicio, 7, 20), "3T": date(ejercicio, 10, 20)}
     if periodo in trimestral and ejercicio <= 2026:
-        return trimestral[periodo]
+        return siguiente_habil(trimestral[periodo])
     if ejercicio >= 2026:  # anual de 2026 en adelante y separadas desde el 4T de 2026
-        return date(ejercicio + 1, 4, 20)
-    return date(ejercicio + 1, 1, 20)
+        return siguiente_habil(date(ejercicio + 1, 4, 20))
+    return siguiente_habil(date(ejercicio + 1, 1, 20))
 
 
 def plazo_210_imputacion(ejercicio: int) -> date:
-    return date(ejercicio + 1, 12, 31)
+    return siguiente_habil(date(ejercicio + 1, 12, 31))
 
 
 def plazo_714(ejercicio: int) -> date:
-    return date(ejercicio + 1, 6, 30)
+    return siguiente_habil(date(ejercicio + 1, 6, 30))
 
 
 def plazo_718(ejercicio: int) -> date:
     """VERIFICAR: en ejercicios anteriores el plazo del 718 fue julio del año siguiente."""
-    return date(ejercicio + 1, 7, 31)
+    return siguiente_habil(date(ejercicio + 1, 7, 31))
 
 
 def plazo_210_venta(fecha_venta: date) -> date:
@@ -260,7 +285,7 @@ def plazo_210_venta(fecha_venta: date) -> date:
     m = fecha_venta.month + 4
     y = fecha_venta.year + (m - 1) // 12
     m = (m - 1) % 12 + 1
-    return date(y, m, min(fecha_venta.day, calendar.monthrange(y, m)[1]))
+    return siguiente_habil(date(y, m, min(fecha_venta.day, calendar.monthrange(y, m)[1])))
 
 
 # ============================================================================================ inmueble
@@ -344,6 +369,10 @@ def pct_imputacion(anio_revision: Optional[int], ejercicio: int, manual: Optiona
     2 % en otro caso o si no consta el año. Un % introducido a mano en 03_CATASTRO_IBI (col. J) manda."""
     if manual not in (None, ""):
         return fraccion(manual)
+    # DA 55 LIRPF: excepción de 2023-2026, revisión colectiva con efectos
+    # desde 01/01/2012 (extensión 2026: RDL29/2026, art.6.1).
+    if anio_revision and 2023 <= ejercicio <= 2026 and 2012 <= int(anio_revision) <= ejercicio:
+        return PCT_IMPUTACION_REVISADO
     if anio_revision and int(anio_revision) >= 1994 and ejercicio - 10 <= int(anio_revision) <= ejercicio:
         return PCT_IMPUTACION_REVISADO
     return PCT_IMPUTACION_GENERAL
@@ -658,7 +687,9 @@ class Resultado210Imputacion:
     provisional: bool = False
 
 
-_OBS_AUTO_IMPUTACION = ("Sin valor catastral", "Valor catastral heredado", "Año bisiesto", PENDIENTE_REVISION)
+AVISO_IMPUTACION_2027 = "Normativa de imputación desde 2027 pendiente de validación"
+_OBS_AUTO_IMPUTACION = ("Sin valor catastral", "Valor catastral heredado", "Año bisiesto", PENDIENTE_REVISION,
+                        AVISO_IMPUTACION_2027)
 
 
 def calcular_210_imputacion(inm: dict, contratos: list[dict], cat: Optional[dict], res: Residencia,
@@ -687,9 +718,17 @@ def calcular_210_imputacion(inm: dict, contratos: list[dict], cat: Optional[dict
     provisional = revision_pendiente(cat)
     if provisional:
         detalle.append(PENDIENTE_REVISION + ": cálculo provisional; confirma el año o el porcentaje manual.")
+    if ejercicio >= 2027:
+        # RDL 29/2026, art.6.3.2: nueva escala del art.85 con efectos 2027.
+        # La estimación heredada por inmueble no sustituye al motor agregado.
+        provisional = True
+        detalle.append(AVISO_IMPUTACION_2027 + ": estimación con el motor anterior; "
+                       "no utilizar como liquidación definitiva ni presentar desde este cálculo.")
     if calendar.isleap(ejercicio):
         detalle.append("Año bisiesto: la plantilla divide entre 365")
-    renta = r2(vc * pct * tit * dias_vacio / DIAS_ANIO_PLANTILLA)
+    # El importe legal es anual: 366 días vacíos no incrementan el porcentaje.
+    # Se conservan los días naturales para ocupación; los parciales siguen /365.
+    renta = r2(vc * pct * tit * min(dias_vacio, DIAS_ANIO_PLANTILLA) / DIAS_ANIO_PLANTILLA)
     return Resultado210Imputacion(dias_vacio, r2(vc), pct, tit, res.tipo, renta, r2(renta * res.tipo), detalle,
                                   falta_valor=vc <= 0, provisional=provisional)
 
@@ -782,6 +821,49 @@ def calcular_venta(inm: dict, amortizaciones: float = 0.0) -> Optional[Resultado
     retencion = r2(pv * tit * RETENCION_VENTA)
     return ResultadoVenta(pv, adq, r2(amortizaciones), gv, ganancia, cuota, retencion, r2(cuota - retencion),
                           plazo_210_venta(fv))
+
+
+def firma_amortizacion_venta(db: Database, cid: int, inmueble: str) -> str:
+    """Vincula la confirmación a los datos relevantes, sin marcas de importación."""
+    inm = db.get("inmuebles", cid, inmueble) or {}
+    campos = ("codigo", "fecha_adquisicion", "pct_titularidad", "gananciales_forzado", "precio_escritura",
+              "itp_iva_ajd", "notaria", "registro", "agencia", "abogado_gestoria", "otros_gastos",
+              "fecha_venta", "precio_venta", "gastos_venta")
+    datos = {"cliente": cid, "inmueble": {k: inm.get(k) for k in campos}}
+    fuentes = {
+        "contratos": ("codigo", "fecha_inicio", "fecha_fin_prevista", "fecha_fin_real", "tipo", "estado"),
+        "catastro": ("codigo", "ejercicio", "valor_catastral", "valor_suelo", "valor_construccion"),
+        "gastos": ("codigo", "ejercicio", "fecha", "periodo_desde", "periodo_hasta", "categoria",
+                   "total", "base", "importe_deducible", "pct_inmueble", "pct_alquiler", "observaciones"),
+        "m210_alquiler": ("codigo", "ejercicio", "periodo", "estado", "ingresos", "gastos", "base",
+                          "cuota", "detalle_limite"),
+    }
+    for tabla, columnas in fuentes.items():
+        filas = db.listar(tabla, cid, inmueble=inmueble)
+        if tabla == "m210_alquiler":
+            filas = [f for f in filas if f.get("estado") == "Presentado"]
+        datos[tabla] = [{k: f.get(k) for k in columnas} for f in sorted(filas, key=lambda f: f["codigo"])]
+    return hashlib.sha256(json.dumps(datos, sort_keys=True, ensure_ascii=False,
+                                     default=str).encode("utf-8")).hexdigest()
+
+
+def amortizacion_venta_confirmada(db: Database, cid: int, inmueble: str) -> Optional[dict]:
+    """El asesor acredita un importe acumulado del cliente, no un porcentaje supuesto."""
+    try:
+        dato = json.loads(db.get_config(f"amortizacion_venta|{cid}|{inmueble}", "null"))
+        if not isinstance(dato, dict) or dato.get("version") != 1:
+            return None
+        importe = dato.get("importe")
+        if (type(importe) not in (int, float) or not math.isfinite(importe) or importe < 0
+                or not isinstance(dato.get("justificacion"), str) or len(dato["justificacion"].strip()) < 8
+                or dato.get("firma") != firma_amortizacion_venta(db, cid, inmueble)):
+            return None
+        inm = db.get("inmuebles", cid, inmueble) or {}
+        if importe > valor_adquisicion_total(inm) * pct_titularidad(inm) + .005:
+            return None
+        return dato
+    except (ValueError, TypeError):
+        return None
 
 
 # ============================================================================================ asesor interanual
@@ -949,8 +1031,8 @@ def completar_pago_210_nrc(db: Database, cid: int, tabla: str, codigo: str) -> d
 
 
 def _obligacion(db: Database, cid: int, ejercicio: int, tipo: str, inmueble: Optional[str], clave: str,
-                fecha_limite: date, id_modelo: Optional[str], estado: str, notas: str = "",
-                pagado: Optional[float] = None, fecha_presentacion=None) -> str:
+    fecha_limite: Optional[date], id_modelo: Optional[str], estado: str, notas: str = "",
+                pagado: Optional[float] = None, fecha_presentacion=None, *, completar_pago_vacio: bool = False) -> str:
     previa = db.get_por_clave("obligaciones", cid, clave)
     if tipo == "210 Alquiler" and id_modelo:
         # La identidad es el modelo, aunque la clave histórica diga OA/0A.
@@ -968,9 +1050,9 @@ def _obligacion(db: Database, cid: int, ejercicio: int, tipo: str, inmueble: Opt
             pagado = modelo.get("pagado")
         nota_nrc = NOTA_PAGO_NRC in (modelo.get("observaciones") or "")
     if _presentado(previa):
-        if es_210 and previa.get("pagado") in (None, "") and pagado not in (None, ""):
+        if (es_210 or completar_pago_vacio) and previa.get("pagado") in (None, "") and pagado not in (None, ""):
             cambios = {"codigo": previa["codigo"], "pagado": pagado}
-            if nota_nrc:
+            if nota_nrc or completar_pago_vacio:
                 cambios["notas"] = _anadir_nota_nrc(previa.get("notas"))
             db.upsert("obligaciones", cid, cambios, solo_si_vacio=("pagado",))
         return previa["codigo"]
@@ -982,7 +1064,8 @@ def _obligacion(db: Database, cid: int, ejercicio: int, tipo: str, inmueble: Opt
         datos["codigo"] = previa["codigo"]
     if not _presentado(previa):
         datos.update(estado=estado, pagado=pagado, fecha_presentacion=fecha_presentacion)
-    return db.upsert("obligaciones", cid, datos, clave=clave, solo_si_vacio=("pagado",) if es_210 else ())
+    return db.upsert("obligaciones", cid, datos, clave=clave,
+                     solo_si_vacio=("pagado",) if es_210 or completar_pago_vacio else ())
 
 
 def _generar_cobros(db: Database, cid: int, ejercicio: int, inm: dict, contratos: list[dict],
@@ -1017,15 +1100,71 @@ class ConflictoDuplicados210(ConflictoHistorial210):
     """Dos registros con la misma identidad fiscal requieren conciliación."""
 
 
-def _conflictos_modelos_210(modelos: list[dict], ejercicio: int) -> dict[str, str]:
+def firma_historial_210(modelos: list[dict], inmueble: str, ejercicio: int) -> str:
+    """Vincula la conciliación a las filas que el asesor vio, sin alterar su contenido."""
+    # El importador renueva «actualizado» aunque no cambie ningún dato fiscal.
+    # La identidad SQLite tampoco forma parte del expediente conciliado.
+    filas = sorted(({k: v for k, v in f.items() if k not in ("id", "actualizado")}
+                    for f in modelos if f.get("inmueble") == inmueble
+                    and f.get("ejercicio") == int(ejercicio)), key=lambda f: f["codigo"])
+    return hashlib.sha256(json.dumps(filas, sort_keys=True, ensure_ascii=False,
+                                     default=str).encode("utf-8")).hexdigest()
+
+
+def conciliaciones_210(db: Database, cid: int, modelos: list[dict]) -> dict:
+    """Solo reconoce saldos expresamente verificados y una firma histórica vigente."""
+    vigentes = {}
+    for inmueble, ejercicio in {(f.get("inmueble"), int(f.get("ejercicio") or 0)) for f in modelos}:
+        if not inmueble or ejercicio < 2024:
+            continue
+        raw = db.get_config(f"conciliacion_210|{cid}|{inmueble}|{ejercicio}")
+        if not raw:
+            continue
+        try:
+            dato = json.loads(raw)
+            if (dato.get("version") != 1 or dato.get("firma") != firma_historial_210(modelos, inmueble, ejercicio)
+                    or not isinstance(dato.get("saldos"), dict)):
+                continue
+            if any(type(v) not in (int, float) for v in dato["saldos"].values()):
+                continue
+            saldos = {int(a): float(v) for a, v in dato["saldos"].items()}
+            if any(not ejercicio - 3 <= a <= ejercicio or not math.isfinite(v) or not 0 <= v <= 1e12
+                   for a, v in saldos.items()):
+                continue
+            vigentes[(inmueble, ejercicio)] = {a: r2(v) for a, v in saldos.items() if v > 0}
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return vigentes
+
+
+def _conflictos_modelos_210(modelos: list[dict], ejercicio: int, conciliados: Optional[set] = None) -> dict[str, str]:
     grupos = {}
     presentados, conflictos = {}, {}
+    agrupaciones_pendientes = {}
     for fila in sorted(modelos, key=lambda f: (int(f.get("ejercicio") or 0), f["codigo"])):
         ej = int(fila.get("ejercicio") or 0)
         periodo = periodo_210_o_none(fila.get("periodo"))
-        if not 1900 <= ej <= ejercicio or fila.get('estado') == 'No procede':
+        if not 1900 <= ej <= ejercicio:
             continue
         inmueble = fila.get('inmueble')
+        indicios = any(fila.get(campo) not in (None, "", 0, 0.0)
+                       for campo in ("nrc", "pagado", "fecha_presentacion"))
+        manual = not str(fila.get("clave") or "").startswith("210A|")
+        protegida = (fila.get("estado") or "Pendiente") not in ESTADOS_AUTOMATICOS or indicios or manual
+        if (ej < 2024 and periodo == 'Anual' and not _presentado(fila)
+                and fila.get('estado') != 'No procede' and float(fila.get('cuota') or 0) > 0):
+            agrupaciones_pendientes.setdefault(inmueble,
+                f'{inmueble}, ejercicio {ej}: borrador anual a ingresar anterior a 2024. '
+                'Revisa o retira ese borrador: la agrupación anual anterior a 2024 solo admite cuota cero o devolución. '
+                'Se conserva el registro y no se crean declaraciones incompatibles.')
+        if (ej >= 2024 and periodo in ("1T", "2T", "3T", "4T") and protegida
+                and (ej == ejercicio or (inmueble, ej) not in (conciliados or set()))):
+            agrupaciones_pendientes.setdefault(inmueble,
+                f"{inmueble}, ejercicio {ej}: 210 trimestral con datos manuales o indicios de presentación. "
+                "Desde 2024 la agrupación es anual. Se conservan los importes; el asesor debe conciliar "
+                "el histórico antes de recalcular el alquiler y sus arrastres posteriores.")
+        if fila.get('estado') == 'No procede':
+            continue
         if _presentado(fila):
             presentados.setdefault((inmueble, ej), set()).add(periodo)
             if not periodo:
@@ -1044,12 +1183,15 @@ def _conflictos_modelos_210(modelos: list[dict], ejercicio: int) -> dict[str, st
         if 'Anual' in periodos and len(periodos) > 1:
             conflictos.setdefault(inmueble, f"{inmueble}, ejercicio {ej}: declaraciones presentadas con "
                                   "periodicidades incompatibles. Revisa el histórico y sus arrastres.")
+    for inmueble, motivo in agrupaciones_pendientes.items():
+        conflictos.setdefault(inmueble, motivo)
     return conflictos
 
 
 def conflictos_210_alquiler(db: Database, cid: int, ejercicio: int) -> dict[str, str]:
     """Conflictos vivos, también al reabrir o exportar sin una nueva sesión de cálculo."""
-    return _conflictos_modelos_210(db.listar("m210_alquiler", cid), int(ejercicio))
+    modelos = db.listar("m210_alquiler", cid)
+    return _conflictos_modelos_210(modelos, int(ejercicio), set(conciliaciones_210(db, cid, modelos)))
 
 
 def _liquidacion_con_historia(db: Database, cid: int, inm: dict, contratos: list[dict],
@@ -1064,7 +1206,8 @@ def _liquidacion_con_historia(db: Database, cid: int, inm: dict, contratos: list
     cod = inm["codigo"]
     gastos = db.listar("gastos", cid, inmueble=cod)
     modelos = db.listar("m210_alquiler", cid, inmueble=cod)
-    conflicto = _conflictos_modelos_210(modelos, ejercicio).get(cod)
+    conciliadas = conciliaciones_210(db, cid, modelos)
+    conflicto = _conflictos_modelos_210(modelos, ejercicio, set(conciliadas)).get(cod)
     if conflicto:
         raise ConflictoDuplicados210(conflicto)
     saldos_guardados = db.listar("arrastres_gastos", cid, inmueble=cod)
@@ -1076,6 +1219,13 @@ def _liquidacion_con_historia(db: Database, cid: int, inm: dict, contratos: list
     saldos = {}
     revisar_hasta = 0
     for ej in range(min(ejercicios), ejercicio + 1):
+        if ej < ejercicio and (cod, ej) in conciliadas:
+            # El cierre confirmado sustituye solo la reconstrucción del saldo.
+            # No se reescriben modelos ni arrastres históricos. El siguiente año
+            # aplicará su límite y caducidad sobre estos saldos verificados.
+            saldos = dict(conciliadas[(cod, ej)])
+            revisar_hasta = 0
+            continue
         # 0A, OA y Anual son el mismo periodo (importaciones antiguas guardaban el código del modelo)
         presentados = {}
         for f in modelos:
@@ -1090,7 +1240,7 @@ def _liquidacion_con_historia(db: Database, cid: int, inm: dict, contratos: list
         # Resolver por inmueble y año permite carteras con declaraciones de ambos tipos.
         periodos = set(presentados)
         if periodos and not (periodos <= {"1T", "2T", "3T", "4T"} or periodos == {"Anual"}):
-            raise ValueError(f"{cod}, ejercicio {ej}: hay declaraciones presentadas con periodicidades incompatibles. "
+            raise ConflictoHistorial210(f"{cod}, ejercicio {ej}: hay declaraciones presentadas con periodicidades incompatibles. "
                              "Revisa el histórico antes de continuar.")
         periodicidad_ej = ("Anual" if periodos == {"Anual"} else
                            "Trimestral" if periodos else periodicidad_210_alquiler(db, cid, cod, ej))
@@ -1098,6 +1248,10 @@ def _liquidacion_con_historia(db: Database, cid: int, inm: dict, contratos: list
             inm, contratos, rentas, [g for g in gastos if _gasto_toca_ejercicio(g, ej)],
             db.catastro(cid, cod, ej), resolver_residencia(db.residencia(cid, ej)), ej,
             periodicidad_ej, saldos, presentados)
+        if (ej < 2024 and periodicidad_ej == 'Anual' and not presentados
+                and any(r.cuota > 0 for r in liquidacion.resultados)):
+            raise ConflictoHistorial210(f'{cod}, ejercicio {ej}: el borrador anual daría una cuota a ingresar. '
+                'Antes de 2024 esa agrupación no era válida; revisa el calendario sin borrar declaraciones presentadas.')
         if liquidacion.revisar:
             revisar_hasta = ej + 4
         saldos = liquidacion.saldos
@@ -1118,9 +1272,11 @@ def _liquidacion_con_historia(db: Database, cid: int, inm: dict, contratos: list
 
 def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
     """Recalcula todas las obligaciones de no residente del ejercicio y las guarda en BD."""
-    res = resolver_residencia(db.residencia(cid, ejercicio))
     fila_res = db.residencia(cid, ejercicio)
-    if fila_res and fila_res.get("ejercicio") == ejercicio:
+    res = resolver_residencia(fila_res)
+    # Una residencia vacía importada de Excel no acredita país ni grupo.
+    # Mantener la hipótesis provisional en memoria; no convertirla en dato manual.
+    if fila_res and fila_res.get("ejercicio") == ejercicio and not res.asumida:
         # Extra-UE nunca deduce (A2-P02): se fuerza "No". En UE se respeta un "No" manual.
         db.upsert("residencias", cid, {"codigo": fila_res["codigo"], "grupo": res.grupo,
                                        "gastos_deducibles": "Sí" if res.deduce_gastos else "No"},
@@ -1160,6 +1316,18 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
                 "grave", cod, f"periodo 210 {f['codigo']}",
                 f"{f['codigo']}: periodo no reconocido ({f.get('periodo') or 'vacío'}). "
                 "Se conservan sus importes; corrige el periodo antes de dar por cerrado el cálculo."))
+        # Una guardia de calendario no debe ocultar una incoherencia aritmética
+        # ya visible en los datos presentados. No se recalcula ni modifica la fila.
+        for f in filas_modelos:
+            if (ejercicio >= 2024 and _presentado(f)
+                    and periodo_210_o_none(f.get("periodo")) in ("1T", "2T", "3T", "4T")
+                    and f.get("ingresos") not in (None, "") and f.get("base") not in (None, "")
+                    and f.get("gastos") not in (None, "")):
+                esperada = r2(max(0, float(f['ingresos']) - (float(f['gastos']) if res.deduce_gastos else 0)))
+                if abs(esperada - float(f['base'])) > .01:
+                    discrepancias.append(Alerta("aviso", cod, f"base 210 {f['periodo']}",
+                        f"La base presentada no coincide con ingresos menos gastos: {fmt_eur(esperada)}. "
+                        "Revisa el justificante; los importes presentados se conservan."))
         _generar_cobros(db, cid, ejercicio, inm, contratos, rentas)
 
         # ---- 210 rendimientos
@@ -1221,7 +1389,8 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
                             not in (None, "", *ESTADOS_AUTOMATICOS) else ())
                     fila = db.get("m210_alquiler", cid, codigo)
                     filas_a.append(codigo)
-                    _obligacion(db, cid, ejercicio, "210 Alquiler", cod, f"OBL|{clave}", plazo_210_alquiler(ejercicio, r.periodo),
+                    _obligacion(db, cid, ejercicio, "210 Alquiler", cod, f"OBL|{clave}",
+                                plazo_210_alquiler(ejercicio, r.periodo, fila.get("cuota")),
                                 codigo, fila.get("estado") or "Pendiente", f"210 rendimientos {r.periodo} {ejercicio}",
                                 fila.get("pagado"), fila.get("fecha_presentacion"))
                     informe_estados.append(f"{cod} · 210 Arrendamientos {r.periodo}/{ejercicio}: {fila.get('estado')}"
@@ -1234,12 +1403,27 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
                             or not periodo_210_o_none(viejo.get("periodo"))
                             or not (viejo.get("clave") or "").startswith("210A|")):
                         continue
-                    db.upsert("m210_alquiler", cid, {"codigo": viejo["codigo"], "ingresos": 0, "gastos": 0, "base": 0,
-                                                     "cuota": 0, "estado": _estado_auto(viejo, "No procede")})
+                    # Mantener importes del calendario sustituido para trazabilidad;
+                    # No procede lo excluye del resumen, sin borrar datos previos.
+                    cambio_calendario = (ejercicio >= 2024 and periodicidad == "Anual"
+                                          and periodo_210_o_none(viejo.get("periodo")) != "Anual")
+                    if cambio_calendario and viejo.get("estado") != "No procede":
+                        db.set_config(f"revision_calendario_210|{cid}|{cod}|{ejercicio}", "1")
+                    db.upsert("m210_alquiler", cid, {"codigo": viejo["codigo"],
+                                                     "estado": _estado_auto(viejo, "No procede")})
                     fila_v = db.get("m210_alquiler", cid, viejo["codigo"])
                     _obligacion(db, cid, ejercicio, "210 Alquiler", cod, f"OBL|{viejo['clave']}",
-                                plazo_210_alquiler(ejercicio, viejo.get("periodo") or ""), viejo["codigo"],
-                                fila_v.get("estado"), "Sin ingresos en el periodo tras recalcular")
+                                plazo_210_alquiler(ejercicio, viejo.get("periodo") or "", 0), viejo["codigo"],
+                                fila_v.get("estado"),
+                                "Calendario sustituido por agrupación anual; importes históricos conservados."
+                                if cambio_calendario else "Modelo inactivo tras recalcular; importes históricos conservados.")
+                if (db.get_config(f"revision_calendario_210|{cid}|{cod}|{ejercicio}")
+                        and not any(_presentado(f) and periodo_210_o_none(f.get("periodo")) == "Anual"
+                                    for f in filas_modelos)):
+                    discrepancias.append(Alerta("grave", cod, "cambio de calendario 210",
+                        "Se sustituyó un calendario trimestral anterior por agrupación anual. "
+                        "Se conservan las filas antiguas. Confirma que no se presentaron fuera de la app "
+                        "antes de declarar el anual; evita una declaración duplicada."))
         except ConflictoHistorial210 as exc:
             # El savepoint revierte exclusivamente las escrituras de alquiler de este inmueble.
             del filas_a[inicio_filas:]
@@ -1284,7 +1468,8 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
                         codigo_i, fila_i.get("estado") or "Pendiente", f"Imputación {fila_i.get('dias')} días",
                         fila_i.get("pagado"), fila_i.get("fecha_presentacion"))
             if fila_i.get("estado") not in ("Presentado", "No procede"):
-                motivo = ("sin valor catastral" if imp and imp.falta_valor else
+                motivo = (AVISO_IMPUTACION_2027 if ejercicio >= 2027 else
+                          "sin valor catastral" if imp and imp.falta_valor else
                           "revisión catastral sin acreditar" if imp and imp.provisional else None)
                 # La cuota va delante: el resumen recorta las líneas largas.
                 informe_estados.append(f"{cod} · FALTA por presentar 210 Imputación {ejercicio} · cuota "
@@ -1310,14 +1495,30 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
         # ---- venta
         fv = a_fecha(inm.get("fecha_venta"))
         if fv and fv.year == ejercicio:
-            amort = sum(float(g.get("importe_deducible") or 0) for g in db.listar("gastos", cid, inmueble=cod)
-                        if g.get("categoria") == "Amortización")
+            previa_v = db.get_por_clave("obligaciones", cid, f"VENTA|{cod}")
+            acreditada = amortizacion_venta_confirmada(db, cid, cod)
+            # El gasto de alquiler puede mezclar inmueble y mobiliario y no prueba
+            # por sí solo la amortización acumulada que corresponde a la venta.
+            # Sin confirmación se conserva solo una orientación, nunca definitiva.
+            amort = acreditada["importe"] if acreditada else sum(
+                float(g.get("importe_deducible") or 0) for g in db.listar("gastos", cid, inmueble=cod)
+                if g.get("categoria") == "Amortización")
             v = calcular_venta(inm, amort)
             if v:
                 texto = (f"210 ganancia patrimonial venta {fv:%d/%m/%Y}: ganancia {fmt_eur(v.ganancia)}, "
                          f"cuota 19 % {fmt_eur(v.cuota)}, retención 3 % comprador {fmt_eur(v.retencion)}, "
                          f"resultado {fmt_eur(v.resultado)}")
-                _obligacion(db, cid, ejercicio, "Otra", cod, f"VENTA|{cod}", v.fecha_limite, None, "Pendiente", texto)
+                if _presentado(previa_v):
+                    texto = previa_v.get("notas") or "Venta presentada: se conservan los datos del justificante."
+                elif not acreditada:
+                    texto = "PROVISIONAL: amortización acumulada no confirmada por el asesor. " + texto
+                    discrepancias.append(Alerta("grave", cod, "amortización venta",
+                        "Confirma la amortización acumulada de la construcción con su historial y justificantes. "
+                        "No presupongas cero ni sumes dos veces amortización manual y automática; excluye mobiliario."))
+                else:
+                    texto += f" · Amortización acreditada del cliente: {fmt_eur(amort)}"
+                _obligacion(db, cid, ejercicio, "Otra", cod, f"VENTA|{cod}", v.fecha_limite, None,
+                            "Pendiente" if acreditada else "Revisar", texto)
                 informe_estados.append(f"{cod} · VENDIDO: {texto}")
             if inm.get("estado") != "Vendido":
                 db.upsert("inmuebles", cid, {"codigo": cod, "estado": "Vendido"})
@@ -1530,11 +1731,13 @@ MODELOS_PERIODICOS = {
 def plazos_autonomo(modelo: str, ejercicio: int) -> list[tuple[str, date]]:
     """Plazos generales: trimestrales 1-20 abr/jul/oct y 1-30 ene; anuales 30 ene (390/190/180), feb (347), jun (100)."""
     if MODELOS_PERIODICOS.get(modelo) == "Trimestral":
-        return [("1T", date(ejercicio, 4, 20)), ("2T", date(ejercicio, 7, 20)), ("3T", date(ejercicio, 10, 20)),
-                ("4T", date(ejercicio + 1, 1, 30))]
+        return [(p, siguiente_habil(f)) for p, f in
+                [("1T", date(ejercicio, 4, 20)), ("2T", date(ejercicio, 7, 20)), ("3T", date(ejercicio, 10, 20)),
+                 ("4T", date(ejercicio + 1, 1, 20 if modelo in ("111", "115") else 30))]]
     anuales = {"390": date(ejercicio + 1, 1, 30), "190": date(ejercicio + 1, 1, 31), "180": date(ejercicio + 1, 1, 31),
-               "347": date(ejercicio + 1, 2, 28), "100": date(ejercicio + 1, 6, 30)}
-    return [("Anual", anuales[modelo])] if modelo in anuales else []
+               "347": date(ejercicio + 1, 2, calendar.monthrange(ejercicio + 1, 2)[1]),
+               "100": date(ejercicio + 1, 6, 30)}
+    return [("Anual", siguiente_habil(anuales[modelo]))] if modelo in anuales else []
 
 
 def recalcular_autonomo(db: Database, cid: int, ejercicio: int) -> list[str]:

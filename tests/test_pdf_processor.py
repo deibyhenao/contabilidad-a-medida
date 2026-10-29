@@ -162,10 +162,10 @@ def test_flujo_pepito_aplica_calcula_y_congela_presentado(db, cliente, tmp_path)
     assert documento_contrato["contrato"] == resultados[3].codigos["contrato"]
     inf = tc.recalcular_cliente(db, cid, 2026)
     modelos = {r["periodo"]: r for r in db.listar("m210_alquiler", cid)}
-    assert set(modelos) == {"3T", "4T"}
+    assert set(modelos) == {"3T"}
     assert modelos["3T"]["estado"] == "Presentado" and modelos["3T"]["pagado"] == 285
     assert modelos["3T"]["cuota"] == 285
-    assert modelos["4T"]["estado"] == "Pendiente"
+    assert inm in inf.alquileres_bloqueados  # no inventar otro modelo junto al histórico trimestral presentado
     assert db.listar("m210_imputacion", cid)[0]["dias"] == 181
     assert "Tiene 1 piso," in inf.mensaje_patrimonio
     assert inf.patrimonio.valor_bienes == 90000

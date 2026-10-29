@@ -52,14 +52,14 @@ def test_categoria_gasto(texto, esperada):
 
 def test_factura_crea_gasto_y_descuenta_en_el_210(ctrl, tmp_path):
     cid = _cliente_con_piso(ctrl)
-    cuota_antes = ctrl.db.get_por_clave("m210_alquiler", cid, "210A|2026|INM-001|1T")["cuota"]
+    cuota_antes = ctrl.db.get_por_clave("m210_alquiler", cid, "210A|2026|INM-001|Anual")["cuota"]
     pdf = _pdf(tmp_path / "luz.pdf", "Factura de luz Iberdrola F-1")
     res = ctrl.procesar_pdf(cid, pdf, 2026, confirmar=lambda ext: _factura("luz", 120.0, concepto="Luz"))
     gasto = ctrl.db.get("gastos", cid, res["resultado"].codigos["gasto"])
     assert gasto["categoria"] == "Suministros" and gasto["total"] == 120 and gasto["origen"] == "pdf"
     assert gasto["inmueble"] == "INM-001"            # un solo inmueble: se asigna solo
     assert gasto["ruta"].startswith("Soportes_PDF/") and gasto["observaciones"] == "Luz"
-    cuota_despues = ctrl.db.get_por_clave("m210_alquiler", cid, "210A|2026|INM-001|1T")["cuota"]
+    cuota_despues = ctrl.db.get_por_clave("m210_alquiler", cid, "210A|2026|INM-001|Anual")["cuota"]
     assert cuota_despues == pytest.approx(cuota_antes - 120 * 0.19, abs=0.02)
 
 
@@ -99,7 +99,7 @@ def test_hipoteca_solo_intereses_y_extra_ue_no_deduce(ctrl, tmp_path):
     ctrl.editar(cid, "residencias", "2026", {"pais": "Estados Unidos"}, 2026)
     ctrl.procesar_pdf(cid, _pdf(tmp_path / "h.pdf", "Recibo préstamo"), 2026,
                       confirmar=lambda ext: _factura("Intereses/financiación", 210.0, n="H-3"))
-    fila = ctrl.db.get_por_clave("m210_alquiler", cid, "210A|2026|INM-001|1T")
+    fila = ctrl.db.get_por_clave("m210_alquiler", cid, "210A|2026|INM-001|Anual")
     assert fila["gastos"] == 0 and fila["tipo"] == tc.TIPO_EXTRA_UE  # Extra-UE: 24 % sobre íntegros
 
 

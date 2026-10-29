@@ -152,7 +152,7 @@ def test_a4_editor_cliente_importa_antes_y_vacia_residencia(ctrl):
     app = object.__new__(main.App)
     app.p, app.cid, app.ejercicio, app.ctrl = ui.CLARO, cid, 2026, ctrl
     app.page = SimpleNamespace(pop_dialog=lambda: None)
-    app.en_segundo_plano = lambda _texto, trabajo, *_args: trabajo()
+    app.en_segundo_plano = lambda _texto, trabajo, *_args, **_kw: trabajo()
     app._refrescar_clientes = lambda: None
     dialogo = {}
     app._dialogo = lambda _titulo, contenido, acciones, **_kw: dialogo.update(contenido=contenido, acciones=acciones)

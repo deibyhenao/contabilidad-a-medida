@@ -185,7 +185,7 @@ def test_pendientes_documentos_y_declaraciones(db):
     assert "Falta: Catastro / IBI" in titulos            # solo hay el de 2025
     assert "Falta: Certificado de residencia fiscal" in titulos
     assert "Falta: Contrato de alquiler" in titulos      # contrato sin PDF
-    assert any(p.titulo.startswith("VENCIDA: 210 Alquiler") for p in pend)  # 3T venció el 20/10
+    assert not any(p.titulo.startswith("VENCIDA: 210 Alquiler") for p in pend)  # anual2026 vence en abril2027
     assert pend[0].nivel == "grave"
     faltas = [d for d in db.listar("documentos", cid) if d["estado"] == "Falta"]
     assert len(faltas) == 4

@@ -192,6 +192,74 @@ def test_bandeja_espera_comentario_y_no_toca_origen(tmp_path,monkeypatch,cancela
     assert archivo.read_text(encoding="utf-8")=="ejemplo"
 
 
+def test_bandeja_error_apertura_despierta_espera_y_limpia_revision(tmp_path, monkeypatch):
+    import main
+    import threading
+    archivo = tmp_path/'ficticio.csv'; archivo.write_text('sin modificar', encoding='utf-8')
+    app = main.App.__new__(main.App)
+    app.cid = 1; app.ejercicio = 2025; app.cerrando = False; app.p = ui.CLARO
+    app.ctrl = NS(lector=NS(get_cliente=lambda _: {'nombre': 'Ficticio'}))
+    app.page = NS(update=lambda: None)
+    def fallar(_): raise PermissionError('Error ficticio al preparar archivos')
+    monkeypatch.setattr(main.adj, 'preparar_lote', fallar)
+    hilos = []
+    def despachar(page, funcion):
+        hilo = threading.Thread(target=funcion, daemon=True); hilos.append(hilo); hilo.start()
+    monkeypatch.setattr(main, 'ejecutar_en_ui', despachar)
+    resultado = []
+    def esperar():
+        try: app._revisar_lote_bandeja(1, 2025, [archivo])
+        except RuntimeError as error: resultado.append(str(error))
+    trabajador = threading.Thread(target=esperar, daemon=True); trabajador.start(); trabajador.join(timeout=3)
+    bloqueado = trabajador.is_alive()
+    if bloqueado:  # Limpiar la sonda también si se reintroduce el fallo.
+        app.cerrando = True; trabajador.join(timeout=1)
+    for hilo in hilos: hilo.join(timeout=1)
+    assert not bloqueado and resultado and 'permanecen' in resultado[0]
+    assert not app._revision_abierta and app._evento_dialogo is None
+    assert archivo.read_text(encoding='utf-8') == 'sin modificar'
+
+
+def test_bandeja_no_reofrece_desmarcado_al_superar_tamano_lote(tmp_path, monkeypatch):
+    import main
+    import database
+    import threading
+    main._cargar_modulos()
+    carpeta = tmp_path/'Clientes_No_Residentes'/'Ficticio'
+    bandeja = carpeta/database.SUBCARPETA_ENTRADA; bandeja.mkdir(parents=True)
+    for nombre in ('a.csv', 'b.csv', 'c.csv'):
+        (bandeja/nombre).write_text('ficticio', encoding='utf-8')
+    app = main.App.__new__(main.App)
+    app.cid = 1; app.ejercicio = 2025; app.cerrando = False
+    app._turno = threading.Lock(); app.page = NS()
+    revisiones, procesados, iteraciones = [], [], [0]
+    def revisar(cid, ej, rutas):
+        revisiones.append([p.name for p in rutas])
+        return {'rutas': rutas[:1] if len(revisiones) == 1 else rutas, 'comentario': '', 'cancelado': False}
+    def procesar(cid, ej, **kw):
+        resultados = []
+        for ruta in kw['rutas']:
+            procesados.append(ruta.name); ruta.unlink()
+            resultados.append({'ok': True, 'archivo': ruta.name})
+        return resultados
+    app.ctrl = NS(lector=NS(get_cliente=lambda _: {'carpeta': str(carpeta)}), procesar_bandeja=procesar)
+    app._revisar_lote_bandeja = revisar
+    app.set_ocupado = lambda *a: None
+    app._pintar_principal = app._reintentar_excel = lambda: None
+    app._aplicar_resultado = app.avisar = lambda *a: None
+    def avanzar(_):
+        iteraciones[0] += 1
+        if iteraciones[0] > 3: app.cerrando = True
+    monkeypatch.setattr(main.time, 'sleep', avanzar)
+    monkeypatch.setattr(main.adj, 'MAX_ARCHIVOS', 2)
+    monkeypatch.setattr(main, 'ejecutar_en_ui', lambda page, fn: fn())
+    app._vigilante_bandeja()
+    assert revisiones == [['a.csv', 'b.csv'], ['c.csv']]
+    assert procesados == ['a.csv', 'c.csv']
+    assert (bandeja/'b.csv').read_text(encoding='utf-8') == 'ficticio'
+    assert not app._turno.locked()
+
+
 def test_patrimonio_incluye_gastos_inherentes_sin_perder_escritura():
     import tax_calculator as tax
     inmueble=dict(precio_escritura=200000,itp_iva_ajd=20000,notaria=900,registro=600,agencia=3500,intereses=9000)

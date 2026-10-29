@@ -10,6 +10,7 @@ import gc
 import hashlib
 import json
 import logging
+import math
 import os
 import shutil
 import threading
@@ -285,11 +286,12 @@ class Controlador:
             try:
                 # Las tablas del cliente tienen ON DELETE CASCADE hacia clientes
                 self.db.con.execute("DELETE FROM clientes WHERE id=?", (cid,))
-                self.db.con.execute("DELETE FROM config WHERE clave IN (?,?,?,?,?,?)",
+                self.db.con.execute("DELETE FROM config WHERE clave IN (?,?,?,?,?,?,?)",
                                     tuple(f'{prefijo}|{cid}' for prefijo in ('excel_firma', 'excel_pendiente',
-                                        'excel_resumen', 'excel_version', 'excel_nombre', 'excel_filas')))
-                prefijo = f"periodicidad_210|{cid}|"
-                self.db.con.execute("DELETE FROM config WHERE substr(clave,1,?)=?", (len(prefijo), prefijo))
+                                        'excel_resumen', 'excel_version', 'excel_nombre', 'excel_filas', 'excel_revision')))
+                for nombre in ("periodicidad_210", "conciliacion_210", "revision_calendario_210", "amortizacion_venta", "saldo303"):
+                    prefijo = f"{nombre}|{cid}|"
+                    self.db.con.execute("DELETE FROM config WHERE substr(clave,1,?)=?", (len(prefijo), prefijo))
                 self.db.con.commit()
             except Exception:
                 self.db.con.rollback()
@@ -340,16 +342,22 @@ class Controlador:
     # ------------------------------------------------------------------ flujo central
     def _recalcular_bd(self, cid: int, ejercicios: set[int], ejercicio_activo: int) -> dict:
         ej = int(ejercicio_activo)
-        # Solo años no prescritos (4) y no futuros, más el activo y declaraciones existentes desde el más antiguo
+        # Ventana automática de cuatro ejercicios anteriores y el actual,
+        # además del activo y la historia explícita; no decide la prescripción legal.
         hoy = date.today().year
         desde = min({int(e) for e in ejercicios} | {ej})
         tablas_modelo = (_DECLARACIONES_RES if self._es_residente(cid) else
                          ("m210_alquiler", "m210_imputacion", "patrimonio_714", "its_718"))
+        # El libro contiene varios ejercicios. Al renovar formato o editar desde
+        # un año posterior, actualizar también los modelos ya guardados dentro
+        # de la ventana de revisión; no crear años sin datos ni dejar la BD con
+        # importes anteriores mientras sus fórmulas de Excel ya son nuevas.
+        desde_guardados = min(desde, hoy - 4)
         # Un modelo ya calculado debe seguir coherente aunque sea histórico o
         # una previsión futura. No crear años nuevos por una etiqueta del PDF.
         existentes = {int(r[0]) for tabla in (*tablas_modelo, "obligaciones", "modelos_presentados")
             for r in self.db.con.execute(f"SELECT DISTINCT ejercicio FROM {tabla} WHERE cliente_id=? AND ejercicio>=?",
-                                         (cid, desde)) if r[0] is not None}
+                                         (cid, desde_guardados)) if r[0] is not None}
         if self._es_residente(cid):
             # El 303 encadena lo «a compensar» de un año al siguiente: se recalcula en orden
             encadenados = set(fiscal_residentes.ejercicios_encadenados(self.db, cid, ejercicios, ej))
@@ -425,6 +433,91 @@ class Controlador:
                 return {}
             return {**self.sincronizar(cid, int(ejercicio)), "excel_importado": True}
 
+    def conciliar_historial_210(self, cid: int, inmueble: str, ejercicio_historico: int,
+                               ejercicio_activo: int, saldos: dict, observacion: str,
+                               firma_esperada: str, confirmado: bool = False) -> dict:
+        """El asesor verifica un cierre legado para continuar años posteriores.
+
+        No cambia declaraciones ni arrastres históricos. La firma evita aceptar
+        una conciliación sobre filas modificadas después de abrir el diálogo.
+        """
+        if confirmado is not True:
+            raise ValueError("Confirma que has contrastado el histórico y sus saldos con los justificantes.")
+        origen, activo = int(ejercicio_historico), int(ejercicio_activo)
+        if not 2024 <= origen < activo:
+            raise ValueError("La conciliación solo permite continuar ejercicios posteriores al histórico.")
+        if not isinstance(observacion, str) or len(observacion.strip()) < 8:
+            raise ValueError("Indica el justificante o la comprobación realizada por el asesor.")
+        if not isinstance(saldos, dict):
+            raise ValueError("Revisa los saldos por año de origen.")
+        verificados = {}
+        for año, importe in saldos.items():
+            a = int(año)
+            n = database.a_euros(importe)
+            if (not origen - 3 <= a <= origen or isinstance(importe, bool) or n is None
+                    or not math.isfinite(n) or not 0 <= n <= 1e12):
+                raise ValueError("Los saldos deben ser importes no negativos de los cuatro orígenes vigentes.")
+            verificados[a] = tax_calculator.r2(n)
+        with self._lock:
+            if not self.db.get("inmuebles", cid, inmueble):
+                raise ValueError("El inmueble no pertenece a este cliente.")
+            self._importar(cid)
+            modelos = self.db.listar("m210_alquiler", cid, inmueble=inmueble)
+            firma = tax_calculator.firma_historial_210(modelos, inmueble, origen)
+            if firma != firma_esperada:
+                raise ValueError("El histórico cambió desde que abriste la revisión. Vuelve a contrastarlo.")
+            filas = [f for f in modelos if f.get("ejercicio") == origen and f.get("estado") != "No procede"]
+            periodos = [tax_calculator.periodo_210_o_none(f.get("periodo")) for f in filas]
+            if (not filas or any(f.get("estado") != "Presentado" for f in filas)
+                    or not set(periodos) <= {"1T", "2T", "3T", "4T"}
+                    or len(periodos) != len(set(periodos))):
+                raise ValueError("Primero revisa los periodos y acredita las declaraciones presentadas, sin duplicados.")
+            with self.db.transaccion():
+                # Pago, firma y cierre forman una sola operación: un fallo del
+                # recálculo no debe dejar un pago completado sin conciliación.
+                # Completar un pago vacío por NRC sigue la regla ya autorizada;
+                # no se alteran cuotas. La firma se calcula después de ese paso.
+                for fila in filas:
+                    tax_calculator.completar_pago_210_nrc(self.db, cid, "m210_alquiler", fila['codigo'])
+                firma = tax_calculator.firma_historial_210(
+                    self.db.listar("m210_alquiler", cid, inmueble=inmueble), inmueble, origen)
+                self.db.set_config(f"conciliacion_210|{cid}|{inmueble}|{origen}", json.dumps({
+                    "version": 1, "firma": firma, "saldos": verificados,
+                    "observacion": observacion.strip(), "fecha": date.today().isoformat()}, sort_keys=True))
+                resultado = self._recalcular_bd(cid, {activo}, activo)
+            return self._exportar_informe(cid, activo, resultado)
+
+    def confirmar_amortizacion_venta(self, cid: int, inmueble: str, ejercicio: int, importe: Any,
+                                    justificacion: str, firma_esperada: str, confirmado: bool = False) -> dict:
+        """Registra la cifra acreditada por el asesor sin reinterpretar su histórico."""
+        if confirmado is not True:
+            raise ValueError("Confirma que has contrastado la amortización acumulada con sus justificantes.")
+        n = database.a_euros(importe)
+        if isinstance(importe, bool) or n is None or not math.isfinite(n) or not 0 <= n <= 1e12:
+            raise ValueError("Indica un importe de amortización acumulada no negativo y finito.")
+        if not isinstance(justificacion, str) or len(justificacion.strip()) < 8:
+            raise ValueError("Indica el historial o justificante utilizado para acreditar la amortización.")
+        with self._lock:
+            self._importar(cid)
+            inm = self.db.get("inmuebles", cid, inmueble)
+            fv = a_fecha((inm or {}).get("fecha_venta"))
+            if not inm or not fv or not inm.get("precio_venta"):
+                raise ValueError("Primero registra la fecha y el precio de venta de este inmueble.")
+            previa = self.db.get_por_clave("obligaciones", cid, f"VENTA|{inmueble}")
+            if tax_calculator._presentado(previa):
+                raise ValueError("La venta ya está presentada: conserva el justificante y revisa su rectificación.")
+            firma = tax_calculator.firma_amortizacion_venta(self.db, cid, inmueble)
+            if firma != firma_esperada:
+                raise ValueError("El expediente cambió desde que abriste la revisión. Vuelve a contrastarlo.")
+            if n > tax_calculator.valor_adquisicion_total(inm) * tax_calculator.pct_titularidad(inm) + .005:
+                raise ValueError("La amortización del cliente no puede superar su valor de adquisición registrado.")
+            with self.db.transaccion():
+                self.db.set_config(f"amortizacion_venta|{cid}|{inmueble}", json.dumps({
+                    "version": 1, "importe": tax_calculator.r2(n), "justificacion": justificacion.strip(),
+                    "firma": firma, "fecha": date.today().isoformat()}, sort_keys=True))
+                resultado = self._recalcular_bd(cid, {fv.year, int(ejercicio)}, int(ejercicio))
+            return self._exportar_informe(cid, int(ejercicio), resultado)
+
     def establecer_periodicidad_210(self, cid: int, inmueble: str, ejercicio: int, periodicidad: str,
                                     al_recalcular: Optional[Callable[[dict], None]] = None) -> dict:
         if periodicidad not in ("Anual", "Trimestral"):
@@ -432,6 +525,10 @@ class Controlador:
         ej = int(ejercicio)
         if ej < 2024:
             raise ValueError("El selector anual/trimestral solo está disponible desde el ejercicio 2024.")
+        if periodicidad == "Trimestral":
+            raise ValueError("Desde 2024 la agrupación del 210 de alquiler es anual. "
+                             "El desglose trimestral de ocupación no es una declaración agrupada. "
+                             "La declaración separada por devengo requiere revisión del asesor.")
         with self._lock:
             if not self.db.get("inmuebles", cid, inmueble):
                 raise ValueError("El inmueble no pertenece a este cliente.")
@@ -866,7 +963,8 @@ class Controlador:
                                      for k in ("ejercicio", "inmueble", "id_modelo"))
                 if fila.get("estado") == "Presentado" and (
                         (previa or {}).get("estado") != "Presentado" or cambia_destino):
-                    self._validar_imputacion_presentable(cid, tabla, nuevo, fila_propuesta=fila)
+                    self._validar_imputacion_presentable(cid, tabla, nuevo, fila_propuesta=fila,
+                        presentada_previamente=tax_calculator._presentado(previa) and not cambia_destino)
                 if tabla == "inmuebles":
                     self.db.proteger_campos_inmueble(cid, nuevo, (
                         k for k in limpios if (previa or {}).get(k) != fila.get(k)))
@@ -1022,7 +1120,7 @@ class Controlador:
             antes, despues = cartera_de(cliente.get("tipo_cliente")), cartera_de(nuevo_tipo)
             if antes == despues:
                 return self.editar_datos_cliente(cid, ejercicio, {}, {}, nuevo_tipo)
-            tablas = (self._DECLARACIONES[:2] + ("patrimonio_714", "its_718")) if antes == NR else _DECLARACIONES_RES
+            tablas = (self._DECLARACIONES + ("patrimonio_714", "its_718")) if antes == NR else (*_DECLARACIONES_RES, "obligaciones")
             presentadas = [f"{t} {r['codigo']}" for t in tablas for r in self.db.listar(t, cid)
                            if r.get("estado") == "Presentado"]
             if presentadas:
@@ -1059,8 +1157,8 @@ class Controlador:
                         _carpeta_sin_enlaces(copia)
                         viejo.rename(copia)
                         respaldo = copia
-                    self.db.con.execute("DELETE FROM config WHERE clave IN (?,?,?,?)",
-                        tuple(f'{p}|{cid}' for p in ('excel_firma', 'excel_nombre', 'excel_version', 'excel_filas')))
+                    self.db.con.execute("DELETE FROM config WHERE clave IN (?,?,?,?,?)",
+                        tuple(f'{p}|{cid}' for p in ('excel_firma', 'excel_nombre', 'excel_version', 'excel_filas', 'excel_revision')))
             except Exception as exc:
                 fallos = []
                 if respaldo is not None:
@@ -1084,41 +1182,86 @@ class Controlador:
         if tabla == "documentos":
             return self.retirar_documento(cid, codigo, ejercicio)
         """Borra una fila. Inmuebles y contratos arrastran sus datos dependientes (A4-P04), salvo que el
-        inmueble tenga declaraciones ya presentadas: entonces se rechaza y se propone marcarlo como Baja."""
+        inmueble tenga declaraciones ya presentadas: entonces se conserva el histórico."""
         with self._lock:
             self._importar(cid)
             previa = self.db.get(tabla, cid, codigo)
-            if tabla in self._DEPENDIENTES:
-                campo, tablas = self._DEPENDIENTES[tabla]
-                presentadas = [f"{t} {r['codigo']}" for t in tablas if t in self._DECLARACIONES
-                               for r in self.db.listar(t, cid, **{campo: codigo}) if r.get("estado") == "Presentado"]
-                if presentadas:
-                    raise ValueError(f"{codigo} tiene declaraciones presentadas ({', '.join(presentadas[:3])}). "
-                                     "No se borra para conservar el histórico: cambia su estado a Baja o Vendido.")
-                contratos = [r["codigo"] for r in self.db.listar("contratos", cid, inmueble=codigo)]                     if tabla == "inmuebles" else [codigo]
-                for t in tablas:
-                    for r in self.db.listar(t, cid, **{campo: codigo}):
-                        self.db.borrar(t, cid, r["codigo"])
-                for ctr in contratos:  # inquilinos/rentas/cobros enlazados por contrato
-                    for t in ("inquilinos", "rentas", "cobros"):
-                        for r in self.db.listar(t, cid, contrato=ctr):
-                            self.db.borrar(t, cid, r["codigo"])
-            self.db.borrar(tabla, cid, codigo)
+            if tax_calculator._presentado(previa) and tabla in (*self._DECLARACIONES, 'patrimonio_714', 'its_718', *_DECLARACIONES_RES):
+                raise ValueError("La declaración está presentada: conserva el histórico y revisa su rectificación.")
+            if tabla == 'contratos' and previa:
+                inmueble = previa.get('inmueble')
+                if inmueble and any(tax_calculator._presentado(f) for t in self._DECLARACIONES
+                        for f in self.db.listar(t, cid, inmueble=inmueble)):
+                    raise ValueError("El inmueble tiene declaraciones presentadas: conserva el contrato como soporte "
+                                     "histórico y corrige sus fechas o estado, sin borrarlo.")
             afectados = {int(ejercicio)}
-            if tabla == "gastos":
+            if (previa or {}).get('ejercicio'):
+                afectados.add(int(previa['ejercicio']))
+            if tabla == 'gastos':
                 afectados |= tax_calculator.ejercicios_gasto(previa or {})
-            return self._recalcular_y_exportar(cid, afectados, int(ejercicio))
+            if tabla in ('inmuebles', 'contratos', 'rentas', 'residencias'):
+                modelos = _DECLARACIONES_RES if self._es_residente(cid) else ('m210_alquiler', 'm210_imputacion', 'patrimonio_714', 'its_718')
+                for modelo in modelos:
+                    afectados.update(int(r[0]) for r in self.db.con.execute(
+                        f'SELECT DISTINCT ejercicio FROM {modelo} WHERE cliente_id=? AND ejercicio IS NOT NULL', (cid,)))
+            with self.db.transaccion():
+                self._borrar_registro_dependientes(cid, tabla, codigo)
+                resultado = self._recalcular_bd(cid, afectados, int(ejercicio))
+            return self._exportar_informe(cid, int(ejercicio), resultado)
+
+    def _borrar_registro_dependientes(self, cid: int, tabla: str, codigo: str) -> None:
+        """Solo escrituras SQLite: el llamador garantiza transacción y protecciones."""
+        # Se conserva la comprobación del inmueble y su cascada explícita.
+        if tabla in self._DEPENDIENTES:
+            campo, tablas = self._DEPENDIENTES[tabla]
+            presentadas = [f"{t} {r['codigo']}" for t in tablas if t in self._DECLARACIONES
+                           for r in self.db.listar(t, cid, **{campo: codigo}) if r.get("estado") == "Presentado"]
+            if presentadas:
+                raise ValueError(f"{codigo} tiene declaraciones presentadas ({', '.join(presentadas[:3])}). "
+                                 "No se borra para conservar el histórico: revisa sus fechas y estado sin eliminarlo.")
+            contratos = ([r["codigo"] for r in self.db.listar("contratos", cid, inmueble=codigo)]
+                         if tabla == "inmuebles" else [codigo])
+            for t in tablas:
+                for r in self.db.listar(t, cid, **{campo: codigo}):
+                    self.db.borrar(t, cid, r["codigo"])
+            for ctr in contratos:  # inquilinos/rentas/cobros enlazados por contrato
+                for t in ("inquilinos", "rentas", "cobros"):
+                    for r in self.db.listar(t, cid, contrato=ctr):
+                        self.db.borrar(t, cid, r["codigo"])
+        self.db.borrar(tabla, cid, codigo)
 
     def _validar_imputacion_presentable(self, cid: int, tabla: str, codigo: str,
-                                          fila_propuesta: Optional[dict] = None) -> None:
+                                          fila_propuesta: Optional[dict] = None, *,
+                                          presentada_previamente: Optional[bool] = None) -> None:
         from validacion_catastro import revision_pendiente
         fila = fila_propuesta if fila_propuesta is not None else (self.db.get(tabla, cid, codigo) or {})
+        previa = self.db.get(tabla, cid, codigo) or {}
+        ya_presentada = (tax_calculator._presentado(previa) if presentada_previamente is None
+                         else presentada_previamente)
+        if tabla == 'm303' and not ya_presentada:
+            anio303 = fila.get('ejercicio') or previa.get('ejercicio')
+            periodo303 = fila.get('periodo') or previa.get('periodo')
+            if not anio303 or periodo303 not in fiscal_residentes.TRIMESTRES:
+                raise ValueError('El modelo 303 vinculado no existe o no tiene un ejercicio y periodo válidos. Revisa el registro antes de presentarlo.')
+            pendientes = fiscal_residentes.pendientes_saldo_303(self.db, cid,
+                int(anio303), periodo303)
+            if pendientes:
+                raise ValueError('El cálculo 303 es provisional: confirma primero con el asesor el destino de los saldos negativos anteriores.')
+        if (tabla == "obligaciones" and str(previa.get("clave") or "").startswith("VENTA|")
+                and not ya_presentada
+                and tax_calculator.amortizacion_venta_confirmada(self.db, cid, previa.get("inmueble")) is None):
+            raise ValueError("La venta es provisional: confirma la amortización acumulada acreditada en la ficha del inmueble.")
         if tabla == "obligaciones":
             modelo = fila.get("id_modelo")
-            if modelo and _PREFIJO_A_TABLA.get(modelo.rsplit("-", 1)[0]) == "m210_imputacion":
-                return self._validar_imputacion_presentable(cid, "m210_imputacion", modelo,
-                    fila_propuesta=self.db.get("m210_imputacion", cid, modelo))
+            destino_modelo = _PREFIJO_A_TABLA.get(modelo.rsplit("-", 1)[0]) if modelo else None
+            if destino_modelo in ('m210_imputacion', 'm303'):
+                return self._validar_imputacion_presentable(cid, destino_modelo, modelo,
+                    fila_propuesta=self.db.get(destino_modelo, cid, modelo))
         if tabla == "m210_imputacion" and (fila_propuesta is not None or fila.get("estado") != "Presentado"):
+            if int(fila.get("ejercicio") or 0) >= 2027 and not ya_presentada:
+                raise ValueError("La previsión de imputación desde 2027 es provisional: la nueva normativa "
+                                 "requiere validar el motor agregado antes de presentar desde este cálculo. "
+                                 "Las declaraciones ya presentadas y sus justificantes se conservan.")
             cat = self.db.catastro(cid, fila.get("inmueble"), fila.get("ejercicio"))
             if revision_pendiente(cat):
                 raise ValueError("La imputación es provisional: acredita la revisión catastral o confirma el porcentaje manual en Catastro antes de marcarla presentada.")
@@ -1139,20 +1282,57 @@ class Controlador:
         with self._lock:
             self._importar(cid)
             self._validar_imputacion_presentable(cid, tabla, codigo)
-            self.db.upsert(tabla, cid, {"codigo": codigo, **datos})
-            enlazados = []
-            if tabla == "obligaciones":
-                obl = self.db.get("obligaciones", cid, codigo) or {}
-                modelo = obl.get("id_modelo")
-                destino = _PREFIJO_A_TABLA.get((modelo or "").rsplit("-", 1)[0]) if modelo else None
-                if destino in CAMPOS_PRESENTACION:
-                    enlazados.append((destino, modelo))
-            else:
-                enlazados += [("obligaciones", o["codigo"]) for o in self.db.listar("obligaciones", cid, id_modelo=codigo)]
-            for t, cod in enlazados:
-                self.db.upsert(t, cid, {"codigo": cod, "estado": "Presentado",
-                                        "fecha_presentacion": datos["fecha_presentacion"], "pagado": pagado})
-            return self._recalcular_y_exportar(cid, {int(ejercicio)}, int(ejercicio))
+            with self.db.transaccion():
+                self.db.upsert(tabla, cid, {"codigo": codigo, **datos})
+                enlazados = []
+                if tabla == "obligaciones":
+                    obl = self.db.get("obligaciones", cid, codigo) or {}
+                    modelo = obl.get("id_modelo")
+                    destino = _PREFIJO_A_TABLA.get((modelo or "").rsplit("-", 1)[0]) if modelo else None
+                    if destino in CAMPOS_PRESENTACION:
+                        enlazados.append((destino, modelo))
+                else:
+                    enlazados += [("obligaciones", o["codigo"]) for o in self.db.listar("obligaciones", cid, id_modelo=codigo)]
+                for t, cod in enlazados:
+                    self.db.upsert(t, cid, {"codigo": cod, "estado": "Presentado",
+                                            "fecha_presentacion": datos["fecha_presentacion"], "pagado": pagado})
+                resultado = self._recalcular_bd(cid, {int(ejercicio)}, int(ejercicio))
+            return self._exportar_informe(cid, int(ejercicio), resultado)
+
+    def confirmar_saldo_303(self, cid: int, codigo: str, ejercicio: int, destino: str,
+                            saldo: Any, justificacion: str, firma_esperada: str, *, confirmado: bool = False) -> dict:
+        """Confirma el arrastre, sin reescribir el justificante presentado ni solicitar devoluciones a Hacienda."""
+        if destino not in ('compensar', 'devolver', 'pendiente'):
+            raise ValueError('Elige compensar, devolución solicitada o pendiente de revisar.')
+        if not confirmado:
+            raise ValueError('El asesor debe confirmar la elección y el saldo con su justificante.')
+        nota = str(justificacion or '').strip()
+        if destino != 'pendiente' and len(nota) < 8:
+            raise ValueError('Indica el justificante contrastado por el asesor.')
+        valor = database.a_euros(saldo) if destino == 'compensar' else 0.0
+        if valor is None or not math.isfinite(valor) or not 0 <= valor <= 1e12:
+            raise ValueError('Indica el saldo final a compensar acreditado, no negativo.')
+        with self._lock:
+            if not self._es_residente(cid):
+                raise ValueError('El modelo 303 pertenece a la cartera de residentes.')
+            self._importar(cid)
+            fila = self.db.get('m303', cid, codigo)
+            if not fila or not fiscal_residentes.saldo_303(self.db, cid, fila)['requiere']:
+                raise ValueError('No hay un saldo presentado pendiente de decisión para este registro.')
+            if fiscal_residentes.firma_saldo_303(fila) != firma_esperada:
+                raise ValueError('El justificante cambió. Vuelve a abrir la revisión antes de confirmar.')
+            if destino == 'devolver' and fila.get('periodo') != '4T':
+                raise ValueError('Este motor trimestral general solo contempla solicitar devolución en 4T. '
+                                 'Los supuestos especiales requieren revisión fuera de este flujo.')
+            minimo = fiscal_residentes.minimo_saldo_303(fila)
+            if destino == 'compensar' and valor + .005 < minimo:
+                raise ValueError('El saldo final no puede ser inferior al resultado negativo declarado. Revisa el justificante.')
+            dato = {'version':1, 'firma':firma_esperada, 'destino':destino, 'saldo':round(valor,2),
+                    'justificacion':nota, 'fecha_confirmacion':date.today().isoformat()}
+            with self.db.transaccion():
+                self.db.set_config(f'saldo303|{cid}|{codigo}', json.dumps(dato, ensure_ascii=False))
+                resultado = self._recalcular_bd(cid, {int(fila['ejercicio']),int(ejercicio)}, int(ejercicio))
+            return self._exportar_informe(cid, int(ejercicio), resultado)
 
     # ------------------------------------------------------------------ atajos usados por la UI y los tests
     def _datos_gananciales(self, cid: int, inmueble: str, activo: bool) -> dict:
@@ -1203,7 +1383,14 @@ class Controlador:
     def vista_inmuebles(self, cid: int, ejercicio: int, limite: Optional[int] = None,
                         desplazamiento: int = 0) -> list[dict]:
         out = []
-        conflictos = tax_calculator.conflictos_210_alquiler(self.lector, cid, int(ejercicio))
+        # El detector ya necesita el histórico del cliente. Reutilizar esa misma
+        # lectura evita repetir consultas por inmueble para el desglose y la firma.
+        modelos_210 = self.lector.listar("m210_alquiler", cid, orden="periodo")
+        conciliadas = tax_calculator.conciliaciones_210(self.lector, cid, modelos_210)
+        conflictos = tax_calculator._conflictos_modelos_210(modelos_210, int(ejercicio), set(conciliadas))
+        historias = {}
+        for modelo in modelos_210:
+            historias.setdefault(modelo.get("inmueble"), []).append(modelo)
         inmuebles = (self.lector.listar_pagina("inmuebles", cid, limite, desplazamiento)
                      if limite is not None else self.lector.iterar("inmuebles", cid))
         for inm in inmuebles:
@@ -1218,16 +1405,32 @@ class Controlador:
             if ref_compra in (None, "") and compra:
                 ref_compra = self.lector.valor_referencia_ejercicio(cid, inm["codigo"], compra.year)
             cobros = self.lector.listar("cobros", cid, inmueble=inm["codigo"], ejercicio=int(ejercicio))
-            desglose = [m for m in self.lector.listar(
-                "m210_alquiler", cid, inmueble=inm["codigo"], ejercicio=int(ejercicio), orden="periodo")
-                if m.get("estado") != "No procede"]
+            historia = historias.get(inm["codigo"], [])
+            desglose = [m for m in historia if m.get("ejercicio") == int(ejercicio)
+                        and (m.get("estado") != "No procede" or inm["codigo"] in conflictos)]
+            ejercicios_historicos = sorted({int(f["ejercicio"]) for f in historia
+                if f.get("ejercicio") and 2024 <= int(f["ejercicio"]) < int(ejercicio)
+                and tax_calculator.periodo_210_o_none(f.get("periodo")) in ("1T", "2T", "3T", "4T")
+                and f.get("estado") == "Presentado"})
             out.append({**inm, "_vp": vp, "_tit": tit, "_computado": round(vp.valor * tit, 2), "_catastro": cat,
+                        "_venta": ({"firma": tax_calculator.firma_amortizacion_venta(self.lector, cid, inm["codigo"]),
+                                    "acreditada": tax_calculator.amortizacion_venta_confirmada(self.lector, cid, inm["codigo"]),
+                                    "presentada": tax_calculator._presentado(self.lector.get_por_clave(
+                                        "obligaciones", cid, f"VENTA|{inm['codigo']}"))}
+                                   if inm.get("fecha_venta") and inm.get("precio_venta") else None),
                         **{"_" + k: v for k, v in ocupacion.items()},
                         "_ingresos_cobrados": tax_calculator.r2(sum(float(c.get("importe_cobrado") or 0) for c in cobros)),
                         "_valor_referencia_compra": ref_compra,
                         "_valor_referencia_actual": self.lector.valor_referencia_ejercicio(cid, inm["codigo"], int(ejercicio)),
                         "_anio_compra": compra.year if compra else None,
                         "_desglose_210": desglose,
+                        "_ocupacion_trimestral": [
+                            {"periodo": periodo, **tax_calculator.resumen_arrendamiento(
+                                inm, contratos, rentas, int(ejercicio), (desde, hasta))}
+                            for periodo, desde, hasta in tax_calculator.trimestres(int(ejercicio))],
                         "_revision_210": conflictos.get(inm["codigo"]),
+                        "_conciliaciones_pendientes": [
+                            {"ejercicio": e, "firma": tax_calculator.firma_historial_210(historia, inm["codigo"], e)}
+                            for e in ejercicios_historicos if (inm["codigo"], e) not in conciliadas],
                         "_periodicidad_210": tax_calculator.periodicidad_210_alquiler(self.lector, cid, inm["codigo"], int(ejercicio))})
         return out

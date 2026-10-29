@@ -101,6 +101,48 @@ def test_no_instala_desde_fuentes(tmp_path):
         updater.preparar_instalacion(tmp_path/'x.exe',consultar(asset()))
 
 
+def test_reintento_instalacion_usa_auxiliar_nuevo_y_detiene_solo_el_fallido(tmp_path, monkeypatch):
+    instalacion = tmp_path/'programa'; instalacion.mkdir()
+    (instalacion/'instalacion.ini').write_text('[instalacion]', encoding='utf-8')
+    cache = tmp_path/'cache'; cache.mkdir()
+    contenido = b'MZ'+b'\0'*58+(64).to_bytes(4, 'little')+b'PE\0\0'+b'x'*100
+    ruta = cache/'CAM-ficticio.exe'; ruta.write_bytes(contenido)
+    publicacion = consultar(asset(contenido))
+    monkeypatch.setattr(updater.sys, 'frozen', True, raising=False)
+    monkeypatch.setattr(updater.sys, 'executable', str(instalacion/updater.EXE_NAME))
+    monkeypatch.setattr(updater.app_paths, 'carpeta_actualizaciones', lambda: cache)
+    monkeypatch.setattr(updater, '_snapshot_previo', lambda _: None)
+    reloj = [0.0]
+    monkeypatch.setattr(updater.time, 'monotonic', lambda: reloj[0])
+    monkeypatch.setattr(updater.time, 'sleep', lambda _: reloj.__setitem__(0, reloj[0]+9))
+    procesos, auxiliares = [], []
+
+    class Proceso:
+        terminado = False
+        esperado = False
+        def poll(self): return 0 if self.terminado else None
+        def terminate(self): self.terminado = True
+        def wait(self, timeout): self.esperado = True; return 0
+
+    def lanzar(args, **kwargs):
+        auxiliar = Path(args[args.index('-File')+1]); auxiliares.append(auxiliar)
+        assert auxiliar.is_file()
+        proceso = Proceso(); procesos.append(proceso)
+        if len(procesos) == 2:
+            Path(args[args.index('-ReadyFile')+1]).write_text('listo')
+        return proceso
+
+    monkeypatch.setattr(updater.subprocess, 'Popen', lanzar)
+    with pytest.raises(ErrorActualizacion, match='sigue abierta'):
+        updater.preparar_instalacion(ruta, publicacion)
+    assert procesos[0].terminado and procesos[0].esperado
+    assert not auxiliares[0].exists() and ruta.read_bytes() == contenido
+    assert updater.preparar_instalacion(ruta, publicacion) is procesos[1]
+    assert auxiliares[0] != auxiliares[1]
+    assert not procesos[1].terminado and auxiliares[1].is_file()
+    assert not list(cache.glob('*.ready'))
+
+
 def test_banner_claro_oscuro_y_estados():
     import ui_estilo as ui
     from ui_actualizaciones import AvisoActualizacion,ESTADOS

@@ -162,8 +162,8 @@ def test_factura_pdf_a_bd_calculo_excel_y_soporte(tmp_path, monkeypatch):
         resultado = ctrl.procesar_pdf(cid, pdf, 2026)
         gastos = ctrl.db.listar("gastos", cid)
         assert len(gastos) == 1 and gastos[0]["total"] == 121
-        trimestre = next(r for r in ctrl.db.listar("m210_alquiler", cid) if r["periodo"] == "1T")
-        assert (trimestre["ingresos"], trimestre["gastos"], trimestre["base"], trimestre["cuota"]) == (3600, 121, 3479, 661.01)
+        anual = next(r for r in ctrl.db.listar("m210_alquiler", cid) if r["periodo"] == "Anual")
+        assert (anual["ingresos"], anual["gastos"], anual["base"], anual["cuota"]) == (14400, 121, 14279, 2713.01)
         assert (Path(cliente["carpeta"]) / gastos[0]["ruta"]).is_file()
         assert resultado["error_excel"] is None
         assert excel_generator.verificar_estructura(resultado["excel"]) == []

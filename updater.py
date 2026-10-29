@@ -208,25 +208,45 @@ def preparar_instalacion(ruta: Path, publicacion: Publicacion, *, db_path: Path 
         raise ErrorActualizacion("El instalador ha cambiado. Descarga la actualización otra vez.")
     _validar_ejecutable(ruta)
     _snapshot_previo(db_path)
-    auxiliar = cache / ("aplicar-" + ruta.stem + ".ps1")
-    with (app_paths.RECURSOS / "packaging" / "aplicar_actualizacion.ps1").open("rb") as origen, auxiliar.open("xb") as out:
-        shutil.copyfileobj(origen, out)
+    # Cada intento tiene su propio auxiliar: un fallo anterior no impide reintentar.
+    descriptor, nombre_auxiliar = tempfile.mkstemp(prefix="aplicar-", suffix=".ps1", dir=cache)
+    auxiliar = Path(nombre_auxiliar)
     acuse = auxiliar.with_suffix(".ready")
-    powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
-    args = [str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(auxiliar),
-            "-ParentId", str(os.getpid()), "-Installer", str(ruta), "-SHA256", publicacion.sha256,
-            "-InstallDir", str(instalacion), "-ReadyFile", str(acuse)]
-    proceso = subprocess.Popen(args, creationflags=subprocess.CREATE_NO_WINDOW, close_fds=True)
-    limite = time.monotonic() + 8
-    while time.monotonic() < limite:
-        if acuse.is_file():
+    proceso = None
+    preparado = False
+    try:
+        with os.fdopen(descriptor, "wb") as out:
+            with (app_paths.RECURSOS / "packaging" / "aplicar_actualizacion.ps1").open("rb") as origen:
+                shutil.copyfileobj(origen, out)
+        powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        args = [str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(auxiliar),
+                "-ParentId", str(os.getpid()), "-Installer", str(ruta), "-SHA256", publicacion.sha256,
+                "-InstallDir", str(instalacion), "-ReadyFile", str(acuse)]
+        proceso = subprocess.Popen(args, creationflags=subprocess.CREATE_NO_WINDOW, close_fds=True)
+        limite = time.monotonic() + 8
+        while time.monotonic() < limite:
+            if acuse.is_file():
+                acuse.unlink(missing_ok=True)
+                preparado = True
+                return proceso
+            if proceso.poll() is not None:
+                break
+            time.sleep(0.05)
+        raise ErrorActualizacion("No se pudo preparar la instalación. La aplicación sigue abierta.")
+    except OSError as exc:
+        raise ErrorActualizacion("No se pudo preparar la instalación. La aplicación sigue abierta.") from exc
+    finally:
+        if not preparado:
+            # Solo detenemos el proceso creado por este intento, antes de cerrar la app.
+            if proceso is not None and proceso.poll() is None:
+                proceso.terminate()
+                try:
+                    proceso.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proceso.kill()
+                    proceso.wait(timeout=5)
             acuse.unlink(missing_ok=True)
-            return proceso
-        if proceso.poll() is not None:
-            break
-        time.sleep(0.05)
-    proceso.terminate()
-    raise ErrorActualizacion("No se pudo preparar la instalación. La aplicación sigue abierta.")
+            auxiliar.unlink(missing_ok=True)
 
 
 def descartar_descarga(ruta: Path | None) -> None:

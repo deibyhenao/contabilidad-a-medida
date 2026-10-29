@@ -50,5 +50,5 @@ def test_fila_solo_con_valor_de_referencia_hereda_el_catastral_anterior(ctrl):
     cat = ctrl.db.catastro(cid, "INM-001", 2025)
     assert cat["valor_catastral"] == 90000 and cat["valor_referencia"] == 210000 and cat["_heredado"] == 2024
     fila = _imputacion(ctrl, cid, 2025)
-    assert fila["valor_catastral"] == 90000 and fila["pct_imputacion"] == pytest.approx(0.02)
+    assert fila["valor_catastral"] == 90000 and fila["pct_imputacion"] == pytest.approx(0.011)  # DA 55: revisión desde 2012 en 2025.
     assert fila["observaciones"].startswith("Valor catastral heredado de 2024")

@@ -1,5 +1,24 @@
 # Instalador y actualizaciones de Contabilidad a Medida
 
+## Novedades de la versión 1.0.7
+
+1. Agrupación anual del 210 de alquiler desde 2024 para cálculos nuevos. Los trimestres presentados y los pagos históricos se conservan; si impiden calcular con certeza, se identifica el inmueble y ejercicio que requieren revisión.
+2. Conciliación explícita del asesor para continuar después de calendarios históricos ambiguos, sin borrar lo presentado ni generar otro anual con el mismo pago. Los saldos acreditados de intereses y reparaciones se revisan antes de arrastrarlos.
+3. Imputación anual bisiesta limitada al porcentaje del año completo, conservando los días naturales. El Excel generado aplica el mismo criterio y redondeo; las imputaciones presentadas mantienen sus importes.
+4. Aplicación de la excepción de revisión colectiva desde 2012 en los ejercicios 2023–2026. El porcentaje acreditado por el asesor tiene prioridad. Los IBI posteriores no sustituyen silenciosamente valores o revisiones confirmados que sean distintos.
+5. Plazos del 210 diferenciados por ejercicio y resultado, con desplazamiento por fines de semana y festivos nacionales contrastados. Una ventana de devolución no se muestra como si su fecha inicial fuera un vencimiento. Los festivos autonómicos/locales y regímenes especiales requieren comprobación del asesor.
+6. En una venta, confirmación de la amortización acumulada acreditada que corresponde al cliente antes de considerar definitivo el cálculo. Si cambia el historial, se vuelve a pedir revisión; las ventas ya presentadas se conservan.
+7. En Residentes, revisión del destino de un 303 presentado negativo: compensar, devolución solicitada en 4T para el motor trimestral general o dejar pendiente. No se presenta ni solicita nada a Hacienda desde esta pantalla. Un saldo no confirmado deja los cálculos dependientes como provisionales e impide marcarlos presentados.
+8. Diálogos de revisión diseñados por Claude: acciones de teclado, confirmación explícita, scroll y conservación de campos ante errores corregibles. Si los datos se guardaron pero Excel falló, se indica que falta actualizar el libro y no se invita a guardar dos veces.
+9. Resumen de gastos con «Resto / sin asignar», incluyendo gastos manuales sin inmueble. El 303 distingue el importe histórico de su saldo aplicado; un resultado negativo no resta otras deudas en los resúmenes. Las plantillas originales no se modifican.
+10. Numeración anual de facturas sin colisiones entre ejercicios, conservando compatibilidad con registros antiguos; mejor identificación de emisor/destinatario y de retenciones de facturas rectificativas. Validación de fechas e importes para evitar aceptar sufijos inválidos, porcentajes o valores no finitos como euros.
+11. Reintentos del auxiliar de actualización con archivos independientes y limpieza limitada al intento fallido. Presentaciones, conciliaciones y borrados relacionados se confirman juntos en SQLite o se revierten si falla el cálculo. No se cambia la ubicación de clientes existentes al actualizar.
+12. Se mantienen la lectura habitual con Haiku, el respaldo selectivo con Sonnet, la caché y la selección de hasta 40 páginas de PDF largos. No se añade una segunda lectura de todos los archivos o chats. Las optimizaciones de consulta se aplican sin cargar toda la cartera para pintar un expediente.
+
+Para preparar una declaración elige su **ejercicio fiscal**, aunque la presentes al año siguiente. Las previsiones de imputación desde 2027 están identificadas como provisionales y no se pueden dar por definitivas desde el motor heredado hasta validar la nueva regla agregada; los justificantes ya presentados se conservan.
+
+La actualización desde 1.0.6 debe instalarse sobre el programa existente. Cierra Excel, conserva la ubicación de datos y comprueba después un cliente ya creado. No crees otro expediente ni copies un Excel ajeno encima del suyo. La renovación del formato del libro importa primero los datos manuales y conserva respaldo. La release 1.0.6 anterior no se sustituye.
+
 ## Novedades de la versión 1.0.6
 
 - Contratos editables con fecha de fin real y vista previa de días y renta. Admiten alquileres de varios trimestres o de parte de un trimestre. Guardar recalcula los modelos pendientes y actualiza el Excel.

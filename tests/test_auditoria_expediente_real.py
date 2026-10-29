@@ -84,7 +84,9 @@ def test_prorroga_sigue_alquilado_y_avisa(ctrl):
     cid, inm, _t, _v = _expediente(ctrl)
     inf = tc.recalcular_cliente(ctrl.db, cid, 2026)
     filas = {f["periodo"]: f for f in ctrl.db.listar("m210_alquiler", cid, ejercicio=2026)}
-    assert filas["2T"]["ingresos"] == 7200 and filas["4T"]["ingresos"] == 7200   # junio y siguientes siguen alquilados
+    assert filas["Anual"]["ingresos"] == 28800
+    tramos = ctrl.vista_inmuebles(cid, 2026)[0]['_ocupacion_trimestral']
+    assert tramos[1]['ingresos_devengados'] == tramos[3]['ingresos_devengados'] == 7200
     imp = ctrl.db.get_por_clave("m210_imputacion", cid, f"210I|2026|{inm}")
     assert imp is None or not imp.get("dias")                                  # ningún día vacío en 2026
     assert any(a.tipo.startswith("prórroga") and "31/05/2030" in a.mensaje for a in inf.alertas)

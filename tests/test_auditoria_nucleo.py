@@ -81,8 +81,8 @@ def test_bisiesto_contrato_sin_fin_y_titularidad_cero():
     res = tc.resolver_residencia({"pais": "Francia"})
     imp = tc.calcular_210_imputacion(inm, [], {"valor_catastral": 100000, "anio_revision": 2020}, res, 2024)
     assert imp.dias == 366
-    # Se conserva expresamente el divisor 365 exigido por la plantilla.
-    assert imp.renta_imputada == round(100000 * 0.011 * 366 / 365, 2)
+    # Los 366 días naturales no hacen superar la imputación anual completa.
+    assert imp.renta_imputada == 1100
     ctr = [{"codigo": "CTR-001", "fecha_inicio": "2024-01-01", "estado": "Vigente", "renta_inicial": 1000}]
     assert tc.calcular_210_imputacion(inm, ctr, {"valor_catastral": 100000}, res, 2024) is None
     inm["pct_titularidad"] = 0

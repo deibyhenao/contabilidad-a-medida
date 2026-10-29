@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 import os
 import re
 import sys
@@ -409,9 +410,12 @@ class App:
         return False
 
     def en_segundo_plano(self, texto: str, trabajo: Callable[[], dict], exito: Optional[str] = None,
-                         despues: Optional[Callable[[], None]] = None) -> bool:
+                         despues: Optional[Callable[[], None]] = None,
+                         al_fallar: Optional[Callable[[Exception], None]] = None) -> bool:
         """Ejecuta ``trabajo`` fuera del hilo de UI, aplica su informe y repinta. Errores -> aviso legible.
-        Devuelve False si había otra tarea en marcha (no se encola: el usuario lo repite al terminar)."""
+        Devuelve False si había otra tarea en marcha (no se encola: el usuario lo repite al terminar).
+        ``al_fallar`` recibe la excepción en el hilo de UI, tras los avisos habituales; no se llama si
+        devuelve False ni si la app se está cerrando."""
         if self.cerrando or not self._turno.acquire(blocking=False):
             if not self.cerrando:
                 self.avisar("Espera a que termine la tarea en curso.")
@@ -447,6 +451,8 @@ class App:
                     self._dialogo("Revisar cambios del Excel", mensaje, [entendido], icono=I.INFO_OUTLINE)
                 else:
                     self.avisar(str(error) or error.__class__.__name__, error=True)
+                if error is not None and al_fallar is not None:
+                    al_fallar(error)
             finally:
                 self._turno.release()
                 if not self.cerrando:
@@ -1196,6 +1202,7 @@ class App:
             uc.rejilla_ocupacion(v, self.ejercicio, p),
             ui.leyenda("Importes del inmueble antes de aplicar la titularidad. Adquisición = escritura + gastos registrados.", p),
             *self._fila_periodicidad(v, con_presentado),
+            *self._fila_revision_venta(v),
             uc.tabla_comparativa(uc.comparativa_valores(v, resumen, cat, self.ejercicio), p),
             *([ui.leyenda("Total parcial: falta registrar el precio de escritura.", p, p.naranja)] if resumen["parcial"] else []),
             desglose,
@@ -1226,12 +1233,184 @@ class App:
             return []
         bloqueo = ("Hay un 210 presentado en este ejercicio" if con_presentado else
                    f"Histórico anterior a {uc.PERIODICIDAD_DESDE}" if self.ejercicio < uc.PERIODICIDAD_DESDE else None)
+        if self.ejercicio >= 2024:
+            bloqueo = ("Histórico presentado conservado; revisa su conciliación antes de nuevas declaraciones."
+                       if con_presentado and actual == "Trimestral" else
+                       "Desde 2024 la agrupación fiscal es anual; la ocupación trimestral es informativa.")
         # Cambio en curso de este inmueble: bloqueado y con la fase; ``actual`` ya es lo guardado en BD.
         pendiente = self._periodicidad_en_curso()
         progreso = (pendiente["fase"] if pendiente and (pendiente["cid"], pendiente["ej"], pendiente["inmueble"])
                     == (self.cid, self.ejercicio, v["codigo"]) else None)
+        conciliaciones = [ui.boton(f"Conciliar histórico de {dato['ejercicio']}",
+            lambda _e, c=v['codigo'], d=dict(dato): self.dialogo_conciliar_210(c, d), self.p, tipo="texto")
+            for dato in (v.get("_conciliaciones_pendientes") or [])]
         return [uc.selector_periodicidad(actual, self.p, lambda e, c=v["codigo"], a=actual: self._cambiar_periodicidad(
-            e, c, a), bloqueo, progreso), *uc.desglose_210(v, actual, self.ejercicio, self.p)]
+            e, c, a), bloqueo, progreso), *conciliaciones, *uc.desglose_210(v, actual, self.ejercicio, self.p)]
+
+    def _fila_revision_venta(self, inmueble: dict) -> list:
+        venta = inmueble.get('_venta')
+        if not venta:
+            return []
+        p = self.p
+        if venta.get('presentada'):
+            return [ui.leyenda("Venta presentada: se conservan los datos del justificante.", p)]
+        acreditada = venta.get('acreditada')
+        if acreditada:
+            titulo = f"Confirmado · amortización acumulada acreditada {ui.eur(acreditada['importe'])}"
+            texto = "La venta usa este importe en los cálculos y en el Excel."
+            color, fondo, accion = p.texto, p.campo, "Cambiar importe"
+        else:
+            titulo = "Pendiente · falta confirmar la amortización acumulada acreditada"
+            texto = "La venta se calcula como provisional."
+            color, fondo, accion = p.naranja, p.naranja_suave, "Confirmar amortización"
+        return [ft.Container(ft.Column([
+            ui.leyenda(titulo, p, color),
+            ui.leyenda(texto, p),
+            ui.accion(accion, lambda _e: self.dialogo_amortizacion_venta(inmueble['codigo'], venta), p,
+                      tooltip=f"{accion} de la venta · {inmueble['codigo']}")],
+            spacing=4, tight=True),
+            bgcolor=fondo, border_radius=10, padding=ft.Padding.symmetric(horizontal=12, vertical=8))]
+
+    def dialogo_amortizacion_venta(self, inmueble: str, venta: dict) -> None:
+        cid, ej, p = self.cid, self.ejercicio, self.p
+        firma = str(venta['firma'])
+        anterior = venta.get('acreditada') or {}
+        estado = {'enviando': False, 'final': False}
+
+        registro = (f"Registrado: {ui.eur(anterior.get('importe'))}. Cancelar lo conserva." if anterior else
+                    "Sin importe confirmado: la venta se calcula como provisional.")
+        resumen = ft.Container(ft.Column([
+            ui.leyenda('Amortización acumulada de la venta', p),
+            ui.leyenda(registro, p, p.texto2 if anterior else p.naranja)], spacing=4, tight=True),
+            bgcolor=p.campo, border_radius=12, padding=ft.Padding.symmetric(horizontal=14, vertical=12))
+        importe = ui.campo("Amortización acumulada acreditada (€)", p,
+                           str(anterior['importe']) if anterior else "",
+                           ayuda="Total de este cliente, ya aplicada su titularidad.",
+                           on_change=lambda _e: refrescar())
+        importe.autofocus = True
+        nota = ui.campo("Historial y justificantes contrastados", p, anterior.get('justificacion') or "",
+                        ayuda="Obligatorio, mínimo 8 caracteres.", on_change=lambda _e: refrescar())
+        confirmar = ft.Checkbox(label="Contrasté historial: sin duplicados ni mobiliario",
+                               value=False, on_change=lambda _e: refrescar())
+        consecuencia = ui.leyenda('', p, p.naranja)
+        requisito = ui.leyenda('', p, p.texto3)
+        error = ui.leyenda('', p, p.rojo)
+        error.visible = False
+        progreso = ft.Row([ft.ProgressRing(width=16, height=16, stroke_width=2, color=p.acento),
+                           ui.leyenda('Guardando el importe…', p)], spacing=8, visible=False)
+
+        def validar():
+            if (self.cid, self.ejercicio) != (cid, ej):
+                return None, 'el expediente activo ha cambiado; cierra y abre de nuevo esta revisión.'
+            texto = str(importe.value or '').strip()
+            if not texto or '%' in texto:
+                return None, 'indica el importe en euros; no uses porcentajes.'
+            try:
+                valor = database.a_euros(texto)
+            except (ValueError, TypeError, OverflowError):
+                valor = None
+            if valor is None or not math.isfinite(valor) or not 0 <= valor <= 1e12:
+                return None, 'el importe debe ser válido y no negativo.'
+            justificacion = str(nota.value or '').strip()
+            if len(justificacion) < 8:
+                return None, 'describe el historial o justificante que acredita el importe (mínimo 8 caracteres).'
+            if not confirmar.value:
+                return None, 'marca la confirmación del asesor.'
+            return (float(valor), justificacion), None
+
+        def refrescar(actualizar: bool = True) -> None:
+            datos, motivo = validar()
+            consecuencia.value = ('Has indicado 0,00 €: guárdalo solo si el historial lo acredita.'
+                                  if datos and datos[0] == 0 else '')
+            consecuencia.visible = bool(consecuencia.value)
+            bloqueado = estado['enviando'] or estado['final']
+            guardar.disabled = bool(motivo) or bloqueado
+            guardar.opacity = 0.45 if guardar.disabled else 1.0
+            requisito.value = f'Para guardar: {motivo}' if motivo and not bloqueado else ''
+            requisito.visible = bool(requisito.value)
+            if actualizar:
+                self.page.update()
+
+        def al_guardar(_e) -> None:
+            if estado['enviando'] or estado['final']:
+                return
+            if self.ocupada():
+                error.value, error.visible = 'Hay una tarea en curso; no ha cambiado nada. Espera a que termine.', True
+                self.page.update()
+                return
+            datos, motivo = validar()
+            if motivo:
+                refrescar()
+                return
+            valor, justificacion = datos
+            self._enviar_dialogo(ctx, "Confirmando la venta y actualizando Excel…",
+                                 lambda: self.ctrl.confirmar_amortizacion_venta(cid, inmueble, ej, valor,
+                                                                                justificacion, firma, confirmado=True),
+                                 "Amortización confirmada. Venta y Excel actualizados.")
+
+        guardar = ui.accion("Confirmar importe", al_guardar, p, tipo="primario")
+        cancelar = ui.accion("Cancelar", self.cerrar_dialogo, p)
+        cerrar = ui.accion("Cerrar", self.cerrar_dialogo, p)
+        cerrar.visible = False
+        ctx = {'estado': estado, 'editables': [importe, nota, confirmar], 'guardar': guardar,
+               'cancelar': cancelar, 'cerrar': cerrar, 'progreso': progreso, 'error': error, 'refrescar': refrescar}
+        refrescar(False)
+        ctx['dialogo'] = self._dialogo("Amortización de la venta", ft.Column([
+            ui.leyenda("Introduce el total que corresponde a este cliente, ya aplicada su titularidad. "
+                       "Contrasta la construcción con el historial de alquileres y declaraciones. "
+                       "No sumes dos veces el mismo año ni incluyas mobiliario. "
+                       "La app no presupone un mínimo fiscal para sustituir esta comprobación.", p),
+            resumen, importe, consecuencia, nota, confirmar, requisito, progreso, error],
+            spacing=12, tight=True), [cancelar, cerrar, guardar], ancho=560)
+
+    def dialogo_conciliar_210(self, inmueble: str, historico: dict) -> None:
+        """Confirmación del asesor: no modifica declaraciones históricas ni presenta nada."""
+        cid, activo, origen = self.cid, self.ejercicio, int(historico['ejercicio'])
+        p = self.p
+        campos = {a: ui.campo(f"Saldo de intereses y reparaciones de {a} (€)", p, "0,00",
+                              ayuda="Solo el saldo pendiente acreditado; escribe 0 si no existe.")
+                  for a in range(origen - 3, origen + 1)}
+        nota = ui.campo("Justificante o comprobación realizada", p)
+        confirmar = ft.Checkbox(label="He contrastado las declaraciones y todos los saldos con sus justificantes.", value=False)
+        error = ui.leyenda("", p, p.rojo)
+
+        def guardar(_e):
+            if self.ocupada():
+                self.avisar("Espera a que termine la tarea en curso.")
+                return
+            if (self.cid, self.ejercicio) != (cid, activo):
+                error.value = "Vuelve a abrir esta revisión en el cliente y ejercicio correctos."
+                self.page.update()
+                return
+            if not confirmar.value:
+                error.value = "Confirma que has contrastado el histórico y sus saldos."
+                self.page.update()
+                return
+            try:
+                saldos = {a: database.a_euros(campo.value) for a, campo in campos.items()}
+            except (ValueError, TypeError, OverflowError):
+                saldos = {}
+            observacion = str(nota.value or "").strip()
+            if len(saldos) != len(campos) or any(v is None or not math.isfinite(v) or not 0 <= v <= 1e12 for v in saldos.values()):
+                error.value = "Revisa los cuatro saldos. Indica importes no negativos; escribe 0 si no existe saldo."
+                self.page.update()
+                return
+            if len(observacion) < 8:
+                error.value = "Indica el justificante o la comprobación realizada."
+                self.page.update()
+                return
+            firma = str(historico['firma'])
+            self.cerrar_dialogo()
+            self.en_segundo_plano("Conciliando histórico y actualizando Excel…",
+                lambda: self.ctrl.conciliar_historial_210(cid, inmueble, origen, activo, saldos,
+                    observacion, firma, confirmado=True), "Histórico conciliado para ejercicios posteriores. Excel actualizado.")
+
+        self._dialogo(f"Revisar cierre de {origen}", ft.Column([
+            ui.leyenda(f"Permite continuar {activo} sin borrar ni recalcular lo presentado en {origen}. "
+                       "No crea otra declaración de ese año. Los saldos que confirmes se usarán en los cálculos posteriores.", p),
+            *campos.values(), nota, confirmar, error], spacing=12, tight=True),
+            [ui.boton("Cancelar", self.cerrar_dialogo, p, tipo="texto"),
+             ui.boton("Confirmar cierre", guardar, p)], ancho=620)
 
     def _periodicidad_en_curso(self) -> Optional[dict]:
         pendiente = getattr(self, "_periodicidad_pendiente", None)
@@ -1246,7 +1425,8 @@ class App:
             return
 
         def restaurar():  # el selector vuelve a lo guardado, sin estado pendiente
-            selector.disabled = False
+            # Los históricos son de solo lectura y desde 2024 solo se agrupa anual.
+            selector.disabled = True
             selector.selected_index = uc.PERIODICIDADES_210.index(actual)
             uc.marcar_periodicidad(selector, self.p)
             uc.mostrar_progreso_periodicidad(selector, None, self.p)
@@ -2573,19 +2753,250 @@ class App:
         filas = self.ctrl.lector.listar(tabla, self.cid, ejercicio=self.ejercicio)
         return sorted(filas, key=lambda f: (orden.get(f.get("periodo"), 9), f.get("modelo") or ""))
 
+    def _enviar_dialogo(self, ctx: dict, texto: str, trabajo: Callable[[], dict], exito: str) -> None:
+        """Guarda sin cerrar el diálogo: lo bloquea mientras dura, lo cierra solo si termina bien y,
+        si falla, conserva lo escrito o deja un estado final cuando los datos ya cambiaron.
+        ctx: estado, editables, guardar, cancelar, cerrar, progreso, error, refrescar y dialogo."""
+        estado, error = ctx['estado'], ctx['error']
+
+        def bloquear(activo: bool) -> None:
+            estado['enviando'] = activo
+            for control in ctx['editables']:
+                control.disabled = activo
+            ctx['cancelar'].disabled = activo
+            ctx['progreso'].visible = activo
+            if activo:
+                error.value, error.visible = '', False
+            ctx['refrescar'](False)
+
+        def mostrar(mensaje: str) -> None:
+            error.value, error.visible = mensaje, True
+            self.page.update()
+
+        def cerrar_si_sigue_abierto() -> None:
+            pila = getattr(self, '_dialogos', [])
+            if pila and pila[-1] is ctx.get('dialogo'):
+                self.cerrar_dialogo()
+
+        def finalizar(mensaje: str) -> None:
+            estado['enviando'], estado['final'] = False, True
+            for control in ctx['editables']:
+                control.disabled = True
+            ctx['progreso'].visible = False
+            ctx['guardar'].visible = ctx['cancelar'].visible = False
+            ctx['cerrar'].visible = True
+            ctx['refrescar'](False)
+            mostrar(mensaje)
+
+        def al_fallar(exc: Exception) -> None:
+            if isinstance(exc, CalculoConfirmadoSinExcel):
+                finalizar('La decisión se ha guardado y los cálculos están actualizados, pero el Excel no. '
+                          'Revisa el aviso del Excel; no vuelvas a guardar esta decisión.')
+            elif isinstance(exc, excel_generator.ExcelConflictoImportacion):
+                finalizar('No se ha completado por un conflicto con el Excel (ver «Revisar cambios del Excel»). '
+                          'Resuélvelo y abre de nuevo esta revisión para ver el estado registrado antes de repetir.')
+            else:
+                bloquear(False)
+                mostrar(f'No se ha guardado: {str(exc) or exc.__class__.__name__}. '
+                        'Lo escrito se conserva; corrígelo y vuelve a guardar.')
+
+        bloquear(True)
+        self.page.update()
+        try:
+            lanzado = self.en_segundo_plano(texto, trabajo, exito, despues=cerrar_si_sigue_abierto,
+                                            al_fallar=al_fallar)
+        except Exception:
+            bloquear(False)
+            mostrar('No se pudo iniciar el guardado; no ha cambiado nada. Inténtalo de nuevo.')
+            raise
+        if not lanzado:
+            bloquear(False)
+            mostrar('Hay otra tarea en curso; no ha cambiado nada. Vuelve a guardar cuando termine.')
+
     def _sec_303(self) -> ft.Control:
+        import fiscal_residentes as fr
         p = self.p
-        filas = []
+        nombres = {'compensar': 'a compensar', 'devolver': 'devolución solicitada'}
+        filas, hay_saldos = [], False
         for f in self._filas_modelo_res("m303"):
             detalle = (f"Devengado {ui.eur(f.get('iva_devengado'))} · deducible {ui.eur(f.get('iva_deducible'))}"
                        f" · compensado {ui.eur(f.get('compensacion_anterior'))}"
                        + (f" · a compensar {ui.eur(f.get('a_compensar'))}" if f.get("a_compensar") else ""))
             filas.append(self._fila_modelo("m303", f, f"303 · {f['periodo']} {self.ejercicio}", detalle,
                                            float(f.get("a_ingresar") or 0)))
+            resolucion = fr.saldo_303(self.ctrl.lector, self.cid, f)
+            if not resolucion['requiere']:
+                continue
+            hay_saldos = True
+            if resolucion['pendiente']:
+                titulo = "Pendiente · destino del saldo sin confirmar"
+                texto = "Los periodos posteriores se calculan como provisionales."
+                color, fondo, accion = p.naranja, p.naranja_suave, "Confirmar destino"
+            else:
+                titulo = f"Confirmado · {nombres.get(resolucion['destino'], resolucion['destino'])}"
+                texto = (f"Saldo aplicado en periodos posteriores: {ui.eur(resolucion['saldo'])}. "
+                         "El justificante conserva su importe registrado.")
+                color, fondo, accion = p.texto, p.campo, "Cambiar decisión"
+            filas.append(ft.Container(ft.Column([
+                ui.leyenda(titulo, p, color),
+                ui.leyenda(texto, p),
+                ui.accion(accion, lambda _e, fila=dict(f): self.dialogo_saldo_303(fila), p,
+                          tooltip=f"{accion} del saldo · 303 {f['periodo']} {self.ejercicio}")],
+                spacing=4, tight=True),
+                bgcolor=fondo, border_radius=10, padding=ft.Padding.symmetric(horizontal=12, vertical=8)))
+        notas = [ui.leyenda("IVA de las emitidas − IVA deducible de las recibidas − lo pendiente de compensar. "
+                            "Una declaración presentada queda congelada.", p, p.texto3)]
+        if hay_saldos:
+            notas.append(ui.leyenda("En el Excel, «a compensar» conserva el importe registrado en el justificante; "
+                                    "los periodos posteriores y el resumen usan el saldo aplicado según la decisión.",
+                                    p, p.texto3))
         return ft.Column([self._bloque(f"IVA · modelo 303 · {self.ejercicio}", filas, vacio=(
-            "Sin 303: el régimen de IVA no es el general o aún no hay facturas.")),
-            ui.leyenda("IVA de las emitidas − IVA deducible de las recibidas − lo pendiente de compensar. "
-                       "Una declaración presentada queda congelada.", p, p.texto3)], spacing=12)
+            "Sin 303: el régimen de IVA no es el general o aún no hay facturas.")), *notas], spacing=12)
+
+    def dialogo_saldo_303(self, fila: dict) -> None:
+        import fiscal_residentes as fr
+        cid, ej, p = self.cid, self.ejercicio, self.p
+        codigo, periodo = fila['codigo'], fila.get('periodo')
+        previa = fr.saldo_303(self.ctrl.lector, cid, fila)
+        firma = previa.get('firma') or fr.firma_saldo_303(fila)
+        minimo = float(fr.minimo_saldo_303(fila))
+        presentado = float(fila.get('a_ingresar') or 0)
+        if presentado == 0 and minimo > 0:
+            presentado = -minimo
+        nombres = {'compensar': 'a compensar', 'devolver': 'devolución solicitada'}
+        confirmada = (bool(previa.get('requiere')) and not previa.get('pendiente')
+                      and previa.get('destino') in nombres)
+        opciones = [('compensar', 'Se dejó a compensar en periodos posteriores')]
+        if periodo == '4T':
+            opciones.append(('devolver', 'Se solicitó devolución'))
+        opciones.append(('pendiente', 'Aún no lo he contrastado: dejar pendiente'))
+        validas = dict(opciones)
+        estado = {'enviando': False, 'final': False}
+
+        registro = (f"Registrado: {nombres[previa['destino']]} · saldo aplicado en periodos posteriores "
+                    f"{ui.eur(previa['saldo'])}. Cancelar lo conserva." if confirmada else
+                    "Sin decisión confirmada: los periodos posteriores se calculan como provisionales.")
+        resumen = ft.Container(ft.Column([
+            ui.leyenda('Resultado del justificante', p),
+            ui.leyenda(ui.eur(presentado), p, p.texto, size=17),
+            ui.leyenda(registro, p, p.texto2 if confirmada else p.naranja)], spacing=4, tight=True),
+            bgcolor=p.campo, border_radius=12, padding=ft.Padding.symmetric(horizontal=14, vertical=12))
+
+        destino = ui.desplegable('Qué consta en el justificante', opciones, p, None,
+                                 on_select=lambda _e: al_elegir())
+        destino.autofocus = True
+        saldo = ui.campo('Saldo total acreditado para periodos posteriores (€)', p,
+                         str(previa['saldo']) if confirmada and previa['destino'] == 'compensar' else '',
+                         ayuda=(f"Incluye saldos anteriores que sigan pendientes. Mínimo {ui.eur(minimo)}."
+                                if minimo else "Incluye saldos anteriores que sigan pendientes."),
+                         on_change=lambda _e: refrescar())
+        nota = ui.campo('Justificante contrastado y observaciones', p, '', on_change=lambda _e: refrescar())
+        confirmar = ft.Checkbox(value=False, on_change=lambda _e: refrescar())
+        consecuencia = ui.leyenda('', p)
+        requisito = ui.leyenda('', p, p.texto3)
+        error = ui.leyenda('', p, p.rojo)
+        error.visible = False
+        progreso = ft.Row([ft.ProgressRing(width=16, height=16, stroke_width=2, color=p.acento),
+                           ui.leyenda('Guardando la decisión…', p)], spacing=8, visible=False)
+        etiquetas = {
+            'compensar': 'Como asesor, confirmo elección y saldo acreditado',
+            'devolver': 'Como asesor, confirmo justificante de devolución',
+            'pendiente': 'Como asesor, decido dejar el saldo pendiente',
+        }
+        consecuencias = {
+            'compensar': ('Este saldo se aplicará a los periodos posteriores. En el Excel, «a compensar» de este '
+                          'periodo seguirá mostrando el importe registrado en el justificante.', p.texto2),
+            'devolver': ('El saldo aplicable a periodos posteriores pasa a 0,00 €. '
+                         'No se envía ninguna solicitud a Hacienda.', p.texto2),
+            'pendiente': (('Se retirará la decisión registrada y los periodos posteriores volverán a ser '
+                           'provisionales. El historial se conserva.') if confirmada else
+                          'Los periodos posteriores seguirán siendo provisionales hasta que confirmes el destino.',
+                          p.naranja),
+        }
+
+        def validar():
+            if (self.cid, self.ejercicio) != (cid, ej):
+                return None, 'el expediente activo ha cambiado; cierra y abre de nuevo esta revisión.'
+            eleccion = destino.value
+            if eleccion not in validas or (eleccion == 'devolver' and periodo != '4T'):
+                return None, 'elige qué consta en el justificante.'
+            observacion = str(nota.value or '').strip()
+            valor = 0.0
+            if eleccion == 'compensar':
+                texto = str(saldo.value or '').strip()
+                if not texto or '%' in texto:
+                    return None, 'indica el saldo en euros; no uses porcentajes.'
+                try:
+                    valor = database.a_euros(texto)
+                except (ValueError, TypeError, OverflowError):
+                    valor = None
+                if valor is None or not math.isfinite(valor) or not 0 <= valor <= 1e12:
+                    return None, 'el saldo debe ser un importe en euros válido y no negativo.'
+                valor = float(valor)
+                if valor + 0.005 < minimo:
+                    return None, f'el saldo no puede ser inferior a {ui.eur(minimo)}, el importe del justificante.'
+            if eleccion != 'pendiente' and len(observacion) < 8:
+                return None, 'describe el justificante contrastado (mínimo 8 caracteres).'
+            if not confirmar.value:
+                return None, 'marca la confirmación del asesor.'
+            return (eleccion, valor, observacion), None
+
+        def refrescar(actualizar: bool = True) -> None:
+            eleccion = destino.value
+            saldo.visible = eleccion == 'compensar'
+            nota.helper = ('Opcional al dejarlo pendiente.' if eleccion == 'pendiente'
+                           else 'Obligatorio, mínimo 8 caracteres.')
+            confirmar.label = etiquetas.get(eleccion, 'Soy el asesor y confirmo esta decisión.')
+            consecuencia.value, consecuencia.color = consecuencias.get(eleccion, ('', p.texto2))
+            consecuencia.visible = bool(consecuencia.value)
+            bloqueado = estado['enviando'] or estado['final']
+            _datos, motivo = validar()
+            guardar.disabled = bool(motivo) or bloqueado
+            guardar.opacity = 0.45 if guardar.disabled else 1.0
+            requisito.value = f'Para guardar: {motivo}' if motivo and not bloqueado else ''
+            requisito.visible = bool(requisito.value)
+            if actualizar:
+                self.page.update()
+
+        def al_elegir() -> None:
+            confirmar.value = False  # la confirmación se refiere a la elección concreta
+            refrescar()
+
+        def al_guardar(_e) -> None:
+            if estado['enviando'] or estado['final']:
+                return
+            if self.ocupada():
+                error.value, error.visible = 'Hay una tarea en curso; no ha cambiado nada. Espera a que termine.', True
+                self.page.update()
+                return
+            datos, motivo = validar()
+            if motivo:
+                refrescar()
+                return
+            eleccion, valor, observacion = datos
+            exito = {
+                'compensar': 'Saldo a compensar confirmado. Cálculos y Excel actualizados.',
+                'devolver': 'Devolución registrada. Cálculos y Excel actualizados.',
+                'pendiente': 'Saldo marcado como pendiente. Periodos posteriores provisionales; Excel actualizado.',
+            }[eleccion]
+            self._enviar_dialogo(ctx, 'Registrando el destino del saldo 303 y actualizando Excel…',
+                                 lambda: self.ctrl.confirmar_saldo_303(cid, codigo, ej, eleccion, valor,
+                                                                       observacion, firma, confirmado=True), exito)
+
+        guardar = ui.accion('Guardar decisión', al_guardar, p, tipo='primario')
+        cancelar = ui.accion('Cancelar', self.cerrar_dialogo, p)
+        cerrar = ui.accion('Cerrar', self.cerrar_dialogo, p)
+        cerrar.visible = False
+        ctx = {'estado': estado, 'editables': [destino, saldo, nota, confirmar], 'guardar': guardar,
+               'cancelar': cancelar, 'cerrar': cerrar, 'progreso': progreso, 'error': error, 'refrescar': refrescar}
+        refrescar(False)
+        ctx['dialogo'] = self._dialogo(f"Destino del saldo · 303 {periodo}/{fila.get('ejercicio', ej)}", ft.Column([
+            ui.leyenda('Un resultado negativo no indica por sí solo si se eligió compensar o devolver. '
+                       'Esta decisión ordena los cálculos locales; no presenta ni solicita nada a Hacienda. '
+                       'La devolución en este flujo trimestral general solo se contempla en 4T.', p),
+            resumen, destino, saldo, consecuencia, nota, confirmar, requisito, progreso, error],
+            spacing=12, tight=True), [cancelar, cerrar, guardar], ancho=560)
+
 
     def _sec_130(self) -> ft.Control:
         p = self.p
@@ -2599,7 +3010,8 @@ class App:
         return ft.Column([self._bloque(f"IRPF · pago fraccionado 130 · {self.ejercicio}", filas, vacio=(
             "Sin 130: solo para autónomos en estimación directa obligados a presentarlo.")),
             ui.leyenda("20 % del rendimiento acumulado − retenciones − pagos anteriores del año. En la simplificada, "
-                       "5 % de difícil justificación (máx. 2.000 €).", p, p.texto3)], spacing=12)
+                       f"{7 if self.ejercicio == 2023 else 5} % de difícil justificación (máx. 2.000 €).",
+                       p, p.texto3)], spacing=12)
 
     def _sec_retenciones(self) -> ft.Control:
         p = self.p
@@ -3512,14 +3924,25 @@ class App:
             nuevo_tipo = dd_tipo.value or c.get("tipo_cliente")
             if nuevo_tipo != c.get("tipo_cliente") and cartera_de(nuevo_tipo) != cartera_de(c.get("tipo_cliente")):
                 self.cerrar_dialogo()
-                self._confirmar_cambio_cartera(cid, nuevo_tipo, ej)
+                if datos or residencia:
+                    # «Guardar» confirma las ediciones personales. El traslado
+                    # sigue requiriendo su confirmación independiente posterior.
+                    def tras_guardar():
+                        self._refrescar_clientes()
+                        if (self.cid, self.ejercicio) == (cid, ej):
+                            self._confirmar_cambio_cartera(cid, nuevo_tipo, ej)
+                    self.en_segundo_plano("Guardando datos antes del cambio de cartera…",
+                        lambda: self.ctrl.editar_datos_cliente(cid, ej, datos, residencia, c.get("tipo_cliente")),
+                        "Datos guardados. El cambio de cartera todavía requiere confirmación.", despues=tras_guardar)
+                else:
+                    self._confirmar_cambio_cartera(cid, nuevo_tipo, ej)
                 return
             self.cerrar_dialogo()
 
             def trabajo():
                 return self.ctrl.editar_datos_cliente(cid, ej, datos, residencia, nuevo_tipo)
-            self.en_segundo_plano("Guardando datos del cliente…", trabajo, "Datos del cliente actualizados.")
-            self._refrescar_clientes()
+            self.en_segundo_plano("Guardando datos del cliente…", trabajo, "Datos del cliente actualizados.",
+                                  despues=self._refrescar_clientes)
 
         self._dialogo("Datos del cliente", ft.Column([
             ft.ResponsiveRow([ft.Container(tf, col={"xs": 12, "sm": 6}) for tf in f.values()], spacing=10, run_spacing=12),
@@ -3704,6 +4127,7 @@ class App:
         """El vigilante espera la nota del asesor ANTES de extraer o enviar documentos."""
         evento = threading.Event()
         decision = {"rutas": None, "comentario": "", "cancelado": False, "abierta": False}
+        errores_apertura = []
         self._evento_dialogo = evento
         def mostrar():
             if self.cerrando or (self.cid, self.ejercicio) != (cid, ej) or getattr(self, "_revision_abierta", False):
@@ -3738,10 +4162,21 @@ class App:
                 dlg.on_dismiss = descartado
             else:
                 evento.set()
+        def mostrar_seguro():
+            try:
+                mostrar()
+            except Exception as exc:
+                # Una excepción del callback UI no llega al hilo que espera.
+                # Señalar el evento evita dejar el turno bloqueado indefinidamente.
+                errores_apertura.append(exc)
+                evento.set()
         try:
-            ejecutar_en_ui(self.page, mostrar)
+            ejecutar_en_ui(self.page, mostrar_seguro)
             while not self.cerrando and not evento.wait(.25):
                 pass
+            if errores_apertura:
+                raise RuntimeError("No se pudo abrir la revisión de la bandeja. "
+                                   "Los documentos permanecen en su carpeta.") from errores_apertura[0]
             return decision if not self.cerrando else None
         finally:
             if decision["abierta"]:
@@ -3762,7 +4197,12 @@ class App:
                     and x.suffix.lower().lstrip(".") in adj.EXTENSIONES and x.resolve().parent == bandeja), key=lambda x:x.name) if bandeja and bandeja.is_dir() else []
                 firma = tuple((x.name, x.stat().st_size, x.stat().st_mtime_ns) for x in pendientes)
                 pospuestas = getattr(self, "_bandejas_pospuestas", {})
-                hay_pdfs = bool(pendientes) and pospuestas.get(cid) != firma
+                apartadas = set(pospuestas.get(cid, ())) & set(firma)
+                pendientes = [x for x, dato in zip(pendientes, firma) if dato not in apartadas]
+                firma = tuple(dato for dato in firma if dato not in apartadas)
+                # Posponer por archivo evita reofrecer los desmarcados cuando
+                # quedan más documentos que el máximo admitido por lote.
+                hay_pdfs = bool(pendientes)
             except Exception:
                 continue
             if not hay_pdfs or not self._turno.acquire(blocking=False):
@@ -3794,7 +4234,7 @@ class App:
                 seleccion = self._revisar_lote_bandeja(cid, ej, pendientes[:adj.MAX_ARCHIVOS])
                 if not seleccion or not seleccion["rutas"]:
                     if seleccion and seleccion["cancelado"]:
-                        self._bandejas_pospuestas = {**pospuestas, cid: firma}
+                        self._bandejas_pospuestas = {**pospuestas, cid: tuple(apartadas | set(firma))}
                     continue
                 ejecutar_en_ui(self.page, lambda: self.set_ocupado(True, "Procesando documentos de la bandeja…")
                                if not self.cerrando else None)
@@ -3804,7 +4244,7 @@ class App:
                 retiradas = set(pendientes[:adj.MAX_ARCHIVOS]) - set(seleccion["rutas"])
                 if retiradas:
                     firma_retiradas = tuple((x.name,x.stat().st_size,x.stat().st_mtime_ns) for x in sorted(retiradas) if x.is_file())
-                    self._bandejas_pospuestas = {**pospuestas, cid: firma_retiradas}
+                    self._bandejas_pospuestas = {**pospuestas, cid: tuple(apartadas | set(firma_retiradas))}
             except Exception as exc:
                 mensaje = f"Bandeja: {exc}"
                 ejecutar_en_ui(self.page, lambda texto=mensaje: self.avisar(texto, True) if not self.cerrando else None)
