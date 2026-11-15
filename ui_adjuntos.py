@@ -200,7 +200,7 @@ class RevisionDocumentos:
             max_length=MAX_COMENTARIO, autofocus=True, filled=True, fill_color=p.campo, border=ui._bordes(p),
             text_size=14, color=p.texto, cursor_color=p.acento,
             label_style=ft.TextStyle(color=p.texto2, size=13), helper_style=ft.TextStyle(color=p.texto3, size=12),
-            hint_style=ft.TextStyle(color=p.texto3, size=13), counter_style=ft.TextStyle(color=p.texto3, size=11),
+            hint_style=ft.TextStyle(color=p.texto3, size=13), counter_style=ft.TextStyle(color=p.texto3, size=12),
             content_padding=ft.Padding.symmetric(horizontal=12, vertical=12))
         self.lista = ft.Column(spacing=0, tight=True)
         self.encabezado_lista = ui.leyenda("", p, p.texto2)

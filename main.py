@@ -26,6 +26,7 @@ import flet as ft
 import ui_estilo as ui
 import ui_adjuntos as adj
 import ui_cartera as uc
+import ui_otros_activos as uoa
 import cola_documentos as cola_doc
 from concurrencia import ejecutar_en_ui
 from version import VERSION
@@ -80,9 +81,19 @@ ETIQUETAS_EXTRACCION = {
     "nif_proveedor": "NIF del proveedor", "n_factura": "Nº de factura", "periodo": "Periodo",
     "periodo_desde": "Periodo desde", "periodo_hasta": "Periodo hasta", "iva": "IVA",
 }
-SECCIONES = ("Resumen", "Pendientes", "Inmuebles", "Alquileres", "Imputación", "Gastos", "Documentos", "Asistente IA")
+SECCIONES = ("Resumen", "Pendientes", "Inmuebles", "Alquileres", "Imputación", "Gastos", "Otros activos",
+             "Documentos", "Asistente IA")  # «Otros activos» tras Gastos: no altera los índices anteriores
 SECCIONES_RES = ("Resumen", "Pendientes", "Emitidas", "Recibidas", "IVA 303", "IRPF 130",
                  "Retenciones", "Documentos", "Asistente IA")
+
+
+def _color_resumen(pat, p):
+    """Propuesta de Claude: una valoración pendiente no se presenta como cierre verde."""
+    if pat.obligado:
+        return p.rojo
+    if getattr(pat, "provisional", False):
+        return p.naranja
+    return p.verde
 
 
 def _abrir_en_sistema(ruta: Path) -> None:
@@ -112,6 +123,28 @@ def _texto_valor(col: database.Columna, valor: Any) -> str:
     if col.tipo == "pct":
         return ui.pct(valor)
     return str(valor)
+
+
+def texto_registro_otro_activo(numero: int, campos: dict) -> str:
+    """Encabezado de revisión de un registro de ``otros_activos``: solo muestra lo extraído (sin valorar ni multiplicar)."""
+    def importe(v):
+        return ui.eur(v) if isinstance(v, (int, float)) else str(v)
+    tipo = campos.get("tipo")
+    partes = [uoa.ETIQUETA_TIPO.get(tipo, tipo or "Otro activo")]
+    partes += [str(campos[c]) for c in ("entidad", "identificador") if campos.get(c) not in (None, "")]
+    partes.append(f"ejercicio {campos.get('ejercicio') or 'sin indicar'}")
+    valores = [(c, txt) for c, txt in (("valor_informe", "valor informado {}"), ("saldo_31dic", "saldo 31/12 {}"),
+                                       ("saldo_medio_4t", "saldo medio 4T {}"))
+               if campos.get(c) not in (None, "")]
+    partes += [txt.format(importe(campos[c])) for c, txt in valores]
+    if tipo == "CRIPTO":
+        if campos.get("unidades") not in (None, ""):
+            partes.append(f"{campos['unidades']} unidades")
+        if campos.get("valor_unitario") not in (None, ""):
+            partes.append(f"precio unitario {importe(campos['valor_unitario'])}")
+    if not valores and not (tipo == "CRIPTO" and any(campos.get(c) not in (None, "") for c in ("unidades", "valor_unitario"))):
+        partes.append("Valor sin indicar")
+    return f"{numero}. " + " · ".join(partes)
 
 
 class App:
@@ -576,7 +609,7 @@ class App:
         cantidades = {c: lec.contar_clientes(c) for c in CARTERAS}
         return [ft.Container(ft.Column([
             ft.Text(ETIQUETA[c], size=12, weight=ft.FontWeight.W_600, color=p.texto, font_family=ui.FUENTE),
-            ft.Text(f"{cantidades[c]} {'cliente' if cantidades[c] == 1 else 'clientes'}", size=10, color=p.texto2, font_family=ui.FUENTE),
+            ft.Text(f"{cantidades[c]} {'cliente' if cantidades[c] == 1 else 'clientes'}", size=12, color=p.texto2, font_family=ui.FUENTE),
         ], spacing=0, tight=True, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
             padding=ft.Padding.symmetric(horizontal=6, vertical=3)) for c in CARTERAS]
 
@@ -730,7 +763,7 @@ class App:
             ft.Column([
                 ft.Text(f"{c['nombre']} {c['apellidos']}", size=14, weight=ft.FontWeight.W_600,
                         color="#FFFFFF" if activo else p.texto, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
-                ft.Text(c["nif"], size=11, color="#FFFFFF" if activo else p.texto2),
+                ft.Text(c["nif"], size=12, color="#FFFFFF" if activo else p.texto2),
             ], spacing=0, expand=True, tight=True),
         ], spacing=10)
 
@@ -784,7 +817,10 @@ class App:
         self._columna_ficha = ft.Column([
             self._cabecera(cliente),
             ft.Container(
-                ft.Column([self._zona_pdfs(), self._caja_cola_de(cliente), self._selector_secciones(), self.contenido],
+                # Pestañas en una fila con desplazamiento horizontal: con 9 pestañas NR no se recortan en ventanas
+                # estrechas. La rueda vertical sigue llegando al scroll de la ficha (eje distinto).
+                ft.Column([self._zona_pdfs(), self._caja_cola_de(cliente),
+                           ft.Row([self._selector_secciones()], scroll=ft.ScrollMode.AUTO), self.contenido],
                           spacing=16),
                 padding=ft.Padding.only(left=28, right=28, bottom=40)),
         ], spacing=0, expand=True, scroll=ft.ScrollMode.AUTO)
@@ -806,7 +842,8 @@ class App:
             texto = f"{res.pais or 'Residencia sin registrar'} · {res.grupo} {int(res.tipo * 100)} %"
             color = p.rojo if res.asumida else p.texto2
             chips.append(ui.pastilla(texto, color, p.rojo_suave if res.asumida else p.campo))
-        anios = [str(a) for a in range(date.today().year - 4, date.today().year + 1)]
+        anios = [str(a) for a in sorted(self.ctrl.ejercicios_cliente(self.cid) | {self.ejercicio}
+                                        | set(range(date.today().year - 4, date.today().year + 1)))]
         selector_anio = ui.desplegable("Ejercicio", [(a, a) for a in reversed(anios)], p, str(self.ejercicio),
                                        on_select=self._cambiar_ejercicio, width=110)
         selector_anio.label = None
@@ -968,7 +1005,7 @@ class App:
                         spacing=6, tight=True, key=f"{e}|{texto}")
         ext = f.extension
         tinte = {"PDF": p.rojo, "XLSX": p.verde, "XLS": p.verde, "CSV": p.verde, "DOCX": p.acento, "DOC": p.acento}
-        insignia = ft.Container(ft.Text(ext, size=10, weight=ft.FontWeight.W_700, color=tinte.get(ext, p.texto2),
+        insignia = ft.Container(ft.Text(ext, size=12, weight=ft.FontWeight.W_700, color=tinte.get(ext, p.texto2),
                                         font_family=ui.FUENTE), width=38)
         nombre = ft.Text(f.nombre, size=13, color=p.texto, font_family=ui.FUENTE, max_lines=1,
                          overflow=ft.TextOverflow.ELLIPSIS, expand=True, tooltip=f.nombre)
@@ -1018,7 +1055,7 @@ class App:
         for n in nombres:
             etiqueta: ft.Control = ft.Text(n, size=13, weight=ft.FontWeight.W_600, color=p.texto, no_wrap=True)
             if n == "Pendientes" and n_pend:
-                cifra = ft.Container(ft.Text(str(n_pend), size=11, weight=ft.FontWeight.W_700, color=p.rojo),
+                cifra = ft.Container(ft.Text(str(n_pend), size=12, weight=ft.FontWeight.W_700, color=p.rojo),
                                      bgcolor=p.rojo_suave, border_radius=ui.PILDORA,
                                      padding=ft.Padding.symmetric(horizontal=6, vertical=0))
                 etiqueta = ft.Row([etiqueta, cifra], spacing=6, tight=True,
@@ -1047,7 +1084,7 @@ class App:
             "Resumen": self._sec_resumen_res if self._es_residente() else self._sec_resumen,
             "Pendientes": self._sec_pendientes, "Inmuebles": self._sec_inmuebles,
             "Alquileres": self._sec_alquileres, "Imputación": self._sec_imputacion, "Gastos": self._sec_gastos,
-            "Documentos": self._sec_documentos, "Asistente IA": self._sec_asistente,
+            "Otros activos": self._sec_otros_activos, "Documentos": self._sec_documentos, "Asistente IA": self._sec_asistente,
             "Emitidas": lambda: self._sec_facturas("facturas_emitidas"),
             "Recibidas": lambda: self._sec_facturas("facturas_recibidas"),
             "IVA 303": self._sec_303, "IRPF 130": self._sec_130, "Retenciones": self._sec_retenciones,
@@ -1076,7 +1113,8 @@ class App:
     def _sec_resumen(self) -> ft.Control:
         p, inf, lec = self.p, self.informe, self.ctrl.lector
         pat = inf.patrimonio
-        color, fondo = (p.rojo, p.rojo_suave) if pat.obligado else (p.verde, p.verde_suave)
+        color = _color_resumen(pat, p)
+        fondo = {p.rojo: p.rojo_suave, p.naranja: p.naranja_suave, p.verde: p.verde_suave}[color]
         heroe = ui.tarjeta(ft.Row([
             ft.Container(ft.Icon(I.ACCOUNT_BALANCE_OUTLINED, size=26, color=color), width=52, height=52,
                          border_radius=12, bgcolor=fondo, alignment=ft.Alignment.CENTER),
@@ -1084,7 +1122,7 @@ class App:
                 ui.leyenda(f"IMPUESTO SOBRE EL PATRIMONIO · {inf.ejercicio}", p, color, 11),
                 ui.cuerpo(pat.mensaje, p, size=17, peso=ft.FontWeight.W_600),
                 ui.leyenda("Valor por inmueble = el mayor entre catastral, escritura, referencia y comprobado, "
-                           "por el % de titularidad. Mínimo exento 700.000 €; obligado también si los bienes "
+                           "por el % de titularidad. Mínimo estatal 700.000 €; obligado también si los bienes "
                            "superan 2.000.000 €.", p),
             ], spacing=4, expand=True),
         ], spacing=16), p)
@@ -1100,7 +1138,7 @@ class App:
         parcial = bool(getattr(inf, "alquileres_bloqueados", {}))
         kpis = ft.Row([
             ui.kpi("Inmuebles a 31/12", str(pat.num_inmuebles), p, I.HOME_OUTLINED),
-            ui.kpi("Base Patrimonio", ui.eur(pat.valor_bienes), p, I.SAVINGS_OUTLINED),
+            ui.kpi("Bienes brutos en España", ui.eur(pat.valor_bienes), p, I.SAVINGS_OUTLINED),
             ui.kpi("Cuotas 210 por pagar", ui.eur(cuotas_pend), p, I.RECEIPT_LONG_OUTLINED,
                    p.naranja if cuotas_pend or parcial else None,
                    "Total parcial · alquileres pendientes de revisión" if parcial else
@@ -1109,11 +1147,19 @@ class App:
                    p.rojo if graves else p.verde, "Ver pendientes" if graves else "Todo en orden",
                    on_click=lambda e: self._ir_a_seccion(1)),
         ], spacing=12)
+        nombres = self._nombres_inmuebles()
+
+        def cual(codigo: Optional[str]) -> Optional[str]:
+            """«INM-001 · dirección · Ref. …» si el código es de un inmueble; si no, el texto tal cual."""
+            return " · ".join(nombres[codigo]) if codigo in nombres else codigo
+
         estados = [ui.fila(I.HOURGLASS_EMPTY if "PROVISIONAL" in e else I.DESCRIPTION_OUTLINED,
                            p.naranja if "PROVISIONAL" in e else p.texto2, e.split(" · ", 1)[-1],
-                           e.split(" · ", 1)[0] if " · " in e else None, p) for e in inf.estados[1:]]
+                           cual(e.split(" · ", 1)[0]) if " · " in e else None, p) for e in inf.estados[1:]]
         alertas = [ui.fila(I.LIGHTBULB_OUTLINE, ui.colores_estado(a.nivel, p)[0], a.mensaje,
-                           a.inmueble or "Cliente", p, fondo_icono=ui.colores_estado(a.nivel, p)[1])
+                           cual(a.inmueble) or "Cliente", p, fondo_icono=ui.colores_estado(a.nivel, p)[1],
+                           derecha=[ui.accion(f"Confirmar residencia {inf.ejercicio}", self._confirmar_residencia, p,
+                                              I.CHECK)] if a.tipo == "residencia heredada" else None)
                    for a in inf.alertas]
         return ft.Column([
             heroe, kpis,
@@ -1207,6 +1253,7 @@ class App:
             *([ui.leyenda("Total parcial: falta registrar el precio de escritura.", p, p.naranja)] if resumen["parcial"] else []),
             desglose,
             ui.leyenda(f"Valor usado actualmente en Patrimonio: {ui.eur(vp.valor)} · {vp.fuente}", p),
+            *self._fila_cotitular(v),
             ft.Row([
                 ui.leyenda(f"Titularidad {ui.pct(v['_tit'])} · computa {ui.eur(v['_computado'])} en Patrimonio", p),
                 ft.Container(expand=True),
@@ -1224,6 +1271,99 @@ class App:
                 ui.boton("Eliminar", lambda e, c=cod: self.confirmar_borrar("inmuebles", c), p, None, "peligro"),
             ], spacing=8, run_spacing=8, wrap=True),
         ], spacing=14), p)
+
+    def _fila_cotitular(self, v: dict) -> list[ft.Control]:
+        """Quién más tiene el inmueble y, si es compartido y falta el otro titular, el acceso para crearlo."""
+        p = self.p
+        try:
+            otros = self.ctrl.cotitulares(self.cid, v["codigo"])
+        except Exception:
+            otros = []
+        filas = []
+        if otros:
+            nombres = ", ".join(f"{o['nombre']} {o.get('apellidos') or ''}".strip() for o in otros)
+            filas.append(ft.Row([ft.Icon(I.PEOPLE_OUTLINE, size=16, color=p.texto2),
+                                 ui.leyenda(f"Cotitular en la gestoría: {nombres}", p, p.texto2, 13)], spacing=6))
+        if v.get("_tit", 1) >= 1 and not v.get("gananciales_forzado"):
+            if otros:
+                return filas
+            # Registrado al 100 % por error (era compartido): el diálogo corrige el porcentaje y crea al otro titular
+            return [ui.accion("Añadir cotitular", lambda e, c=v["codigo"]: self.dialogo_cotitular(c), p,
+                              I.PERSON_ADD_ALT)]
+        if otros:  # ya registrado: solo se ofrece otro si queda porcentaje libre
+            if v.get("_tit", 1) + sum(float(o.get("pct") if o.get("pct") is not None else 1) for o in otros) >= 0.9999:
+                return filas
+            return filas + [ui.accion("Añadir otro cotitular", lambda e, c=v["codigo"]: self.dialogo_cotitular(c), p,
+                                      I.PERSON_ADD_ALT)]
+        return filas + [ft.Row([
+            ft.Icon(I.PERSON_ADD_ALT, size=16, color=p.naranja),
+            ui.leyenda(f"Titularidad {ui.pct(v['_tit'])}: el otro titular no está creado en la gestoría.", p, p.naranja, 13),
+            ui.accion("Crear cotitular", lambda e, c=v["codigo"]: self.dialogo_cotitular(c), p, I.PERSON_ADD_ALT),
+        ], spacing=8, wrap=True, vertical_alignment=ft.CrossAxisAlignment.CENTER)]
+
+    def dialogo_cotitular(self, cod: str) -> None:
+        """Alta del otro titular (p. ej. el cónyuge) con los datos del inmueble ya registrados."""
+        p, cid, ej = self.p, self.cid, self.ejercicio
+        inm = self.ctrl.lector.get("inmuebles", cid, cod) or {}
+        actual = tax_calculator.pct_titularidad(inm)
+        f = {k: ui.campo(t, p, "", ayuda) for k, t, ayuda in (
+            ("nombre", "Nombre", None), ("apellidos", "Apellidos", None),
+            ("nif", "NIF / NIE", "Si ya es cliente, se le añade este inmueble"),
+            ("pais", "País de residencia fiscal", "Obligatorio en no residentes; el del certificado"))}
+        f_pct = ui.campo("Titularidad del cotitular (%)", p, f"{(1 - actual if actual < 1 else 0.5) * 100:g}")
+        mio_actual = f"{actual * 100:g}"
+        f_mio = ui.campo("Titularidad de este cliente (%)", p, f"{(actual if actual < 1 else 0.5) * 100:g}",
+                         "Corrige un 100 % que en realidad era compartido")
+        error = ui.leyenda("", p, p.rojo, 13)
+
+        def crear(_e):
+            datos = {k: (c.value or "").strip() for k, c in f.items()}
+            # Se valida aquí, antes de cerrar, para no perder lo tecleado si falta algo
+            try:  # si el NIF ya es cliente se le añade el inmueble: su país ya consta
+                ya_cliente = bool(datos["nif"]) and bool(self.ctrl.lector.get_cliente_por_nif(datos["nif"].upper()))
+            except Exception:
+                ya_cliente = False
+            problema = ("Indica al menos el nombre y el NIF/NIE." if not datos["nombre"] or not datos["nif"] else
+                        "Indica el país de residencia fiscal del cotitular." if not datos["pais"]
+                        and not ya_cliente and not self._es_residente() else None)
+            porcentajes = []
+            for campo, texto in ((f_pct, "del cotitular"), (f_mio, "de este cliente")):
+                if problema is None:
+                    f_campo = (campo.value or "").strip().rstrip("%").strip()
+                    try:
+                        numero = database.a_num(f_campo)
+                    except Exception:
+                        numero = None
+                    if numero is None or not 0 < numero <= 100:
+                        problema = f"La titularidad {texto} debe ser un porcentaje entre 0 y 100."
+                    else:
+                        porcentajes.append(numero)
+            if problema is None and sum(porcentajes) > 100 + 1e-7:
+                problema = "La suma de ambas titularidades no puede superar el 100 %."
+            if problema:
+                error.value = problema
+                self.page.update()
+                return
+            mio = (f_mio.value or "").strip().rstrip("%").strip()
+            cotitular_pct = (f_pct.value or "").strip().rstrip("%").strip() + "%"
+            cambia = bool(mio) and mio != mio_actual   # el controlador valida el número y la suma
+            self.cerrar_dialogo()
+            self.en_segundo_plano(
+                "Creando el cotitular y copiando el inmueble…",
+                lambda: self.ctrl.crear_cotitular(cid, cod, datos, cotitular_pct, ej, mio + "%" if cambia else None),
+                "Cotitular creado con el inmueble, el catastro, los contratos, rentas, inquilinos y gastos. "
+                "Revisa su ficha: las declaraciones se han calculado con su porcentaje.",
+                despues=self._refrescar_clientes)
+
+        self._dialogo(f"Crear cotitular · {cod}", ft.Column([
+            ui.leyenda(f"{inm.get('direccion') or 'Inmueble sin dirección'} · Ref. {inm.get('ref_catastral') or '—'}", p),
+            ui.leyenda("Se crea el cliente en esta misma cartera y se copian el inmueble, su catastro, contratos, rentas, "
+                       "inquilinos, gastos y los PDF de escritura y contratos. Las declaraciones no se copian: se "
+                       "calculan con su porcentaje. Si el cotitular ya presentó años anteriores, márcalos como "
+                       "presentados en su ficha.", p, p.texto2),
+            f["nombre"], f["apellidos"], f["nif"], f["pais"], f_pct, f_mio, error], spacing=12, tight=True),
+            [ui.boton("Cancelar", self.cerrar_dialogo, p, tipo="texto"),
+             ui.boton("Crear cotitular", crear, p, I.PERSON_ADD_ALT)], ancho=480, icono=I.PEOPLE_OUTLINE)
 
     def _fila_periodicidad(self, v: dict, con_presentado: bool) -> list[ft.Control]:
         """Selector Anual/Trimestral del 210 de rentas del inmueble en el ejercicio. Solo si el backend da la
@@ -1581,6 +1721,11 @@ class App:
             ui.separador(p), ui.leyenda("Valor de adquisición · escritura + gastos registrados", p), total, error,
         ], spacing=12), [cancelar, confirmar], ancho=680, icono=I.RECEIPT_LONG_OUTLINED)
 
+    def _confirmar_residencia(self, _e=None) -> None:
+        self.en_segundo_plano("Confirmando la residencia…",
+                              lambda cid=self.cid, ej=self.ejercicio: self.ctrl.confirmar_residencia(cid, ej),
+                              "Residencia confirmada. El certificado del año sigue figurando como pendiente.")
+
     def _toggle_gananciales(self, cod: str, valor: bool) -> None:
         self.en_segundo_plano("Recalculando con la nueva titularidad…",
                               lambda cid=self.cid, ej=self.ejercicio: self.ctrl.set_gananciales(cid, cod, valor, ej),
@@ -1619,8 +1764,20 @@ class App:
     def _resumen_alquileres(self) -> Optional[dict]:
         return self._leer_resumen_alquileres()[0]
 
+    def _nombres_inmuebles(self) -> dict[str, tuple[str, str]]:
+        """Código → («INM-001 · dirección», «Ref. catastral …») para identificar el inmueble sin cambiar de pestaña."""
+        salida = {}
+        for i in self.ctrl.lector.listar("inmuebles", self.cid):
+            salida[i["codigo"]] = (f"{i['codigo']} · {i.get('direccion') or 'sin dirección'}",
+                                   f"Ref. {i.get('ref_catastral') or 'sin referencia catastral'}")
+        return salida
+
+    def _inmueble_de(self, nombres: dict, codigo: Optional[str]) -> tuple[str, str]:
+        return nombres.get(codigo or "", (codigo or "—", ""))
+
     def _sec_alquileres(self) -> ft.Control:
         p, lec, ej = self.p, self.ctrl.lector, self.ejercicio
+        nombres = self._nombres_inmuebles()
         anual, fallo_resumen = self._leer_resumen_alquileres()
         lista = anual.get("contratos", []) if anual is not None else lec.listar("contratos", self.cid)
         contratos = []
@@ -1632,12 +1789,14 @@ class App:
                 fechas += " (fin real)"
             elif c.get("fecha_fin_prevista"):
                 fechas += " (fin previsto)"
-            detalle = f"{fechas} · {uc.importe(c.get('renta_inicial'))} {(c.get('periodicidad') or 'Mensual').lower()}"
+            inm_txt, ref_txt = self._inmueble_de(nombres, c.get("inmueble"))
+            detalle = (f"{ref_txt + ' · ' if ref_txt else ''}{fechas} · {uc.importe(c.get('renta_inicial'))} "
+                       f"{(c.get('periodicidad') or 'Mensual').lower()}")
             if anual is not None:
                 detalle += (f" · {ej}: {uc.dias(c.get('_dias_alquilado'))} alquilado, "
                             f"renta devengada {uc.importe(c.get('_ingresos_devengados'))}")
             contratos.append(ui.fila(
-                I.HANDSHAKE_OUTLINED, p.acento, f"{c['codigo']} · {c.get('inmueble') or '—'} · {inq or 'sin inquilino'}",
+                I.HANDSHAKE_OUTLINED, p.acento, f"{c['codigo']} · {inm_txt} · {inq or 'sin inquilino'}",
                 detalle, p,
                 [ui.pastilla_estado(c.get("estado"), p),
                  ui.accion_icono(I.PERSON_ADD_ALT, lambda e, cc=c: self.dialogo_editar(
@@ -1645,8 +1804,8 @@ class App:
                  ui.accion_icono(I.EDIT_OUTLINED, lambda e, cc=c["codigo"]: self.dialogo_contrato(cc), p,
                                  "Corregir contrato")]))
         modelos = [self._fila_modelo(
-            "m210_alquiler", f, f"210 rendimientos {f.get('periodo')} · {f.get('inmueble')}",
-            f"Ingresos {ui.eur(f.get('ingresos'))} · gastos {ui.eur(f.get('gastos'))} · base {ui.eur(f.get('base'))}"
+            "m210_alquiler", f, f"210 rendimientos {f.get('periodo')} · {self._inmueble_de(nombres, f.get('inmueble'))[0]}",
+            f"{self._inmueble_de(nombres, f.get('inmueble'))[1]} · Ingresos {ui.eur(f.get('ingresos'))} · gastos {ui.eur(f.get('gastos'))} · base {ui.eur(f.get('base'))}"
             f" · tipo {ui.pct(f.get('tipo'))}", f.get("cuota") or 0)
             for f in lec.listar("m210_alquiler", self.cid, ejercicio=self.ejercicio, orden="periodo")]
         nuevo = ui.accion("Añadir contrato", lambda e: self.dialogo_contrato(None), p, I.ADD)
@@ -1655,7 +1814,8 @@ class App:
         for c in cobros:
             periodo = f"{uc.fecha(c.get('periodo_desde'))} → {uc.fecha(c.get('periodo_hasta'))}"
             filas_cobro.append(ui.fila(
-                I.PAYMENTS_OUTLINED, p.acento, f"{c.get('contrato') or c.get('inmueble') or '—'} · {periodo}",
+                I.PAYMENTS_OUTLINED, p.acento,
+                f"{c.get('contrato') or '—'} · {self._inmueble_de(nombres, c.get('inmueble'))[0]} · {periodo}",
                 f"Cobrado el {uc.fecha(c.get('fecha_cobro'))} · contractual {uc.importe(c.get('importe_contractual'))}", p,
                 [ft.Text(uc.importe(c.get("importe_cobrado")), size=14, weight=ft.FontWeight.W_600, color=p.texto),
                  ui.pastilla_estado(c.get("estado"), p),
@@ -1967,7 +2127,10 @@ class App:
 
     def _sec_imputacion(self) -> ft.Control:
         p, lec = self.p, self.ctrl.lector
-        imput = [self._fila_modelo("m210_imputacion", f, f"210 imputación · {f.get('inmueble')}",
+        nombres = self._nombres_inmuebles()
+        imput = [self._fila_modelo("m210_imputacion", f,
+                                   f"210 imputación · {self._inmueble_de(nombres, f.get('inmueble'))[0]}",
+                                   f"{self._inmueble_de(nombres, f.get('inmueble'))[1]} · "
                                    f"{f.get('dias')} días vacíos · VC {ui.eur(f.get('valor_catastral'))} × "
                                    f"{ui.pct(f.get('pct_imputacion'))} × {ui.pct(f.get('pct_titularidad'))}",
                                    f.get("cuota") or 0)
@@ -1986,6 +2149,13 @@ class App:
             self._bloque("Patrimonio e ITS", patri),
             ui.leyenda("Deudas deducibles y bonificación autonómica del 714 se introducen a mano con el lápiz.", p, p.texto3),
         ], spacing=20)
+
+    def _sec_otros_activos(self) -> ft.Control:
+        """Cuentas, cripto y valores del 714 (solo no residentes). La presentación vive en ui_otros_activos."""
+        return uoa.seccion(self)
+
+    def dialogo_otro_activo(self, codigo: Optional[str] = None) -> None:
+        uoa.dialogo_activo(self, codigo)
 
     ICONOS_GASTO = {
         "IBI": I.ACCOUNT_BALANCE_OUTLINED, "Comunidad": I.APARTMENT_OUTLINED, "Seguro": I.SHIELD_OUTLINED,
@@ -3547,6 +3717,8 @@ class App:
                     valor = datos_fila.get("valor_catastral")
                     texto_fila = (f"{numero}. Catastro · ejercicio {datos_fila.get('ejercicio') or 'sin indicar'} · "
                                   f"{ui.eur(valor) if valor is not None else 'Valor sin indicar'}")
+                elif registro.tabla == "otros_activos":
+                    texto_fila = texto_registro_otro_activo(numero, datos_fila)
                 elif registro.tabla == "cobros" and not datos_fila.get("periodo_desde") and not datos_fila.get("periodo_hasta"):
                     texto_fila = (f"{numero}. Cobro · {fecha_visible(datos_fila.get('fecha_cobro'))} · "
                                   f"{ui.eur(importe) if importe is not None else 'Importe sin indicar'} · Periodo pendiente de asignar")
@@ -4294,6 +4466,16 @@ def pantalla_carga(p) -> ft.Container:
                         animate_opacity=ft.Animation(260, ft.AnimationCurve.EASE_OUT_CUBIC))
 
 
+def _copia_diaria(db_path) -> None:
+    """Copia de seguridad del día en segundo plano; un fallo nunca impide trabajar."""
+    try:
+        from persistencia import crear_snapshot_diario
+        crear_snapshot_diario(db_path)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("No se pudo crear la copia diaria (%s).", type(exc).__name__)
+
+
 def main(page: ft.Page) -> None:
     """Pinta la pantalla de carga y vuelve enseguida: Flet solo envía la primera pantalla al terminar esta
     función. Módulos y BD se cargan en un worker; el bucle UI monta y anima la pantalla."""
@@ -4315,6 +4497,12 @@ def main(page: ft.Page) -> None:
             app = App(page, ctrl)
             app.iniciar(pila)
             page.update()
+            ruta_db = getattr(getattr(ctrl, "db", None), "db_path", None)
+            if ruta_db:  # la copia diaria nunca debe tumbar el arranque
+                try:
+                    threading.Thread(target=_copia_diaria, args=(ruta_db,), daemon=True).start()
+                except Exception as exc:
+                    logging.getLogger(__name__).warning('No se pudo iniciar la copia diaria (%s).', type(exc).__name__)
             # Mínimo ~0,9 s en pantalla para que no parpadee; luego fundido de salida (más corto que la entrada)
             minimo = float(os.environ.get("SPLASH_MIN", "0.9"))  # SPLASH_MIN=8 para revisarla con calma
             await asyncio.sleep(max(0.0, minimo - (time.perf_counter() - inicio)))

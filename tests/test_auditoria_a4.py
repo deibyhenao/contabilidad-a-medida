@@ -84,7 +84,8 @@ def test_a4_vaciar_solo_un_campo_y_conservar_formula(ctrl):
 def test_a4_presentacion_resuelve_el_prefijo_exacto(ctrl, tabla):
     cid = ctrl.crear_cliente("Cliente", "A4", "A4-MODELO")["id"]
     codigo = database.TABLAS[tabla].prefijo + "-999"
-    ctrl.db.upsert(tabla, cid, {"codigo": codigo, "ejercicio": 2026, "estado": "Pendiente"})
+    inmueble = ctrl.db.upsert("inmuebles", cid, {"direccion": "QA A4", "fecha_adquisicion": "2020-01-01"})
+    ctrl.db.upsert(tabla, cid, {"codigo": codigo, "ejercicio": 2026, "inmueble": inmueble, "estado": "Pendiente"})
     obl = ctrl.db.upsert("obligaciones", cid, {"ejercicio": 2026, "id_modelo": codigo, "estado": "Pendiente"})
     ctrl.marcar_presentado(cid, "obligaciones", obl, 2026, date(2026, 10, 17), 20)
     assert ctrl.db.get(tabla, cid, codigo)["estado"] == "Presentado"

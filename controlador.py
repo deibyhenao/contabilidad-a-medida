@@ -30,6 +30,7 @@ import ia_extractor
 import pdf_processor
 import tax_calculator
 from carteras import NR, RES, cartera_de
+import rutas_seguras
 from database import TABLAS, Database, a_fecha
 
 ConfirmarFn = Callable[[pdf_processor.Extraccion], pdf_processor.Extraccion]
@@ -62,6 +63,8 @@ class CalculoConfirmadoSinExcel(RuntimeError):
 
 
 # Etiquetas de los campos que no tienen columna en la plantilla (solo BD)
+_COL_PCT = {c.campo: c for c in TABLAS["inmuebles"].columnas_bd}["pct_titularidad"]
+
 ETIQUETAS_SOLO_BD = {
     "ejercicio": "Ejercicio", "gananciales_forzado": "Gananciales 50 % forzado",
     "pct_titularidad_escritura": "% titularidad según escritura", "valor_comprobado": "Valor comprobado Administración",
@@ -120,7 +123,7 @@ CALCULADOS = {
              "a_ingresar"},
     "m111_115": {"perceptores", "base", "retenciones"},
 }
-OCULTOS = {"codigo", "sha256", "nombre_original", "origen", "pct_titularidad_escritura", "renta_imputada", "cuota",
+OCULTOS = {"revision_automatica", "codigo", "sha256", "nombre_original", "origen", "pct_titularidad_escritura", "renta_imputada", "cuota",
            "detalle_limite", "revision_pendiente"}
 CAMPOS_PRESENTACION = {
     "m210_alquiler": ("fecha_presentacion", "pagado", "nrc"),
@@ -252,6 +255,329 @@ class Controlador:
                                            gastos_deducibles="Sí" if grupo == tax_calculator.GRUPO_UE else "No")
             return cliente
 
+    _TABLAS_ORIGEN_EJERCICIO = ("residencias", "catastro", "gastos", "cobros", "m210_alquiler", "m210_imputacion",
+                                "patrimonio_714", "its_718", "facturas_emitidas", "facturas_recibidas", "m303",
+                                "m130", "m111_115", "modelos_presentados", "otros_activos")
+
+    def ejercicios_cliente(self, cid: Optional[int]) -> set[int]:
+        """Años con datos del cliente, para no esconder un histórico en el selector al cambiar de año natural."""
+        if not cid:
+            return set()
+        anios: set[int] = set()
+        for tabla in self._TABLAS_ORIGEN_EJERCICIO:
+            if tabla not in TABLAS:
+                continue
+            try:
+                for (anio,) in self.lector.con.execute(
+                        f"SELECT DISTINCT ejercicio FROM {tabla} WHERE cliente_id=? AND ejercicio IS NOT NULL", (cid,)):
+                    try:
+                        anio = int(anio)
+                    except (TypeError, ValueError):
+                        continue
+                    if 1990 <= anio <= 2100:
+                        anios.add(anio)
+            except Exception:  # tabla de una versión anterior sin la columna: se ignora
+                continue
+        return anios
+
+    def confirmar_residencia(self, cid: int, ejercicio: int) -> dict:
+        """El asesor confirma que la residencia del año anterior sigue igual: se registra para ``ejercicio`` (sin
+        certificado, que sigue figurando como pendiente) y los 210 dejan de ser provisionales por este motivo."""
+        ej = int(ejercicio)
+        with self._lock:
+            self._importar(cid)
+            previa = self.db.residencia(cid, ej)
+            if not previa or previa.get("ejercicio") == ej:
+                raise ValueError("No hay una residencia de otro año que confirmar.")
+            if not str(previa.get("pais") or "").strip():
+                raise ValueError("La residencia anterior no tiene país: regístrala a mano para este ejercicio.")
+            aviso = tax_calculator.aviso_pais_residencia(previa.get('pais'))
+            if aviso:
+                raise ValueError(aviso)
+            with self.db.transaccion():
+                self.db.guardar_residencia(cid, ej, pais=previa.get("pais"), grupo=previa.get("grupo"),
+                                           nif_extranjero=previa.get("nif_extranjero"),
+                                           gastos_deducibles=previa.get("gastos_deducibles"),
+                                           normativa_ip=previa.get("normativa_ip"), ccaa_ip=previa.get("ccaa_ip"),
+                                           observaciones=f"Confirmada por el asesor a partir de {previa.get('ejercicio')} "
+                                                         f"el {date.today():%d/%m/%Y}; falta el certificado de {ej}.")
+                resultado = self._recalcular_bd(cid, {ej}, ej)
+            return self._exportar_informe(cid, ej, resultado)
+
+    def cotitulares(self, cid: int, inmueble: str) -> list[dict]:
+        """Otros clientes de la gestoría que tienen el mismo inmueble (misma referencia catastral)."""
+        inm = self.lector.get("inmuebles", cid, inmueble) or {}
+        ref = "".join(str(inm.get("ref_catastral") or "").split()).upper()
+        if not ref:
+            return []
+        filas = self.lector.con.execute(
+            "SELECT c.id, c.nombre, c.apellidos, c.nif, MAX(i.pct_titularidad) AS pct FROM inmuebles i "
+            "JOIN clientes c ON c.id=i.cliente_id WHERE i.cliente_id<>? AND referencia_normalizada(i.ref_catastral)=? "
+            "GROUP BY c.id ORDER BY c.apellidos, c.nombre",
+            (cid, ref)).fetchall()
+        return [dict(f) for f in filas]
+
+    # Datos del inmueble que se copian al cotitular. No se copian declaraciones (se recalculan) ni cobros (los
+    # genera el motor). De los PDF solo se copian escritura y contratos (_copiar_soportes_cotitular).
+    _COPIA_COTITULAR = ("catastro", "contratos", "rentas", "inquilinos", "gastos")
+
+    def crear_cotitular(self, cid: int, inmueble: str, datos: dict, pct_cotitular: Any,
+                        ejercicio: int, pct_cliente: Any = None) -> dict:
+        """Alta del otro titular de un inmueble (p. ej. el cónyuge al 50 %) copiando la información del inmueble.
+
+        ``datos``: nombre, apellidos, nif y, en no residentes, país. Si ya existe un cliente con ese NIF en la misma
+        cartera, se le añade el inmueble. ``pct_cliente``: nueva titularidad del cliente actual (opcional), para
+        corregir un 100 % que en realidad era 50 %. La suma de ambas titularidades no puede superar el 100 %."""
+        nif = (datos.get("nif") or "").strip().upper()
+        if not nif or not (datos.get("nombre") or "").strip():
+            raise ValueError("Indica al menos el nombre y el NIF/NIE del cotitular.")
+        pct = database._normalizar(_COL_PCT, pct_cotitular)
+        if pct is None or not 0 < pct <= 1:
+            raise ValueError("La titularidad del cotitular debe ser mayor que 0 % y no superar el 100 %.")
+        with self._lock:
+            origen = self.db.get_cliente(cid)
+            inm = self.db.get("inmuebles", cid, inmueble)
+            if not origen or not inm:
+                raise ValueError("El inmueble ya no existe en este expediente.")
+            self._importar(cid)
+            origen = self.db.get_cliente(cid)
+            inm = self.db.get("inmuebles", cid, inmueble)
+            if not origen or not inm:
+                raise ValueError("El inmueble se eliminó del Excel. Reabre el expediente antes de crear el cotitular.")
+            existente = self.db.get_cliente_por_nif(nif)
+            if existente:
+                if existente["id"] == cid:
+                    raise ValueError("El cotitular no puede ser el mismo cliente.")
+                if cartera_de(existente.get("tipo_cliente")) != cartera_de(origen.get("tipo_cliente")):
+                    raise ValueError("Ese NIF pertenece a un cliente de otra cartera. Revisa el NIF.")
+                # Importar ANTES de comprobar duplicados y antes de la transacción de alta.
+                # Así se conservan también las ediciones del asesor si el alta se rechaza.
+                self._importar(existente["id"])
+                existente = self.db.get_cliente(existente["id"])
+            propio = (database._normalizar(_COL_PCT, pct_cliente)
+                      if pct_cliente not in (None, "") else tax_calculator.pct_titularidad(inm))
+            if propio is None or not 0 < propio <= 1:
+                raise ValueError("La titularidad del cliente actual debe ser mayor que 0 % y no superar el 100 %.")
+            if propio + pct > 1 + 1e-9:
+                raise ValueError(f"La suma de titularidades supera el 100 % ({propio:.0%} + {pct:.0%}). "
+                                 "Ajusta los porcentajes.")
+            if inm.get("gananciales_forzado") and (abs(pct - 0.5) > 1e-9 or abs(propio - .5) > 1e-9):
+                raise ValueError("El inmueble es ganancial (50 % forzado): ambos titulares deben tener el 50 %.")
+            ref = "".join(str(inm.get("ref_catastral") or "").split()).upper()
+            if not ref:
+                raise ValueError("Registra primero la referencia catastral del inmueble: identifica al cotitular "
+                                 "y evita duplicar el inmueble.")
+            if sum(1 for fila in self.db.listar('inmuebles', cid)
+                   if ''.join(str(fila.get('ref_catastral') or '').split()).upper() == ref) > 1:
+                raise ValueError('La referencia catastral está duplicada en este expediente. Revísala antes de crear cotitulares.')
+            if existente:
+                if existente["id"] == cid:
+                    raise ValueError("El cotitular no puede ser el mismo cliente.")
+                if cartera_de(existente.get("tipo_cliente")) != cartera_de(origen.get("tipo_cliente")):
+                    raise ValueError("Ese NIF pertenece a un cliente de otra cartera. Revisa el NIF.")
+                if any("".join(str(i.get("ref_catastral") or "").split()).upper() == ref
+                       for i in self.db.listar("inmuebles", existente["id"])):
+                    raise ValueError("Ese cliente ya tiene este inmueble (misma referencia catastral).")
+            elif cartera_de(origen.get("tipo_cliente")) == NR and not (datos.get("pais") or "").strip():
+                # Nunca se presume: la residencia del cónyuge puede ser otra (y la del cliente, heredada).
+                raise ValueError("Indica el país de residencia fiscal del cotitular.")
+            # Titulares ya registrados en la gestoría: la suma de todos no puede pasar del 100 %.
+            # Sus porcentajes pueden haber cambiado en sus Excel, incluso en otra cartera.
+            # Importarlos antes de sumar y antes de la transacción conserva esas ediciones
+            # aunque se rechace el alta. Solo se consultan los titulares de esta referencia.
+            for otro in self.cotitulares(cid, inmueble):
+                self._importar(otro['id'])
+            otros = 0.0
+            for o in self.cotitulares(cid, inmueble):
+                for i in self.db.listar("inmuebles", o["id"]):
+                    if "".join(str(i.get("ref_catastral") or "").split()).upper() == ref:
+                        otros += tax_calculator.pct_titularidad(i)
+            if propio + pct + otros > 1 + 1e-9:
+                raise ValueError(f"Con los cotitulares ya registrados ({otros:.0%}) la suma supera el 100 %.")
+            carpeta_nueva = None
+            try:
+                with self.db.transaccion():
+                    if existente:
+                        destino = existente
+                    else:
+                        destino = self.crear_cliente(
+                            datos["nombre"].strip(), (datos.get("apellidos") or "").strip(), nif,
+                            tipo_cliente=origen.get("tipo_cliente") or "No residente",
+                            pais=(datos.get("pais") or "").strip() or None, ejercicio=int(ejercicio))
+                        carpeta_nueva = destino.get("carpeta")
+                    did = destino["id"]
+                    cod_inm, copiados, mapa_ctr = self._copiar_datos_cotitular(
+                        cid, did, inmueble, inm, origen, pct, propio, pct_cliente)
+                    anios = {int(ejercicio)} | {int(f["ejercicio"]) for t in ("catastro", "gastos")
+                        for f in self.db.listar(t, did, inmueble=cod_inm) if f.get("ejercicio")}
+                    anios = {a for a in anios if int(ejercicio) - 4 <= a <= int(ejercicio)}
+                    # La historia explícita ya calculada también debe seguir coherente,
+                    # sin crear declaraciones antiguas solo por la fecha de un PDF.
+                    anios |= {int(f['ejercicio']) for cliente in (cid, did)
+                        for t in ('m210_alquiler', 'm210_imputacion', 'patrimonio_714', 'its_718')
+                        for f in self.db.listar(t, cliente) if f.get('ejercicio')}
+                    self.db.set_config(f'excel_pendiente|{cid}', '1')
+                    self.db.set_config(f'excel_pendiente|{did}', '1')
+                    resultado_destino = self._recalcular_bd(did, anios, int(ejercicio))
+                    resultado_origen = self._recalcular_bd(cid, anios, int(ejercicio))
+            except BaseException:
+                # La BD se revierte; la carpeta recién creada, si sigue vacía, también se retira.
+                if carpeta_nueva:
+                    try:
+                        carpeta = rutas_seguras.sanitize_safe_path(
+                            self.db.raiz(cartera_de(origen.get('tipo_cliente'))), Path(carpeta_nueva))
+                        for p in (carpeta / database.SUBCARPETA_SOPORTES,
+                                  carpeta / database.SUBCARPETA_ENTRADA, carpeta):
+                            try:
+                                p.rmdir()  # nunca recursivo: ningún archivo ajeno se elimina
+                            except OSError:
+                                pass
+                    except (OSError, ValueError):
+                        pass
+                raise
+            # Los PDF se copian tras confirmar la BD: un fallo anterior no deja archivos huérfanos en disco.
+            avisos = []
+            try:
+                copiados['documentos'], avisos_pdf = self._copiar_soportes_cotitular(cid, did, inmueble, cod_inm, mapa_ctr)
+                avisos.extend(avisos_pdf)
+            except Exception:
+                copiados['documentos'] = 0
+                avisos.append('El cotitular se creó, pero no se pudieron copiar todos los soportes PDF. '
+                              'Revisa los permisos y añade los soportes pendientes desde su ficha; no repitas el alta.')
+            # Actualizar faltas documentales después de las copias, sin recalcular
+            # ni reinterpretar otra vez importes que ya se confirmaron juntos.
+            for cliente, resultado in ((did, resultado_destino), (cid, resultado_origen)):
+                try:
+                    if not self._es_residente(cliente):
+                        resultado['informe'].pendientes = tax_calculator.revisar_pendientes(self.db, cliente, int(ejercicio))
+                    resultado.update(self._exportar_informe(cliente, int(ejercicio), resultado))
+                except Exception:
+                    self.db.set_config(f'excel_pendiente|{cliente}', '1')
+                    resultado['error_excel'] = ('Los datos se han guardado. No se pudo actualizar el Excel; '
+                        'sincroniza el expediente cuando el archivo esté disponible. No repitas el alta.')
+            avisos.extend(resultado_origen.get("avisos_documentales") or [])
+            if resultado_origen.get('error_excel'):
+                avisos.append(resultado_origen['error_excel'])
+            if resultado_destino.get("error_excel"):
+                avisos.append("El cotitular se creó, pero su Excel no se pudo actualizar (¿abierto en Excel?). "
+                              "Ciérralo y pulsa Sincronizar en su ficha.")
+            return {**resultado_origen, "cliente": self.db.get_cliente(did), "inmueble": cod_inm,
+                    "copiados": copiados, "nuevo": not existente, "avisos_documentales": avisos,
+                    "error_excel_cotitular": resultado_destino.get("error_excel")}
+
+    def _copiar_datos_cotitular(self, cid, did, inmueble, inm, origen, pct, propio, pct_cliente):
+        """Copia inmueble, catastro, contratos, rentas, inquilinos y gastos dentro de la transacción del alta."""
+        columnas = {t: [c.campo for c in TABLAS[t].columnas_bd
+                        if c.tipo not in ("formula", "link") and c.campo not in ("codigo",)]
+                    for t in ("inmuebles", *self._COPIA_COTITULAR)}
+        nuevo = {k: inm.get(k) for k in columnas["inmuebles"]}
+        nuevo.update(pct_titularidad=pct, observaciones="; ".join(filter(None, (
+            f"Cotitular de {origen.get('nombre')} {origen.get('apellidos') or ''} ({origen.get('nif')}), "
+            f"{inmueble}. Datos copiados el {date.today():%d/%m/%Y}",
+            inm.get("observaciones")))))
+        if inm.get("gananciales_forzado"):
+            nuevo["gananciales_forzado"] = 1
+        nuevo["pct_titularidad_escritura"] = None   # dato interno del primer titular al forzar el 50 %
+        cod_inm = self.db.upsert("inmuebles", did, nuevo)
+        copiados = {"inmuebles": 1}
+        mapa_ctr: dict[str, str] = {}
+        for c in self.db.listar("contratos", cid, inmueble=inmueble):
+            mapa_ctr[c["codigo"]] = self.db.upsert(
+                "contratos", did, {**{k: c.get(k) for k in columnas["contratos"]}, "inmueble": cod_inm})
+        copiados["contratos"] = len(mapa_ctr)
+        for tabla in ("catastro", "rentas", "inquilinos", "gastos"):
+            n = 0
+            # Rentas e inquilinos: los del inmueble y los de sus contratos (pueden faltar uno u otro dato), sin repetir
+            filas = self.db.listar(tabla, cid, inmueble=inmueble)
+            if tabla in ("rentas", "inquilinos"):
+                vistos = {f["codigo"] for f in filas}
+                filas += [r for ctr in mapa_ctr for r in self.db.listar(tabla, cid, contrato=ctr)
+                          if r["codigo"] not in vistos and not vistos.add(r["codigo"])]
+            for f in filas:
+                copia = {k: f.get(k) for k in columnas[tabla]}
+                if "inmueble" in copia:
+                    copia["inmueble"] = cod_inm
+                if copia.get("contrato"):
+                    copia["contrato"] = mapa_ctr.get(copia["contrato"])
+                if tabla == "gastos":
+                    # El «importe deducible final» ya lleva la titularidad del primer titular: no vale aquí.
+                    if copia.get("importe_deducible") not in (None, ""):
+                        copia["observaciones"] = "; ".join(filter(None, (
+                            copia.get("observaciones"),
+                            "Importe deducible final del otro titular no copiado: revisar")))
+                    copia["importe_deducible"] = None
+                    copia["id_210"] = None
+                    copia["incluido_210"] = None
+                self.db.upsert(tabla, did, copia)
+                n += 1
+            copiados[tabla] = n
+        if pct_cliente not in (None, "") and abs(propio - tax_calculator.pct_titularidad(inm)) > 1e-9:
+            self.db.upsert("inmuebles", cid, {"codigo": inmueble, "pct_titularidad": propio})
+            self.db.proteger_campos_inmueble(cid, inmueble, ["pct_titularidad"])
+        return cod_inm, copiados, mapa_ctr
+
+    def _copiar_soportes_cotitular(self, cid: int, did: int, inmueble: str, cod_inm: str,
+                                   mapa_ctr: dict[str, str]) -> tuple[int, list[str]]:
+        """Copia los PDF de la escritura y de los contratos del inmueble a la carpeta del cotitular y los registra.
+        Sin ellos su ficha mostraría faltas graves permanentes de escritura y contrato."""
+        origen = self.db.verificar_cartera(self.db.get_cliente(cid))
+        destino = self.db.verificar_cartera(self.db.get_cliente(did))
+        # Solo los soportes comunes del inmueble; justificantes, facturas e IBI son del primer titular.
+        tipos = ("Escritura de compra", "Contrato de alquiler")
+        ruta_ctr = {str(c.get("ruta") or "").replace("\\", "/"): c["codigo"]
+                    for c in self.db.listar("contratos", cid) if c["codigo"] in mapa_ctr and c.get("ruta")}
+        n, avisos = 0, []
+        for d in self.db.listar("documentos", cid):
+            if not (d.get("ruta") and d.get("sha256") and d.get("estado") != "Falta" and d.get("tipo") in tipos
+                    and (d.get("inmueble") == inmueble or d.get("contrato") in mapa_ctr)):
+                continue
+            relativo = str(d["ruta"]).replace("\\", "/")
+            if not relativo.startswith(database.SUBCARPETA_SOPORTES + "/"):
+                continue
+            creado, copia = False, None
+            try:
+                fuente = rutas_seguras.sanitize_safe_path(origen, relativo)
+                if not fuente.is_file() or hashlib.sha256(fuente.read_bytes()).hexdigest() != d['sha256']:
+                    avisos.append(f"Soporte {d['codigo']}: falta o cambió desde su registro. No se copió con una huella antigua.")
+                    continue
+                database.subcarpeta_cliente(destino).mkdir(parents=True, exist_ok=True)
+                copia = rutas_seguras.sanitize_safe_path(destino, relativo)
+                copia.parent.mkdir(parents=True, exist_ok=True)
+                if not copia.exists():
+                    with copia.open('xb') as salida:
+                        creado = True
+                        with fuente.open('rb') as entrada:
+                            shutil.copyfileobj(entrada, salida, length=1024 * 1024)
+                if hashlib.sha256(copia.read_bytes()).hexdigest() != d['sha256']:
+                    raise ValueError('El soporte de destino es distinto o la fuente cambió durante la copia.')
+                contrato = (mapa_ctr.get(d.get('contrato')) if d.get('contrato')
+                            else mapa_ctr.get(ruta_ctr.get(relativo, '')))
+                previo = self.db.con.execute('SELECT inmueble,contrato FROM documentos WHERE cliente_id=? AND sha256=?',
+                                             (did, d['sha256'])).fetchone()
+                if previo and (previo['inmueble'] not in (None, '', cod_inm)
+                               or previo['contrato'] not in (None, '', contrato)):
+                    raise ValueError('El soporte ya está vinculado a otro registro del cotitular.')
+                with self.db.transaccion():
+                    _codigo, nuevo = self.db.registrar_documento(
+                        did, relativo, d.get("tipo"), d["sha256"], d.get("nombre_original") or fuente.name,
+                        inmueble=cod_inm, contrato=contrato, ejercicio=d.get("ejercicio"),
+                        fecha_documento=d.get("fecha_documento"), descripcion=d.get("descripcion"),
+                        observaciones="Copia del soporte del otro titular")
+                    if contrato:
+                        self.db.upsert("contratos", did, {"codigo": contrato, "ruta": relativo})
+                n += int(nuevo)
+            except Exception as exc:
+                logging.getLogger(__name__).warning('Soporte de cotitular no copiado (%s).', type(exc).__name__)
+                # Solo se retira la copia nueva de este intento, nunca un PDF existente.
+                if creado and copia:
+                    try:
+                        rutas_seguras.sanitize_safe_path(destino, copia).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                avisos.append(f"Soporte {d['codigo']}: no se pudo copiar o vincular; los archivos existentes se conservan.")
+                continue
+        return n, avisos
+
     def eliminar_cliente(self, cid: int) -> Path:
         """Quita al cliente de la app. Su carpeta (PDFs y Excel) NO se borra: se mueve a
         ``<carpeta de clientes>/_Eliminados/<carpeta>_<fecha-hora>`` para poder recuperarla.
@@ -286,10 +612,11 @@ class Controlador:
             try:
                 # Las tablas del cliente tienen ON DELETE CASCADE hacia clientes
                 self.db.con.execute("DELETE FROM clientes WHERE id=?", (cid,))
-                self.db.con.execute("DELETE FROM config WHERE clave IN (?,?,?,?,?,?,?)",
+                self.db.con.execute("DELETE FROM config WHERE clave IN (?,?,?,?,?,?,?,?,?,?,?)",
                                     tuple(f'{prefijo}|{cid}' for prefijo in ('excel_firma', 'excel_pendiente',
-                                        'excel_resumen', 'excel_version', 'excel_nombre', 'excel_filas', 'excel_revision')))
-                for nombre in ("periodicidad_210", "conciliacion_210", "revision_calendario_210", "amortizacion_venta", "saldo303"):
+                                        'excel_resumen', 'excel_version', 'excel_nombre', 'excel_filas', 'excel_revision', 'excel_base',
+                                        'excel_revision_id', 'excel_revision_propuesta', 'excel_base_propuesta')))
+                for nombre in ("periodicidad_210", "conciliacion_210", "revision_calendario_210", "amortizacion_venta", "saldo303", "normativa714", "bonificacion714_manual", "bonificacion714_auto", "minimo714_manual", "minimo714_auto"):
                     prefijo = f"{nombre}|{cid}|"
                     self.db.con.execute("DELETE FROM config WHERE substr(clave,1,?)=?", (len(prefijo), prefijo))
                 self.db.con.commit()
@@ -395,7 +722,7 @@ class Controlador:
                 pendiente = base.with_name(f"{base.stem}_PENDIENTE_{uuid.uuid4().hex[:12]}{base.suffix}")
                 if len(str(pendiente)) > 247:
                     pendiente = base.with_name(f"PENDIENTE_{uuid.uuid4().hex[:12]}{base.suffix}")
-                ruta_excel = excel_generator.exportar_cliente(self.db, cid, ej, destino=pendiente)
+                ruta_excel = excel_generator.exportar_cliente(self.db, cid, ej, destino=pendiente, revision_pendiente=True)
                 error_excel = ("Guardaste el Excel mientras se procesaba: tu versión se ha conservado. La versión "
                                f"calculada está en {pendiente.name}. La copia pendiente no se importa "
                                "automáticamente: conserva cualquier edición que hagas en ella. "
@@ -595,7 +922,7 @@ class Controlador:
                   if datos.get("codigo") else [])
         resumen = tax_calculator.resumen_arrendamiento(
             inm, [limpios], {limpios["codigo"]: rentas}, int(ejercicio))
-        avisos = []
+        avisos = list(resumen.get("avisos", []))
         fin_legal = tax_calculator.fin_con_prorroga(limpios)
         if fin_legal and limpios.get("fecha_fin_prevista") and fin_legal > a_fecha(limpios["fecha_fin_prevista"]):
             avisos.append("Vivienda vigente: se aplica la prórroga legal. La fecha prevista no acredita el fin real del alquiler.")
@@ -824,6 +1151,62 @@ class Controlador:
             existentes = {int(f["ejercicio"]) for f in self.db.listar("m210_alquiler", cid) if f.get("ejercicio")}
             return self._recalcular_y_exportar(cid, existentes | {int(ejercicio)}, int(ejercicio))
 
+    def configuracion_patrimonio(self, cid: int, ejercicio: int) -> dict:
+        import normativa_patrimonio as normativa
+        with self._lock:
+            if self.db.get_cliente(cid) is None or self._es_residente(cid):
+                raise ValueError('Esta configuración corresponde a un cliente No Residente.')
+            if not 1900 <= int(ejercicio) <= 2200:
+                raise ValueError('Ejercicio inválido.')
+            datos = normativa.leer(self.db, cid, ejercicio)
+            return {**datos, 'motor_general': normativa.regla(datos['normativa'], int(ejercicio)) is not None,
+                    'foral': datos['normativa'] in ('PAIS_VASCO', 'NAVARRA')}
+
+    def usar_bonificacion_automatica(self, cid: int, ejercicio: int, version_esperada: str) -> dict:
+        with self._lock:
+            self._importar(cid)
+            configuracion = self.configuracion_patrimonio(cid, ejercicio)
+            if configuracion['version'] != version_esperada:
+                raise ValueError('La configuración cambió; vuelve a abrirla antes de restaurar el cálculo automático.')
+            if not configuracion['confirmado'] or not configuracion['motor_general']:
+                raise ValueError('Confirma primero una normativa con motor validado para este ejercicio.')
+            fila = self.db.get_por_clave('patrimonio_714', cid, f'714|{ejercicio}')
+            if fila and tax_calculator._presentado(fila):
+                raise ValueError('La declaración presentada conserva su bonificación; no se recalcula automáticamente.')
+            with self.db.transaccion():
+                self.db.set_config(f'bonificacion714_manual|{cid}|{ejercicio}', '')
+                self.db.set_config(f'bonificacion714_auto|{cid}|{ejercicio}', str((fila or {}).get('bonificacion') or 0))
+                resultado = self._recalcular_bd(cid, {int(ejercicio)}, int(ejercicio))
+            return self._exportar_informe(cid, int(ejercicio), resultado)
+
+    def configurar_patrimonio(self, cid: int, ejercicio: int, normativa: str,
+                             comunidad: str, justificacion: str, confirmado: bool,
+                             version_esperada: str) -> dict:
+        import normativa_patrimonio as np
+        with self._lock:
+            actual = self.configuracion_patrimonio(cid, ejercicio)
+            if confirmado is not True or not str(justificacion or '').strip():
+                raise ValueError('Confirma y justifica la normativa aplicable a los bienes del no residente.')
+            if normativa not in np.NOMBRES or (normativa == 'OTRA' and not str(comunidad or '').strip()):
+                raise ValueError('Selecciona una normativa e identifica la comunidad.')
+            if actual['version'] != version_esperada:
+                raise ValueError('La normativa cambió mientras editabas. Vuelve a abrir la configuración.')
+            if len(str(justificacion)) > 2000 or len(str(comunidad)) > 100:
+                raise ValueError('La justificación o comunidad es demasiado larga.')
+            self._importar(cid)
+            # La elección es anual: no modifica residencias ni ejercicios anteriores.
+            if self.configuracion_patrimonio(cid, ejercicio)['version'] != version_esperada:
+                raise ValueError('La normativa cambió en Excel. Vuelve a abrir la configuración antes de guardar.')
+            with self.db.transaccion():
+                previa = self.db.get_por_clave('patrimonio_714', cid, f'714|{ejercicio}')
+                if not actual.get('confirmado') and previa and previa.get('bonificacion'):
+                    self.db.set_config(f'bonificacion714_manual|{cid}|{ejercicio}', '1')
+                self.db.set_config(np.clave(cid, ejercicio), json.dumps({
+                    'normativa': normativa, 'comunidad': str(comunidad or '').strip(),
+                    'justificacion': str(justificacion).strip(), 'confirmado': True}, ensure_ascii=False))
+                resultado = self._recalcular_bd(cid, {int(ejercicio)}, int(ejercicio))
+            return self._exportar_informe(cid, int(ejercicio), resultado)
+
     def procesar_bandeja(self, cid: int, ejercicio: int, confirmar: ConfirmarFn | None = None,
                          comentario_guia: str = "", rutas: list[Path] | None = None) -> list[dict]:
         with self._lock:
@@ -883,7 +1266,10 @@ class Controlador:
             if col is None or valor in (None, ""):
                 continue
             try:
-                database._normalizar(col, valor)
+                normalizado = database._normalizar(col, valor)
+                if ((tabla, campo) in (("contratos", "renta_inicial"), ("rentas", "renta"))
+                        and normalizado is not None and normalizado < 0):
+                    errores[campo] = "La renta no puede ser negativa."
             except (ValueError, TypeError):
                 ayuda = {"date": "usa dd/mm/aaaa", "eur": "usa un importe como 1.234,56",
                          "pct": "usa un porcentaje entre 0 % y 100 % (por ejemplo 50 % o 0,5)",
@@ -909,6 +1295,8 @@ class Controlador:
             limpios = {k: v for k, v in datos.items() if k in validos and k not in {"codigo", "revision_pendiente"}}
             if tabla in ("gastos", "facturas_emitidas", "facturas_recibidas") and not codigo:
                 limpios.setdefault("origen", "app")
+            if tabla in ("patrimonio_714", "its_718") and "estado" in limpios:
+                limpios["revision_automatica"] = 0  # Una elección humana no se cierra automáticamente.
             if tabla == "residencias" and limpios.get("ejercicio"):
                 codigo = codigo or str(int(limpios["ejercicio"]))
             previa = self.db.get(tabla, cid, codigo) if codigo else None
@@ -1126,6 +1514,9 @@ class Controlador:
             if presentadas:
                 raise ValueError(f"Tiene declaraciones presentadas ({', '.join(presentadas[:3])}): no se cambia de "
                                  "cartera para conservar su histórico. Crea un expediente nuevo en la otra cartera.")
+            if antes == NR and self.db.listar("otros_activos", cid):
+                raise ValueError("Tiene Otros Activos de Patrimonio: se conserva su expediente de No Residentes. "
+                                 "Crea un expediente nuevo en Residentes para no ocultar su historial ni sus Excel.")
             raiz = _carpeta_sin_enlaces(self.db.raiz(despues))
             raiz.mkdir(parents=True, exist_ok=True)
             destino, n = raiz / origen.name, 2
@@ -1238,6 +1629,28 @@ class Controlador:
         previa = self.db.get(tabla, cid, codigo) or {}
         ya_presentada = (tax_calculator._presentado(previa) if presentada_previamente is None
                          else presentada_previamente)
+        if tabla == 'm210_imputacion' and not ya_presentada and int(fila.get('ejercicio') or 0) >= 2027:
+            raise ValueError('La previsión de imputación desde 2027 es provisional: la nueva normativa '
+                             'requiere validar el motor agregado antes de presentar desde este cálculo. '
+                             'Las declaraciones ya presentadas y sus justificantes se conservan.')
+        if tabla in ('m210_alquiler', 'm210_imputacion') and not ya_presentada:
+            inmueble = fila.get('inmueble') or previa.get('inmueble')
+            ej = fila.get('ejercicio') or previa.get('ejercicio')
+            if not inmueble or not ej:
+                raise ValueError('El modelo 210 no tiene inmueble o ejercicio. Revisa su identidad antes de presentarlo.')
+            residencia = self.db.residencia(cid, int(ej))
+            if residencia and residencia.get('ejercicio') != int(ej):
+                raise ValueError('Confirma la residencia fiscal del ejercicio antes de presentar el 210.')
+            if residencia and tax_calculator.aviso_pais_residencia(residencia.get('pais')):
+                raise ValueError('Revisa el país de residencia fiscal antes de presentar el 210.')
+            contratos = self.db.listar('contratos', cid, inmueble=inmueble)
+            rentas = {c['codigo']: self.db.listar('rentas', cid, contrato=c['codigo']) for c in contratos}
+            inm = self.db.get('inmuebles', cid, inmueble) or {}
+            if ej:
+                avisos = tax_calculator.avisos_contratos(contratos, rentas,
+                    tax_calculator.periodo_tenencia(inm, int(ej)) or tax_calculator.anio(int(ej)))
+                if avisos:
+                    raise ValueError('Confirma los datos del contrato antes de presentar el 210: ' + ' '.join(avisos))
         if tabla == 'm303' and not ya_presentada:
             anio303 = fila.get('ejercicio') or previa.get('ejercicio')
             periodo303 = fila.get('periodo') or previa.get('periodo')
@@ -1254,14 +1667,10 @@ class Controlador:
         if tabla == "obligaciones":
             modelo = fila.get("id_modelo")
             destino_modelo = _PREFIJO_A_TABLA.get(modelo.rsplit("-", 1)[0]) if modelo else None
-            if destino_modelo in ('m210_imputacion', 'm303'):
+            if destino_modelo in ('m210_alquiler', 'm210_imputacion', 'm303'):
                 return self._validar_imputacion_presentable(cid, destino_modelo, modelo,
                     fila_propuesta=self.db.get(destino_modelo, cid, modelo))
         if tabla == "m210_imputacion" and (fila_propuesta is not None or fila.get("estado") != "Presentado"):
-            if int(fila.get("ejercicio") or 0) >= 2027 and not ya_presentada:
-                raise ValueError("La previsión de imputación desde 2027 es provisional: la nueva normativa "
-                                 "requiere validar el motor agregado antes de presentar desde este cálculo. "
-                                 "Las declaraciones ya presentadas y sus justificantes se conservan.")
             cat = self.db.catastro(cid, fila.get("inmueble"), fila.get("ejercicio"))
             if revision_pendiente(cat):
                 raise ValueError("La imputación es provisional: acredita la revisión catastral o confirma el porcentaje manual en Catastro antes de marcarla presentada.")

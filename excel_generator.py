@@ -9,6 +9,7 @@ import logging
 import shutil
 import tempfile
 import re
+import uuid
 from copy import copy
 from datetime import date, datetime
 from pathlib import Path, PureWindowsPath
@@ -17,6 +18,7 @@ import openpyxl
 from openpyxl.formula.translate import Translator
 from openpyxl.workbook.properties import CalcProperties
 from openpyxl.comments import Comment
+from openpyxl.packaging.custom import StringProperty
 
 import database
 import valores_inmuebles
@@ -27,7 +29,7 @@ from gastos import ejercicio_registrado, fraccion
 from rutas_seguras import sanitize_safe_path
 
 FIRMA_NO_ESPECIFICADA = object()
-REVISION_FORMATO = "1.0.7-fiscal-20261029"
+REVISION_FORMATO = "diagnostico-108-20261115"
 
 
 def _formula_imputacion_redondeada(formula):
@@ -122,7 +124,7 @@ def _ruta(db: Database, cid: int, ruta: Path | None) -> Path:
 
 
 # Tablas en las que una fila escrita a mano en el Excel (sin ID) es un alta y su ausencia, una baja
-MANUALES_EXCEL = ("gastos", "facturas_emitidas", "facturas_recibidas")
+MANUALES_EXCEL = ("gastos", "facturas_emitidas", "facturas_recibidas", "otros_activos")
 
 
 def _firma_fila_manual(tabla, fila) -> str:
@@ -134,6 +136,74 @@ def _firma_fila_manual(tabla, fila) -> str:
 
 def _columnas(tabla):
     return [c for c in tabla.columnas_excel if c.tipo != "formula"]
+
+
+def _datos_exportados(tabla, ws, fila):
+    """Valores realmente escritos, para la revisión concreta de este libro."""
+    datos = {}
+    for col in _columnas(tabla):
+        cell = ws[f'{col.letra}{fila}']
+        valor = (cell.hyperlink.target or cell.value) if col.tipo == 'link' and cell.hyperlink else cell.value
+        datos[col.campo] = database._normalizar(col, valor)
+    return datos
+
+
+def _guardar_revision_propuesta(db, cid, revision, tablas, filas, resumen, ruta):
+    """Conserva la base de la última copia entregada, separada de la canónica.
+
+    Solo se llama después de guardar esa copia (incluido ExcelBloqueadoError).
+    Nunca legitima propuestas antiguas ni cambia la base del último original.
+    """
+    with db.transaccion():
+        db.set_config(f'excel_revision_propuesta|{cid}', revision)
+        db.set_config(f'excel_base_propuesta|{cid}', json.dumps(dict(
+            revision=revision, tablas=tablas, filas=filas, resumen=resumen),
+            ensure_ascii=False, default=str))
+        db.set_config(f'excel_pendiente|{cid}', str(ruta))
+
+
+def _rechazar_revision(db, cid, ruta, ejercicio, detalle=''):
+    copia = ruta.with_name(f'PENDIENTE_revision_{uuid.uuid4().hex[:12]}.xlsx')
+    try:
+        exportar_cliente(db, cid, int(ejercicio or date.today().year),
+                         destino=copia, revision_pendiente=True)
+        recuperacion = (f'La versión actual de la ficha está en {copia}. Traslada allí los cambios '
+            f'del Excel que quieras conservar, guárdala con el nombre {ruta.name} y vuelve a sincronizar.')
+    except Exception:
+        recuperacion = 'No se pudo preparar una copia actualizada. Conserva el original y revisa los permisos y el espacio disponible.'
+    raise ExcelConflictoImportacion('No se puede confirmar la revisión del libro: puede ser una copia anterior '
+        'o haber perdido su marca de revisión. No se ha importado ni sobrescrito ningún dato. '
+        + detalle + ' ' + recuperacion)
+
+
+def _conciliar_pendiente(db, cid, tabla, columnas, datos, previo, base, hoja, fila, ruta):
+    """Fusión de tres vías: conserva ediciones disjuntas y rechaza las ambiguas."""
+    if not previo:
+        if base is not None:
+            # Existía en el último libro, pero fue borrada en app. Su copia
+            # antigua no es un alta nueva; una edición concurrente exige revisión.
+            for col in columnas:
+                candidato = database._normalizar(col, datos.get(col.campo))
+                anterior = database._normalizar(col, base.get(col.campo))
+                if candidato != anterior:
+                    _conflicto_excel(db, cid, ruta, f'{hoja}!{col.letra}{fila}',
+                                     'Fila eliminada en la app', candidato, '(eliminada)')
+            return False
+        return True
+    for col in columnas:
+        campo = col.campo
+        candidato = database._normalizar(col, datos.get(campo))
+        actual = database._normalizar(col, previo.get(campo))
+        if candidato == actual:
+            continue
+        if base is None or campo not in base:
+            _conflicto_excel(db, cid, ruta, f"{hoja}!{col.letra}{fila}", campo, candidato, actual)
+        anterior = database._normalizar(col, base[campo])
+        if candidato == anterior:
+            datos[campo] = actual  # El Excel aún contiene la versión anterior a la edición en app.
+        elif actual != anterior:
+            _conflicto_excel(db, cid, ruta, f"{hoja}!{col.letra}{fila}", campo, candidato, actual)
+    return True
 
 
 def _link(cell, valor, carpeta_cliente: Path | None = None) -> None:
@@ -495,6 +565,8 @@ def _resumen_ocupacion(wb, db: Database, cid: int, ejercicio: int, inicio: int) 
                 celda.number_format = "dd/mm/yyyy"
             elif col in (6, 7):
                 celda.number_format = '#,##0.00 [$€-es-ES]'
+            if resumen.get("avisos") and col in (4, 5, 6):
+                celda.comment = Comment("PROVISIONAL: " + " ".join(resumen["avisos"]), "Contabilidad a Medida")
 
 
 def _aclaraciones_resumen(wb, db: Database, cid: int, ejercicio: int) -> None:
@@ -504,10 +576,18 @@ def _aclaraciones_resumen(wb, db: Database, cid: int, ejercicio: int) -> None:
     notas = {
         "H7": "Total de impuestos pagados registrados para el ejercicio. No suma cuotas pendientes ni provisionales.",
         "E10": "Suma de movimientos cobrados registrados; puede incluir cobros pendientes de conciliar. No acredita su naturaleza ni su devengo fiscal.",
-        "E12": "Suma de importes anotados en gastos. Contrasta la deducción fiscal con residencia, límites y modelos 210; no acredita por sí sola gastos efectivamente deducidos.",
+        "E12": "Esta fórmula heredada suma únicamente R (importe deducible final manual) de 08_GASTOS. "
+               "Un cero aquí no significa que el 210 no deduzca gastos automáticos. "
+               "La columna Q requiere O y P explícitas; los campos vacíos no son un porcentaje cero para el motor fiscal.",
+        "H8": "Cuenta únicamente inmuebles con estado Activo. Los que tienen el estado vacío no se incluyen: "
+              "revisa su estado en la ficha; no se presume que un inmueble vendido siga activo.",
         "H10": "Cuenta documentos faltantes de todo el expediente, no solo del ejercicio seleccionado. Filtra 13_DOCUMENTACION por ejercicio para revisarlos.",
     }
     from tax_calculator import conflictos_210_alquiler
+    modelos = [f for f in db.listar('m210_alquiler', cid, ejercicio=ejercicio) if f.get('estado') != 'No procede']
+    notas['E12'] += (' Gastos consignados en los modelos 210 de este ejercicio: '
+                    + fmt_eur(sum(float(f.get('gastos') or 0) for f in modelos))
+                    + '. Consulta sus cuotas, estados y observaciones; un borrador puede ser provisional.')
     conflictos = conflictos_210_alquiler(db, cid, ejercicio)
     if conflictos:
         aviso = "PENDIENTE DE REVISIÓN: " + " ".join(conflictos.values())
@@ -535,7 +615,7 @@ def _aclaraciones_resumen(wb, db: Database, cid: int, ejercicio: int) -> None:
 
 
 def exportar_cliente(db: Database, cliente_id: int, ejercicio: int, destino: Path | None = None, *,
-                     firma_esperada=FIRMA_NO_ESPECIFICADA) -> Path:
+                     firma_esperada=FIRMA_NO_ESPECIFICADA, revision_pendiente: bool = False) -> Path:
     """Exporta BD; el controlador debe importar el Excel ANTES de modificar BD.
 
     Importar aquí revertiría los datos que acaba de aplicar el PDF/calculadora.
@@ -555,10 +635,22 @@ def exportar_cliente(db: Database, cliente_id: int, ejercicio: int, destino: Pat
     if canonico:
         db.set_config(f"excel_pendiente|{cliente_id}", "1")
     wb = openpyxl.load_workbook(database.PLANTILLAS[cartera])
+    revision_id = (uuid.uuid4().hex if canonico or revision_pendiente else
+                   db.get_config(f'excel_revision_id|{cliente_id}') or uuid.uuid4().hex)
+    if 'ContabilidadRevision' in wb.custom_doc_props.names:
+        del wb.custom_doc_props['ContabilidadRevision']
+    wb.custom_doc_props.append(StringProperty(name='ContabilidadRevision', value=revision_id))
+    if cartera == NR and db.listar("otros_activos", cliente_id):
+        import otros_activos_excel
+        otros_activos_excel.preparar(wb)
     firmas_filas = {t: {} for t in MANUALES_EXCEL}
+    datos_exportados = {}
     try:
-        for tabla, hoja in database.hojas_cartera(cartera):
+        for tabla, hoja in database.hojas_cartera(cartera, incluir_extensiones=True):
+            if hoja not in wb.sheetnames:
+                continue
             nombre = tabla.nombre
+            datos_exportados[nombre] = {}
             ws = wb[hoja]
             limite = ws.max_row
             # Guardar la fórmula de plantilla antes de que una primera fila
@@ -607,6 +699,9 @@ def exportar_cliente(db: Database, cliente_id: int, ejercicio: int, destino: Pat
                             'El destino y saldo para periodos posteriores requieren confirmación del asesor; '
                             'consulta el comentario de a compensar. No se modifica el justificante presentado.',
                             'Contabilidad a Medida')
+                # La base representa lo que el asesor vio, incluidas las rutas
+                # y estados de papelera; no los valores previos a la presentación.
+                datos_exportados[nombre][str(datos['codigo'])] = _datos_exportados(tabla, ws, fila)
                 if nombre == "m210_imputacion" and datos.get("estado") == "Presentado":
                     # Congelada: renta y cuota son las del justificante (la fórmula usaría los datos de la app)
                     for formula, campo in (("renta_imputada_formula", "renta_imputada"), ("cuota_formula", "cuota")):
@@ -656,10 +751,14 @@ def exportar_cliente(db: Database, cliente_id: int, ejercicio: int, destino: Pat
                             sin_asignar=sin_asignar)
             _resumen_valores(wb, db, cliente_id, ejercicio)
             _aclaraciones_resumen(wb, db, cliente_id, ejercicio)
+            if "16_OTROS_ACTIVOS" in wb.sheetnames:
+                otros_activos_excel.completar(wb, db, cliente_id, ejercicio)
         if wb.calculation is None:
             wb.calculation = CalcProperties()
         wb.calculation.fullCalcOnLoad = True
         wb.calculation.forceFullCalc = True
+        resumen_exportado = {c: ws[celdas[c]].value for c in
+            ("pasaporte", "nacionalidad", "email", "telefono", "responsable") if c in celdas}
         _guardar_atomico(wb, destino, Path(cliente["carpeta"]), firma_esperada=firma_esperada,
                          guardar_version=guardar_version)
         if canonico:
@@ -669,12 +768,19 @@ def exportar_cliente(db: Database, cliente_id: int, ejercicio: int, destino: Pat
                 db.set_config(f"excel_revision|{cliente_id}", REVISION_FORMATO)
                 db.set_config(f"excel_nombre|{cliente_id}", destino.name)
                 db.set_config(f"excel_filas|{cliente_id}", json.dumps(firmas_filas, ensure_ascii=False))
-                db.set_config(f"excel_resumen|{cliente_id}", json.dumps({c: cliente.get(c) for c in
-                    ("pasaporte", "nacionalidad", "email", "telefono", "responsable")}, ensure_ascii=False))
+                db.set_config(f"excel_base|{cliente_id}", json.dumps(datos_exportados, ensure_ascii=False, default=str))
+                db.set_config(f'excel_revision_id|{cliente_id}', revision_id)
+                db.set_config(f'excel_revision_propuesta|{cliente_id}', '')
+                db.set_config(f'excel_base_propuesta|{cliente_id}', '')
+                db.set_config(f"excel_resumen|{cliente_id}", json.dumps(resumen_exportado, ensure_ascii=False))
                 db.set_config(f"excel_pendiente|{cliente_id}", "")
+        elif revision_pendiente:
+            _guardar_revision_propuesta(db, cliente_id, revision_id, datos_exportados,
+                                       firmas_filas, resumen_exportado, destino)
     except ExcelBloqueadoError as exc:
-        if canonico:
-            db.set_config(f"excel_pendiente|{cliente_id}", str(exc.ruta_pendiente))
+        if canonico or revision_pendiente:
+            _guardar_revision_propuesta(db, cliente_id, revision_id, datos_exportados,
+                                       firmas_filas, resumen_exportado, exc.ruta_pendiente)
         raise
     finally:
         wb.close()
@@ -691,23 +797,43 @@ def import_excel_to_db(db: Database, cliente_id: int, ruta: Path | None = None) 
     ruta = _ruta(db, cliente_id, ruta)
     if not ruta.exists():
         return {}
+    renovar = necesita_actualizar_formato(db, cliente_id)
     cliente = db.get_cliente(cliente_id)
     if cliente and ruta.resolve() == db.ruta_excel(cliente).resolve():
-        if db.get_config(f"excel_firma|{cliente_id}") == _firma_excel(ruta):
+        # Una firma reconocida por una versión anterior no sustituye la lectura
+        # al renovar formato. Importar primero también sus notas/campos nuevos.
+        if (db.get_config(f"excel_firma|{cliente_id}") == _firma_excel(ruta)
+                and not renovar):
             return {}
     cartera = cartera_de((cliente or {}).get("tipo_cliente"))
     pendiente = bool(db.get_config(f"excel_pendiente|{cliente_id}"))
     try:
+        base_exportada = json.loads(db.get_config(f'excel_base|{cliente_id}', '{}'))
+    except (ValueError, TypeError):
+        base_exportada = {}
+    if not isinstance(base_exportada, dict):
+        base_exportada = {}
+    # La renovación también necesita tres vías si existe una base conocida:
+    # un cierre tras guardar BD puede haber dejado el original sin exportar.
+    conciliar = pendiente or (renovar and bool(base_exportada))
+    try:
         filas_exportadas = json.loads(db.get_config(f'excel_filas|{cliente_id}', '{}'))
     except (ValueError, TypeError):
         filas_exportadas = {}
-    hojas = database.hojas_cartera(cartera)
+    hojas = database.hojas_cartera(cartera, incluir_extensiones=True)
     wb = openpyxl.load_workbook(ruta, data_only=False)
-    faltan = [hoja for hoja in ['00_RESUMEN', *(h for _, h in hojas)] if hoja not in wb.sheetnames]
+    faltan = [hoja for hoja in ['00_RESUMEN', *(h for t, h in hojas if t.nombre != 'otros_activos')] if hoja not in wb.sheetnames]
     if faltan:
         wb.close()
         raise ValueError(f"El Excel no corresponde a la plantilla de {'residentes' if cartera == RES else 'no residentes'}"
                          f" (faltan {', '.join(faltan[:3])}).")
+    adicionales = set(wb.sheetnames) - {'00_RESUMEN',
+        '16_COMO_USAR' if cartera == NR else '11_COMO_USAR', *(h for _, h in hojas)}
+    if adicionales:
+        wb.close()
+        raise ExcelConflictoImportacion('El libro contiene hojas adicionales: ' + ', '.join(sorted(adicionales))
+            + '. No se ha regenerado para evitar eliminarlas. Conserva una copia y revisa esas hojas antes de sincronizar.')
+    hojas = [(t, h) for t, h in hojas if h in wb.sheetnames]
     conteos: dict[str, int] = {}
     try:
         # El nombre y la carpeta no prueban la identidad del contenido: el asesor
@@ -720,6 +846,37 @@ def import_excel_to_db(db: Database, cliente_id: int, ruta: Path | None = None) 
         if nif_libro != str((cliente or {}).get('nif') or '').strip().upper():
             raise ValueError('El Excel corresponde a otro cliente (NIF/NIE diferente). '
                              'No se ha importado ni sobrescrito ningún dato del expediente.')
+        revision_leida = (wb.custom_doc_props['ContabilidadRevision'].value
+                          if 'ContabilidadRevision' in wb.custom_doc_props.names else None)
+        conocidas = {r for r in (db.get_config(f'excel_revision_id|{cliente_id}'),
+                     db.get_config(f'excel_revision_propuesta|{cliente_id}')) if r}
+        if conocidas and revision_leida not in conocidas:
+            _rechazar_revision(db, cliente_id, ruta, wb['00_RESUMEN']['E4'].value)
+        resumen_exportado = None
+        if revision_leida and revision_leida == db.get_config(f'excel_revision_propuesta|{cliente_id}'):
+            # La copia tiene su propia base: puede incluir altas y cambios que
+            # todavía no llegaron al original. No usarla para otro UUID/libro.
+            pendiente = True
+            conciliar = True
+            try:
+                propuesta = json.loads(db.get_config(f'excel_base_propuesta|{cliente_id}', '{}') or '{}')
+            except (ValueError, TypeError):
+                propuesta = {}
+            if (isinstance(propuesta, dict) and propuesta.get('revision') == revision_leida
+                    and all(isinstance(propuesta.get(k), dict) for k in ('tablas', 'filas', 'resumen'))
+                    and all(isinstance(propuesta['tablas'].get(t.nombre), dict)
+                            and all(isinstance(r, dict) and all(c.campo in r for c in _columnas(t))
+                                    for r in propuesta['tablas'][t.nombre].values()) for t, _ in hojas)
+                    and all(isinstance(propuesta['filas'].get(t), dict) for t in MANUALES_EXCEL)):
+                base_exportada = propuesta['tablas']
+                filas_exportadas = propuesta['filas']
+                resumen_exportado = propuesta['resumen']
+            else:
+                # Las versiones anteriores podían entregar propuestas sin base.
+                # No asumir que una fila ausente de la base canónica es un alta:
+                # podría haberse eliminado después de crear aquella propuesta.
+                _rechazar_revision(db, cliente_id, ruta, wb['00_RESUMEN']['E4'].value,
+                    'La copia propuesta no tiene una base de conciliación verificable.')
         with db.transaccion():
             # Instantánea anterior a las notas generadas por la propia sincronización.
             anteriores_tablas = {t.nombre: {r["codigo"]: r for r in db.iterar(t.nombre, cliente_id, incluir_retirados=True)} for t, _ in hojas}
@@ -772,10 +929,29 @@ def import_excel_to_db(db: Database, cliente_id: int, ruta: Path | None = None) 
                         raise ValueError(f'Código duplicado {codigo} en {hoja}, fila {fila}. '
                                          'Revisa la fila copiada; no se ha importado el libro.')
                     previo = anteriores.get(codigo)
+                    if conciliar:
+                        if not _conciliar_pendiente(db, cliente_id, nombre, columnas, datos, previo,
+                                base_exportada.get(nombre, {}).get(str(codigo)), hoja, fila, ruta):
+                            continue
+                    if (nombre == 'm303' and previo and (previo.get('a_ingresar') or 0) < 0
+                            and datos.get('a_ingresar') == 0
+                            and base_exportada.get(nombre, {}).get(str(codigo), {}).get('a_ingresar') == 0):
+                        # El cero es una representación de deuda, no una edición
+                        # del resultado firmado/extraído negativo conservado en BD.
+                        datos['a_ingresar'] = previo['a_ingresar']
                     if nombre == "documentos" and previo:
                         gestion = db.con.execute("SELECT en_papelera FROM documentos_gestion WHERE cliente_id=? AND codigo=?",
                                                  (cliente_id, previo["codigo"])).fetchone()
                         if gestion and gestion["en_papelera"]:
+                            # Una anotación del asesor no restaura el documento
+                            # ni concede permiso para cambiar su ruta archivada.
+                            nota = datos.get('observaciones')
+                            if nota != previo.get('observaciones'):
+                                if nota in (None, ''):
+                                    db.vaciar_campo('documentos', cliente_id, previo['codigo'], 'observaciones')
+                                else:
+                                    db.upsert('documentos', cliente_id,
+                                        {'codigo': previo['codigo'], 'observaciones': nota}, respetar_manuales=False)
                             vistos.add(previo["codigo"])
                             conteos[nombre] += 1
                             continue  # El Excel muestra la papelera, pero no cambia su ruta original ni la reactiva.
@@ -805,6 +981,37 @@ def import_excel_to_db(db: Database, cliente_id: int, ruta: Path | None = None) 
                                 modelo_303.get('periodo') or (previo or {}).get('periodo')):
                             raise ValueError(f'{hoja}, fila {fila}: confirma en la app el destino de los saldos 303 anteriores. '
                                              'No se ha importado el libro ni presentado nada.')
+                    if datos.get('estado') == 'Presentado' and (
+                            nombre in ('m210_alquiler', 'm210_imputacion')
+                            or nombre == 'obligaciones' and (datos.get('tipo') or (previo or {}).get('tipo'))
+                            in ('210 Alquiler', '210 Imputación')):
+                        import tax_calculator as tc
+                        inmueble = datos.get('inmueble') or (previo or {}).get('inmueble')
+                        ej = int(datos.get('ejercicio') or (previo or {}).get('ejercicio') or 0)
+                        if nombre == 'obligaciones':
+                            codigo_modelo = datos.get('id_modelo') or (previo or {}).get('id_modelo')
+                            tabla_modelo = ('m210_alquiler' if (datos.get('tipo') or (previo or {}).get('tipo'))
+                                            == '210 Alquiler' else 'm210_imputacion')
+                            modelo = db.get(tabla_modelo, cliente_id, codigo_modelo) if codigo_modelo else None
+                            if modelo:
+                                inmueble = modelo.get('inmueble')
+                                ej = int(modelo.get('ejercicio') or 0)
+                        if not inmueble or not ej:
+                            raise ValueError(f'{hoja}, fila {fila}: falta inmueble o ejercicio del 210. '
+                                             'Corrige su identidad antes de presentarlo.')
+                        residencia = db.residencia(cliente_id, ej)
+                        if residencia and residencia.get('ejercicio') != ej:
+                            raise ValueError(f'{hoja}, fila {fila}: confirma la residencia fiscal del ejercicio antes de presentar el 210.')
+                        if residencia and tc.aviso_pais_residencia(residencia.get('pais')):
+                            raise ValueError(f'{hoja}, fila {fila}: revisa el país de residencia fiscal antes de presentar el 210.')
+                        contratos = db.listar('contratos', cliente_id, inmueble=inmueble)
+                        rentas = {c['codigo']: db.listar('rentas', cliente_id, contrato=c['codigo']) for c in contratos}
+                        inm = db.get('inmuebles', cliente_id, inmueble) or {}
+                        avisos = tc.avisos_contratos(contratos, rentas,
+                            tc.periodo_tenencia(inm, ej) or tc.anio(ej)) if ej else []
+                        if avisos:
+                            raise ValueError(f'{hoja}, fila {fila}: confirma los datos del contrato antes de presentar el 210. '
+                                             + ' '.join(avisos))
                     if (nombre == 'obligaciones' and previo
                             and str(previo.get('clave') or '').startswith('VENTA|')
                             and datos.get('estado') == 'Presentado'):
@@ -821,6 +1028,13 @@ def import_excel_to_db(db: Database, cliente_id: int, ruta: Path | None = None) 
                                          'la nueva normativa antes de presentarse desde este cálculo.')
                     if pendiente:
                         _comprobar_datos_pendientes(db, cliente_id, nombre, columnas, datos, previo, hoja, fila, ruta)
+                    if nombre in ("patrimonio_714", "its_718") and previo and datos.get("estado") != previo.get("estado"):
+                        datos["revision_automatica"] = 0
+                    campos_norma = ('normativa_ip', 'ccaa_ip') if nombre == 'residencias' else (('normativa', 'ccaa') if nombre == 'patrimonio_714' else ())
+                    if previo and any(datos.get(c) != previo.get(c) for c in campos_norma):
+                        import normativa_patrimonio as np
+                        modificado = next(c for c in reversed(campos_norma) if datos.get(c) != previo.get(c))
+                        np.cambio_desde_excel(db, cliente_id, int(datos.get('ejercicio') or previo['ejercicio']), datos.get(modificado))
                     nuevo = db.upsert(nombre, cliente_id, datos, respetar_manuales=False)
                     vistos.add(nuevo)
                     if previo:
@@ -838,7 +1052,7 @@ def import_excel_to_db(db: Database, cliente_id: int, ruta: Path | None = None) 
                         continue
                     if nombre in MANUALES_EXCEL and previo.get("origen") == "excel":
                         anterior = filas_exportadas.get(nombre, {}).get(codigo)
-                        if pendiente and anterior is None and nombre in filas_exportadas:
+                        if conciliar and anterior is None and nombre in filas_exportadas:
                             # La fila nació en BD después del último libro confirmado:
                             # el usuario nunca la vio allí y no puede haberla borrado.
                             db.nota(cliente_id, "Sincronización", f"Fila nueva pendiente: {codigo}",
@@ -846,7 +1060,7 @@ def import_excel_to_db(db: Database, cliente_id: int, ruta: Path | None = None) 
                                     "se conserva el registro nuevo de la aplicación.",
                                     clave=f"NUEVA_PENDIENTE|{nombre}|{codigo}")
                             continue
-                        if pendiente and anterior != _firma_fila_manual(nombre, previo):
+                        if conciliar and anterior != _firma_fila_manual(nombre, previo):
                             raise ExcelConflictoImportacion(
                                 f'La fila {codigo} de {hoja} se eliminó del Excel, pero hay una exportación '
                                 'pendiente y no se puede confirmar que la ficha siga igual. Se conservan ambas '
@@ -860,14 +1074,19 @@ def import_excel_to_db(db: Database, cliente_id: int, ruta: Path | None = None) 
             ws = wb["00_RESUMEN"]
             celdas = database.CELDAS_RESUMEN[cartera]
             campos = [c for c in ("pasaporte", "nacionalidad", "email", "telefono", "responsable") if c in celdas]
-            if pendiente:
-                resumen_anterior = json.loads(db.get_config(f"excel_resumen|{cliente_id}", "{}"))
+            resumen_importado = {c: ws[celdas[c]].value for c in campos}
+            if conciliar:
+                resumen_anterior = (resumen_exportado if resumen_exportado is not None else
+                    json.loads(db.get_config(f"excel_resumen|{cliente_id}", "{}")))
                 for campo in campos:
-                    candidato, actual = ws[celdas[campo]].value, cliente.get(campo)
-                    if campo in resumen_anterior and resumen_anterior[campo] != actual and candidato != actual:
+                    candidato, actual, anterior = (None if v in (None, '') else v for v in
+                        (ws[celdas[campo]].value, cliente.get(campo), resumen_anterior.get(campo)))
+                    if candidato == anterior and campo in resumen_anterior:
+                        resumen_importado[campo] = actual
+                    elif candidato != actual and (campo not in resumen_anterior or anterior != actual):
                         _conflicto_excel(db, cliente_id, ruta, f"00_RESUMEN!{celdas[campo]}",
                                          campo.capitalize(), candidato, actual)
-            db.actualizar_cliente(cliente_id, **{c: ws[celdas[c]].value for c in campos})
+            db.actualizar_cliente(cliente_id, **resumen_importado)
     finally:
         wb.close()
     return conteos
@@ -908,7 +1127,9 @@ def verificar_estructura(ruta: Path, plantilla_ruta: Path | None = None) -> list
     plantilla = openpyxl.load_workbook(plantilla_ruta or database.PLANTILLA_EXCEL)
     libro = openpyxl.load_workbook(ruta)
     try:
-        if libro.sheetnames != plantilla.sheetnames:
+        import otros_activos as oa
+        esperadas_hojas = plantilla.sheetnames + ([oa.HOJA] if oa.HOJA in libro.sheetnames and "11_PATRIMONIO_714" in plantilla.sheetnames else [])
+        if libro.sheetnames != esperadas_hojas:
             diferencias.append("Nombres u orden de las hojas diferentes")
         for original in plantilla:
             if original.title not in libro:

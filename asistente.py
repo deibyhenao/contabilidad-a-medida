@@ -302,6 +302,8 @@ def construir_contexto(db: Database, cid: int, ejercicio: int, pendientes: Optio
     tablas = ["residencias", "inmuebles", "catastro", "contratos", "inquilinos", "rentas", "cobros", "gastos",
               "m210_alquiler", "m210_imputacion", "patrimonio_714", "its_718", "obligaciones", "documentos",
               "actividades", "modelos_presentados"]
+    if "otros_activos" in TABLAS:
+        tablas.insert(tablas.index("patrimonio_714"), "otros_activos")
     if "arrastres_gastos" in TABLAS:
         tablas.insert(tablas.index("m210_imputacion"), "arrastres_gastos")
     valores = []

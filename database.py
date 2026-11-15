@@ -31,7 +31,7 @@ from app_paths import RECURSOS as RECURSOS_DIR, carpeta_datos
 from persistencia import crear_snapshot
 from rutas_seguras import sanitize_safe_path
 
-VERSION_ESQUEMA = 3
+VERSION_ESQUEMA = 5
 
 PROYECTO_DIR = carpeta_datos()
 DB_PATH_DEFECTO = PROYECTO_DIR / "contabilidad.db"
@@ -262,15 +262,26 @@ TABLAS: dict[str, TablaDef] = {
     ]
 }
 
+# Ampliación autorizada 04/11/2026: hoja adicional solo en copias NR.
+import otros_activos as _otros_activos
+TABLAS["otros_activos"] = TablaDef("otros_activos", _otros_activos.HOJA, "ACTP", tuple(
+    Columna(campo, letra, tipo) for campo, letra, tipo in _otros_activos.CAMPOS))
+
+# Distinguir revisión automática de una decisión manual del asesor.
+for _modelo in ("patrimonio_714", "its_718"):
+    TABLAS[_modelo] = replace(TABLAS[_modelo], columnas=TABLAS[_modelo].columnas + (
+        Columna("revision_automatica", None, "int"),))
+
 # Documentación, obligaciones y notas existen en las dos plantillas con las mismas columnas.
 for _tabla, _hoja in (("documentos", "08_DOCUMENTACION"), ("obligaciones", "09_OBLIGACIONES"),
                       ("notas", "10_NOTAS")):
     TABLAS[_tabla] = replace(TABLAS[_tabla], cartera="AMBAS", hoja_res=_hoja)
 
 
-def hojas_cartera(cartera: str) -> list[tuple[TablaDef, str]]:
+def hojas_cartera(cartera: str, incluir_extensiones: bool = False) -> list[tuple[TablaDef, str]]:
     """(tabla, hoja) de la plantilla de una cartera, en el orden de TABLAS."""
-    return [(t, t.hoja_en(cartera)) for t in TABLAS.values() if t.hoja_en(cartera)]
+    return [(t, t.hoja_en(cartera)) for t in TABLAS.values() if t.hoja_en(cartera)
+            and (incluir_extensiones or t.nombre != "otros_activos")]
 
 
 # Celdas de 00_RESUMEN que la app rellena (datos del cliente). El resto son fórmulas de la plantilla.
@@ -517,6 +528,8 @@ class Database:
         self.con = sqlite3.connect(destino, uri=solo_lectura, check_same_thread=not multihilo, timeout=30)
         try:
             self.con.create_function("casefold", 1, lambda v: str(v or "").casefold(), deterministic=True)
+            self.con.create_function("referencia_normalizada", 1,
+                                     lambda v: "".join(str(v or "").split()).upper(), deterministic=True)
             self.con.row_factory = sqlite3.Row
             self.con.execute("PRAGMA foreign_keys = ON")
             self.con.execute("PRAGMA temp_store = MEMORY")
@@ -1015,6 +1028,9 @@ class Database:
         t = self._tabla(tabla)
         validos = {c.campo: c for c in t.columnas_bd}
         limpio = {k: _normalizar(validos[k], v) for k, v in datos.items() if k in validos}
+        campo_renta = {"contratos": "renta_inicial", "rentas": "renta"}.get(tabla)
+        if campo_renta and limpio.get(campo_renta) is not None and limpio[campo_renta] < 0:
+            raise ValueError("La renta no puede ser negativa. Corrige el importe; una carencia se registra con cero.")
         if tabla == "facturas_recibidas" and limpio.get("categoria"):
             categorias = {c.casefold(): c for c in CATEGORIAS_FACTURA_RECIBIDA}
             limpio["categoria"] = categorias.get(str(limpio["categoria"]).casefold(), "Otros")
@@ -1029,9 +1045,18 @@ class Database:
         fila = None
         if codigo:
             fila = self.get(tabla, cliente_id, codigo)
+        if tabla == "otros_activos" and clave is None:
+            clave = _otros_activos.clave_natural({**(fila or {}), **limpio})
         if fila is None and clave:
             r = self.con.execute(f"SELECT * FROM {tabla} WHERE cliente_id=? AND clave=?", (cliente_id, clave)).fetchone()
             fila = dict(r) if r else None
+        if tabla == "otros_activos" and fila is None and clave and clave.startswith("ACTIVO|"):
+            # Compatibilidad con claves de borradores locales anteriores; no fusionar ambigüedades.
+            candidatas = [a for a in self.listar(tabla, cliente_id, ejercicio=limpio.get("ejercicio"))
+                          if _otros_activos.clave_natural(a) == clave]
+            if len(candidatas) > 1:
+                raise ValueError("Hay posiciones duplicadas con la misma identidad: concilia las filas antes de importar.")
+            fila = candidatas[0] if candidatas else None
         if tabla in ("facturas_emitidas", "facturas_recibidas"):
             fecha = limpio.get("fecha") or (fila or {}).get("fecha")
             if fecha:
@@ -1044,7 +1069,29 @@ class Database:
             inferido = ejercicio_registrado({**(fila or {}), **limpio})
             if inferido is not None:
                 limpio["ejercicio"] = inferido
+        if tabla == "otros_activos":
+            if self.get_cliente(cliente_id).get("cartera") != NR:
+                raise ValueError("Otros Activos solo está disponible para No Residentes.")
+            if fila and fila.get("manual_override") and respetar_manuales:
+                return str(fila["codigo"])
+            propuesta = {"pct_titularidad": 1, "ubicacion": "PENDIENTE", "estado": "Activo",
+                         "revision_confirmada": 0, **(fila or {}), **limpio}
+            _otros_activos.validar(propuesta)
+            if fila is None:
+                for campo in ("pct_titularidad", "ubicacion", "estado", "revision_confirmada"):
+                    limpio.setdefault(campo, propuesta[campo])
+            if not respetar_manuales and not (fila is None and limpio.get("origen") == "pdf"
+                                              and not limpio.get("manual_override")):
+                limpio["manual_override"] = 1
         ahora = datetime.now().isoformat(timespec="seconds")
+        if (tabla == 'patrimonio_714' and fila and not respetar_manuales
+                and 'minimo_exento' in limpio and limpio['minimo_exento'] != fila.get('minimo_exento')):
+            self.con.execute('INSERT INTO config(clave,valor) VALUES(?,?) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor',
+                (f"minimo714_manual|{cliente_id}|{limpio.get('ejercicio') or fila.get('ejercicio')}", '1'))
+        if (tabla == 'patrimonio_714' and fila and not respetar_manuales
+                and 'bonificacion' in limpio and limpio['bonificacion'] != fila.get('bonificacion')):
+            self.con.execute('INSERT INTO config(clave,valor) VALUES(?,?) ON CONFLICT(clave) DO UPDATE SET valor=excluded.valor',
+                (f"bonificacion714_manual|{cliente_id}|{limpio.get('ejercicio') or fila.get('ejercicio')}", '1'))
 
         if fila is None:
             codigo = codigo or self.siguiente_codigo(cliente_id, tabla)
@@ -1060,8 +1107,13 @@ class Database:
             cambios = {k: v for k, v in limpio.items()
                        if (v is not None or (k == "trimestre" and tabla in ("facturas_emitidas", "facturas_recibidas")))
                        and not (k in solo_si_vacio and fila.get(k) not in (None, ""))}
-            if clave and not fila.get("clave"):
+            if (clave and not fila.get("clave")) or (tabla == "otros_activos" and clave
+                    and clave.startswith("ACTIVO|") and str(fila.get("clave") or "").startswith("ACTIVO|")
+                    and clave != fila.get("clave")):
                 cambios["clave"] = clave
+            elif (tabla == "otros_activos" and "identificador" in limpio and not limpio["identificador"]
+                  and str(fila.get("clave") or "").startswith("ACTIVO|")):
+                cambios["clave"] = None
             if cambios:
                 cambios["actualizado"] = ahora
                 sets = ", ".join(f"{k}=?" for k in cambios)

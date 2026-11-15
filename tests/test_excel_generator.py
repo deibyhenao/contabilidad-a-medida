@@ -92,6 +92,10 @@ def test_ida_vuelta_todas_las_tablas_sin_perder_campos_solo_bd(db, cliente):
             datos[col.campo] = valor
         if nombre == "residencias":
             datos.update(codigo="2026", ejercicio=2026)
+        if nombre == "otros_activos":
+            datos.update(tipo="CUENTA", ubicacion="ESPANA", estado="Activo", origen="app",
+                         auditoria_favorable=0, exento=0, revision_confirmada=1, manual_override=1,
+                         unidades="1", valor_unitario="1234.56")
         db.upsert(nombre, cid, datos, clave=f"PRUEBA|{nombre}")
     antes = {n: db.listar(n, cid) for n, t in database.TABLAS.items() if t.hoja}
     ruta = eg.exportar_cliente(db, cid, 2026)

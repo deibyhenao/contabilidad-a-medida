@@ -107,7 +107,10 @@ def test_excel_rechaza_fraccion_superior_a_uno(expediente, tmp_path, valor):
     wb = Workbook()
     wb.remove(wb.active)
     wb.create_sheet('00_RESUMEN')['B5'] = db.get_cliente(cid)['nif']
-    for tabla in database.TABLAS.values():
+    # El expediente NR no incorpora hojas de la cartera de residentes.
+    # La prueba debe llegar al porcentaje inválido, sin activar antes la
+    # protección que impide eliminar hojas ajenas durante la sincronización.
+    for tabla, _ in database.hojas_cartera('NR', incluir_extensiones=True):
         if tabla.hoja and tabla.hoja not in wb.sheetnames:
             wb.create_sheet(tabla.hoja)
     tabla = database.TABLAS["inmuebles"]

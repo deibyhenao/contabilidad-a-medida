@@ -21,7 +21,7 @@ from typing import Any, Literal
 import fitz
 from pydantic import BaseModel, Field
 
-from carteras import RES, cartera_de
+from carteras import NR, RES, cartera_de
 from database import TABLAS, Columna, _normalizar, a_fecha, a_num, slug, componente_ruta, subcarpeta_cliente
 from database import ESTADOS_COBRO
 from rutas_seguras import sanitize_safe_path
@@ -41,11 +41,12 @@ class TipoDocumento(str, Enum):
     FACTURA_GASTO = "FACTURA_GASTO"
     RESUMEN_ALQUILER = "RESUMEN_ALQUILER"
     RESOLUCION_ALQUILER = "RESOLUCION_ALQUILER"
+    INFORME_ACTIVOS = "INFORME_ACTIVOS"
     DESCONOCIDO = "DESCONOCIDO"
 
 
 class RegistroDocumento(BaseModel):
-    tabla: Literal["cobros", "gastos", "catastro"]
+    tabla: Literal["cobros", "gastos", "catastro", "otros_activos"]
     campos: dict[str, Any]
     evidencia: str = Field(min_length=1, max_length=500)
 
@@ -81,6 +82,7 @@ class ResultadoAplicacion(BaseModel):
 
 
 TIPOS_LEGIBLES = {
+    TipoDocumento.INFORME_ACTIVOS: "Informe de activos financieros",
     TipoDocumento.ESCRITURA_COMPRA: "Escritura de compra",
     TipoDocumento.ESCRITURA_VENTA: "Escritura de venta",
     TipoDocumento.CATASTRO_IBI: "Catastro / IBI",
@@ -95,7 +97,8 @@ TIPOS_LEGIBLES = {
     TipoDocumento.RESOLUCION_ALQUILER: "Resolución de contrato de alquiler",
     TipoDocumento.DESCONOCIDO: "Documento por revisar",
 }
-AVISO_OCR = "PDF escaneado sin OCR: revisa los campos a mano"
+AVISO_OCR = ("PDF escaneado sin OCR: el lector local no puede leerlo. Activa la lectura con IA en Ajustes (lee "
+             "escaneados) o revisa los campos a mano")
 MESES = {m: i for i, m in enumerate(
     ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre",
      "noviembre", "diciembre"), 1)}
@@ -217,6 +220,8 @@ def clasificar(texto: str, nombre_archivo: str = "") -> tuple[TipoDocumento, flo
     t = re.sub(r"\s+", " ", _normal(texto))
     nombre = re.sub(r"\s+", " ", _normal(nombre_archivo).replace("_", " "))
     reglas = {
+        TipoDocumento.INFORME_ACTIVOS: [("saldo medio cuarto trimestre", 12), ("saldo medio 4t", 12),
+                                       ("certificado de posiciones", 12), ("cartera de valores", 12)],
         TipoDocumento.ESCRITURA_COMPRA: [("compraventa", 5), ("notario", 2), ("parte compradora", 2),
                                         ("escritura de compra", 6)],
         TipoDocumento.ESCRITURA_VENTA: [("escritura de venta", 7), ("cliente vendedor", 10),
@@ -304,7 +309,31 @@ def extraer_local(ruta: Path) -> Extraccion:
     if tipo in (TipoDocumento.ESCRITURA_COMPRA, TipoDocumento.ESCRITURA_VENTA,
                 TipoDocumento.CATASTRO_IBI, TipoDocumento.CONTRATO_ALQUILER, TipoDocumento.FACTURA_GASTO):
         texto_campo("direccion", "dirección", "dirección del inmueble", "domicilio del inmueble", "finca sita en")
-    if tipo in (TipoDocumento.ESCRITURA_COMPRA, TipoDocumento.ESCRITURA_VENTA):
+    if tipo == TipoDocumento.INFORME_ACTIVOS:
+        campos["tipo"] = "CUENTA" if re.search(r"saldo|\biban\b", _normal(texto)) else "RESUMEN_CARTERA"
+        texto_campo("entidad", "entidad", "banco", "broker", "bróker")
+        texto_campo("identificador", "iban", "identificador", "numero de cuenta", "número de cuenta")
+        if "ejercicio" not in campos:
+            cierre = re.search(r"(?:31[/.-]12[/.-]|31\s+de\s+diciembre\s+de\s+)(20\d{2})", _normal(texto))
+            if cierre:
+                campos["ejercicio"] = int(cierre[1])
+            else:
+                avisos.append("No consta ejercicio del informe: revisa el año antes de guardarlo.")
+        importe_campo("saldo_31dic", "saldo a 31/12", "saldo 31/12", "saldo a 31 de diciembre")
+        importe_campo("saldo_medio_4t", "saldo medio 4t", "saldo medio cuarto trimestre")
+        moneda = _normal(_dato(texto, 'moneda', 'divisa', 'currency') or '')
+        divisa_explicita = re.search(
+            r"\b(?:usd|gbp|chf|rub|jpy|mxn|cad|aud|cny|hkd|brl|ars|cop|clp|pen|uyu|"
+            r"sek|nok|dkk|pln|czk|huf|ron|bgn|try|uah|inr|krw|aed|sar|zar|nzd|sgd|thb|twd|ils|php|idr|vnd)\b"
+            r"|[$£¥₽₹₩₺₴₱]|\b(?:dolar(?:es)?|dollars?|yen(?:es)?|yuan(?:es)?|renminbi|rublos?|pesos?)\b",
+            _normal(texto))
+        moneda_desconocida = moneda and not re.search(r'\beur\b|\beuros?\b|€', moneda)
+        if divisa_explicita or moneda_desconocida:
+            campos.pop("saldo_31dic", None)
+            campos.pop("saldo_medio_4t", None)
+            avisos.append("Informe con divisas: introduce el contravalor acreditado en euros; el lector local no convierte monedas.")
+        avisos.append("Lectura local básica: verifica titular, ejercicio y saldo medio ajustado. Las posiciones de bróker requieren lectura IA o alta manual.")
+    elif tipo in (TipoDocumento.ESCRITURA_COMPRA, TipoDocumento.ESCRITURA_VENTA):
         fecha_campo("fecha_adquisicion" if tipo == TipoDocumento.ESCRITURA_COMPRA else "fecha_venta",
                     "fecha de adquisición" if tipo == TipoDocumento.ESCRITURA_COMPRA else "fecha de venta",
                     "fecha escritura", "fecha de escritura", "fecha")
@@ -830,7 +859,8 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
     if ext.registros:
         from ia_extractor import CAMPOS_REGISTRO
         permitidas = ({"catastro"} if tipo == TipoDocumento.ESCRITURA_COMPRA else
-                      {"cobros", "gastos"} if tipo == TipoDocumento.RESUMEN_ALQUILER else set())
+                      {"cobros", "gastos"} if tipo == TipoDocumento.RESUMEN_ALQUILER else
+                      {"otros_activos"} if tipo == TipoDocumento.INFORME_ACTIVOS else set())
         if any(r.tabla not in permitidas or set(r.campos) - CAMPOS_REGISTRO[r.tabla] for r in ext.registros):
             raise ValueError("El documento contiene tablas o campos incompatibles con su tipo.")
     if tipo == TipoDocumento.FACTURA_GASTO:
@@ -855,7 +885,8 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
         ej = fecha_documento.year
     # Valida el ejercicio antes de archivar; una corrección inválida no deja un alta parcial.
     date(ej, 1, 1)
-    inmueble = _inmueble(db, cid, c, inmueble_destino or c.get("inmueble"))
+    inmueble = (None if tipo == TipoDocumento.INFORME_ACTIVOS else
+                _inmueble(db, cid, c, inmueble_destino or c.get("inmueble")))
     # Evitar crear otra copia de un soporte retirado antes de informar cómo restaurarlo.
     huella = _hash(Path(ruta_pdf))
     if huella_esperada is not None and huella != huella_esperada:
@@ -889,7 +920,40 @@ def _aplicar(db, cid, ext: Extraccion, ruta_pdf: Path, inmueble_destino: str | N
     mensajes = list(ext.avisos)
     contrato = None
 
-    if tipo == TipoDocumento.ESCRITURA_COMPRA:
+    if tipo == TipoDocumento.INFORME_ACTIVOS:
+        if cartera_de(cliente.get("tipo_cliente")) != NR:
+            raise ValueError("Los informes de Otros Activos se gestionan en No Residentes.")
+        registros = [r.campos for r in ext.registros if r.tabla == "otros_activos"] or [c]
+        claves_informe = set()
+        for posicion, datos_fuente in enumerate(registros, 1):
+            datos = _permitidos("otros_activos", datos_fuente)
+            # Sujeción/exenciones nunca quedan aprobadas por una respuesta de IA.
+            datos.update(ejercicio=int(datos.get("ejercicio") or ej), origen="pdf", ruta=relativo,
+                         ubicacion="PENDIENTE", revision_confirmada=0, estado="Activo",
+                         observaciones="Revisar informe: " + str(datos_fuente.get("descripcion") or ""))
+            identidad = str(datos.get("identificador") or "").strip().casefold()
+            entidad = str(datos.get("entidad") or "").strip().casefold()
+            import otros_activos as oa
+            clave_activo = oa.clave_natural(datos) or f"DOC|{documento}|{posicion}"
+            if clave_activo in claves_informe:
+                raise ValueError("El informe contiene posiciones con la misma identidad fiscal. Revisa cartera e identificador para no sobrescribir ni duplicar importes.")
+            claves_informe.add(clave_activo)
+            if not identidad:
+                candidatas = [a for a in db.listar("otros_activos", cid, ejercicio=datos["ejercicio"])
+                    if a.get("estado") != "Baja" and a.get("tipo") == datos.get("tipo")
+                    and str(a.get("entidad") or "").strip().casefold() == entidad]
+                if candidatas:
+                    referencias = ", ".join(a["codigo"] for a in candidatas[:5])
+                    datos["observaciones"] = f"POSIBLE DUPLICADO: sin identificador; compara con {referencias}. " + datos["observaciones"]
+                    mensajes.append(datos["observaciones"])
+            protegido = db.get_por_clave("otros_activos", cid, clave_activo)
+            codigos[f"activo_{posicion}"] = db.upsert("otros_activos", cid, datos, clave=clave_activo)
+            if protegido and protegido.get("manual_override"):
+                mensajes.append(f"{protegido['codigo']}: se conservan las correcciones manuales; el nuevo informe no sustituye sus datos. Compara el soporte y edita el activo si procede.")
+            afectados.add(datos["ejercicio"])
+        mensajes.append("Activos registrados provisionalmente; confirma ubicación, valoración y exenciones.")
+
+    elif tipo == TipoDocumento.ESCRITURA_COMPRA:
         datos = _permitidos("inmuebles", c)
         inferir_gananciales = "gananciales_forzado" not in c and (
             len(ext.titulares) >= 2 or "gananciales" in _normal(ext.texto))

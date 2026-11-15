@@ -42,6 +42,7 @@ UMBRAL_RESPALDO = 0.5
 # Haiku cobra x5 (0,50/2,50 $) una petición de más de 100.000 tokens. Un PDF escaneado gasta ~1.700 tokens por
 # página: por encima de este número de páginas se envía una selección (portada, final y páginas con datos).
 MAX_PAGINAS_IA = 40
+CUPO_ESCANEADAS_IA = 5  # de las 15 intermedias, para anexos que solo existen como imagen
 _PALABRAS_CLAVE_PDF = ("catastral", "precio", "euros", "€", "valor", "compraventa", "vende", "adquiere", "finca",
                        "superficie", "titular", "nie", "pasaporte", "residencia", "renta", "arrend", "importe",
                        "fecha", "otorg", "ibi", "referencia")
@@ -56,7 +57,7 @@ USUARIO_KEYRING = "anthropic_api_key"
 # Tipos de documento (mismos valores que pdf_processor.TipoDocumento)
 TIPOS = ("ESCRITURA_COMPRA", "ESCRITURA_VENTA", "CATASTRO_IBI", "VALOR_REFERENCIA", "CONTRATO_ALQUILER",
          "MODELO_210", "CERTIFICADO_RESIDENCIA", "MODELO_036_037", "MODELO_PRESENTADO", "FACTURA_GASTO",
-         "RESUMEN_ALQUILER", "RESOLUCION_ALQUILER", "DESCONOCIDO")
+         "RESUMEN_ALQUILER", "RESOLUCION_ALQUILER", "INFORME_ACTIVOS", "DESCONOCIDO")
 
 # Campo -> tipo de valor. Los nombres son los de database.TABLAS.
 #   t texto, i importe en euros, f fecha, e entero, p porcentaje (fracción)
@@ -104,6 +105,15 @@ CAMPOS_POR_TIPO: dict[str, tuple[str, ...]] = {
     "RESOLUCION_ALQUILER": ("ref_catastral", "direccion", "ejercicio", "fecha_inicio", "fecha_fin_real"),
     "DESCONOCIDO": (),
 }
+
+# Datos documentales: la IA no confirma sujeción, exención ni cálculos.
+_CAMPOS_ACTIVOS = ("tipo", "entidad", "identificador", "descripcion", "pct_titularidad", "ejercicio",
+                  "saldo_31dic", "saldo_medio_4t", "valor_informe", "unidades", "valor_unitario",
+                  "valor_nominal", "valor_balance", "beneficio_1", "beneficio_2", "beneficio_3", "cartera_id")
+CAMPOS.update({c: "i" for c in ("saldo_31dic", "saldo_medio_4t", "valor_informe", "valor_nominal",
+                              "valor_balance", "beneficio_1", "beneficio_2", "beneficio_3")})
+CAMPOS.update({c: "t" for c in ("entidad", "identificador", "unidades", "valor_unitario", "cartera_id")})
+CAMPOS_POR_TIPO["INFORME_ACTIVOS"] = _CAMPOS_ACTIVOS
 
 SISTEMA = """Eres un experto en documentación inmobiliaria y fiscal española (notarías, Catastro, ayuntamientos,
 Agencia Tributaria). Lees un único documento y devuelves sus datos en el esquema JSON pedido.
@@ -200,6 +210,7 @@ def _esquema() -> dict:
 
 ESQUEMA = _esquema()
 CAMPOS_REGISTRO = {
+    "otros_activos": set(_CAMPOS_ACTIVOS),
     "catastro": {"ref_catastral", "ejercicio", "valor_catastral", "valor_suelo", "valor_construccion", "anio_revision", "fuente"},
     "cobros": {"ejercicio", "periodo_desde", "periodo_hasta", "fecha_cobro", "importe_cobrado", "estado", "observaciones"},
     "gastos": {"ejercicio", "fecha", "periodo_desde", "periodo_hasta", "categoria", "proveedor", "nif_proveedor",
@@ -207,10 +218,19 @@ CAMPOS_REGISTRO = {
 }
 ESQUEMA["properties"]["registros"] = {"type": "array", "items": {
     "type": "object", "additionalProperties": False, "required": ["tabla", "campos", "evidencia"],
-    "properties": {"tabla": {"type": "string", "enum": ["cobros", "gastos", "catastro"]},
+    "properties": {"tabla": {"type": "string", "enum": ["cobros", "gastos", "catastro", "otros_activos"]},
                    "campos": ESQUEMA["properties"]["campos"], "evidencia": {"type": "string"}}}}
 ESQUEMA["required"].append("registros")
 SISTEMA += """
+INFORME_ACTIVOS: certificado bancario, informe de bróker, cartera o tenencias de criptomonedas para Patrimonio.
+Usa registros con tabla otros_activos, una fila por cuenta/posición/especie con evidencia. tipo exactamente CUENTA,
+CRIPTO, ACCION_COTIZADA, FONDO, NO_COTIZADO, RENTA_FIJA_COTIZADA, RENTA_FIJA_NO_COTIZADA o RESUMEN_CARTERA.
+No dupliques totales y posiciones: totales informativos tipo RESUMEN_CARTERA. valor_informe es TOTAL de la posición,
+no precio unitario. Cotizados: media4T explícita (valor_unitario por título y unidades cuando no conste total); fondos: liquidativo31/12 (valor_unitario liquidativo y unidades); cuentas separa saldo31dic y media4T.
+CRIPTO: unidades y valor_unitario como texto decimal, nunca redondees unidades. No hagas matemáticas ni inventes
+saldos, año, ubicación, exenciones o confirmaciones del asesor. NO conviertas divisas: los importes de activos deben estar explícitamente expresados en EUR. Si solo hay USD, GBP u otra moneda, omite sus importes monetarios, conserva la identificación y añade un aviso para introducir su contravalor documentado en euros. Si no consta valoración legal, deja dato ausente
+con aviso; el cierre del año o total de cartera NO es por defecto media4T. No uses pérdidas/ganancias de ventas
+como tenencia patrimonial. En campos globales incluye ejercicio solo si está acreditado.
 RESOLUCION_ALQUILER: terminación/rescisión expresa. Extrae inicio original y fecha_fin_real documentada, inmueble y ejercicio. Nunca inventes inicio ni resuelvas ambigüedad de contrato.
 RESUMEN_ALQUILER: relación/tablas de ingresos cobrados o gastos, con ref_catastral, direccion, ejercicio.
 Para este tipo usa registros: una fila por movimiento individual de cobros o gastos, con evidencia de hoja/celda/página.
@@ -450,13 +470,24 @@ def _pdf_para_ia(datos: bytes) -> tuple[bytes, str]:
         if total <= MAX_PAGINAS_IA:
             return datos, ""
         inicio, final = list(range(15)), list(range(total - 10, total))
-        puntos = []
+        puntos, escaneadas = [], []
         for n in range(15, total - 10):
             texto = doc[n].get_text().lower()
             puntos.append((sum(texto.count(p) for p in _PALABRAS_CLAVE_PDF), -n))
+            # Sin capa de texto y con imagen: página escaneada (p. ej. un anexo catastral). Su texto no puntúa.
+            # Un pie o sello digital («Copia simple electrónica…») no convierte en texto una página escaneada.
+            if len(texto.strip()) < 200 and doc[n].get_images():
+                escaneadas.append(n)
         resto = MAX_PAGINAS_IA - len(inicio) - len(final)
-        medio = sorted(-n for _, n in sorted(puntos, reverse=True)[:resto])
+        # Cupo propio para escaneadas, repartidas a lo largo del documento, para no perder anexos solo en imagen.
+        cupo = min(len(escaneadas), CUPO_ESCANEADAS_IA, resto)
+        elegidas = ([escaneadas[round(i * (len(escaneadas) - 1) / max(1, cupo - 1))] for i in range(cupo)]
+                    if cupo else [])
+        elegidas = list(dict.fromkeys(elegidas))
+        por_texto = [-n for _, n in sorted(puntos, reverse=True) if -n not in elegidas][:resto - len(elegidas)]
+        medio = sorted(elegidas + por_texto)
         paginas = inicio + medio + final
+        omitidas_escaneadas = len([n for n in escaneadas if n not in medio])
         reducido = fitz.open()
         try:
             for n in paginas:
@@ -468,7 +499,9 @@ def _pdf_para_ia(datos: bytes) -> tuple[bytes, str]:
     return salida, (f"PDF largo: se enviaron a la IA {len(paginas)} de {total} páginas (inicio, final y las de más "
                     "coincidencias fiscales en el texto). Lectura parcial: no acredita que falten datos en el original. "
                     "Páginas originales, en el orden enviado: " + ", ".join(str(n + 1) for n in paginas)
-                    + ". Los anexos omitidos sin texto extraíble no se evalúan visualmente. Revisa el PDF completo.")
+                    + ". Los anexos omitidos sin texto extraíble no se evalúan visualmente. Revisa el PDF completo."
+                    + (f" Quedaron fuera {omitidas_escaneadas} páginas escaneadas (solo imagen): si falta un dato, "
+                       "súbelas aparte en un PDF corto." if omitidas_escaneadas else ""))
 
 
 def leer_con_claude(ruta: Path, ajustes: AjustesIA, uso: Optional[dict] = None, comentario_guia: str = "") -> dict:
@@ -490,6 +523,12 @@ def leer_con_claude(ruta: Path, ajustes: AjustesIA, uso: Optional[dict] = None, 
             datos, aviso_paginas = _pdf_para_ia(datos)
             if len(datos) > LIMITE_BYTES_PDF:
                 raise ErrorIA("El PDF preparado para la IA supera 32 MB: se usa el lector local.")
+            if getattr(lectura, "escaneado", False):
+                # La IA recibe el PDF y lee las páginas escaneadas como imagen: el aviso local de «necesitan OCR»
+                # confundiría. Se sustituye por uno que pide contrastar lo leído visualmente.
+                lectura.avisos = [a for a in lectura.avisos if "necesitan OCR" not in a] + [
+                    "PDF escaneado (páginas sin texto): la IA las leyó como imagen. Contrasta importes, fechas y "
+                    "referencias con el PDF."]
             if aviso_paginas:
                 lectura.avisos.append(aviso_paginas)
             contenido = [{"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
@@ -629,7 +668,8 @@ def a_extraccion(datos: dict, nombre_archivo: str):
     confianza = max(0.0, min(1.0, float(datos.get("confianza") or 0)))
     registros = []
     permitidas = ({"catastro"} if tipo == "ESCRITURA_COMPRA" else
-                  {"cobros", "gastos"} if tipo == "RESUMEN_ALQUILER" else set())
+                  {"cobros", "gastos"} if tipo == "RESUMEN_ALQUILER" else
+                  {"otros_activos"} if tipo == "INFORME_ACTIVOS" else set())
     if datos.get("registros") and not permitidas:
         raise ErrorIA("La IA propuso filas para un tipo incompatible. Revisa el documento.", admite_respaldo=True)
     from pdf_processor import RegistroDocumento

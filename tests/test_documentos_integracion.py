@@ -302,7 +302,7 @@ def test_ia_excluye_pdf_retirado_incluso_con_original_pendiente_y_limpia_histori
 
 
 @pytest.mark.parametrize('accion', ['retirar', 'restaurar', 'ejercicio'])
-def test_excel_antiguo_no_revierte_correccion_y_permite_conciliar(entorno, monkeypatch, accion):
+def test_excel_antiguo_concilia_correccion_y_edicion_disjunta(entorno, monkeypatch, accion):
     import excel_generator as eg
     ctrl, cid, _ = entorno
     codigo, _ = importar_certificado(entorno)
@@ -322,25 +322,13 @@ def test_excel_antiguo_no_revierte_correccion_y_permite_conciliar(entorno, monke
     assert res['error_excel'] and pendiente.exists()
     assert ctrl.db.get_config(f'excel_pendiente|{cid}')
     monkeypatch.setattr(eg, '_guardar_atomico', guardar)
-    residencias = ctrl.db.listar('residencias', cid)
-    documento = ctrl.obtener_documento(cid, codigo)
     celda_email = eg.database.CELDAS_RESUMEN[eg.NR]['email']
     wb = openpyxl.load_workbook(ruta)
     wb['00_RESUMEN'][celda_email] = 'manual@example.invalid'
     wb.save(ruta)
     wb.close()
-    original_manual = ruta.read_bytes()
-    with pytest.raises(eg.ExcelConflictoImportacion, match='No se ha importado'):
-        ctrl.sincronizar(cid, 2026)
-    assert ctrl.db.listar('residencias', cid) == residencias
-    assert ctrl.obtener_documento(cid, codigo) == documento
-    assert ctrl.db.get_cliente(cid)['email'] != 'manual@example.invalid'
-    assert ruta.read_bytes() == original_manual
-    # Conciliación indicada en el mensaje: trasladar la edición al libro actualizado.
-    wb = openpyxl.load_workbook(pendiente)
-    wb['00_RESUMEN'][celda_email] = 'manual@example.invalid'
-    wb.save(ruta)
-    wb.close()
+    # La base por campo permite unir el email del Excel con la corrección
+    # documental de la app; ya no exige conciliar a mano cambios disjuntos.
     assert not ctrl.sincronizar(cid, 2026)['error_excel']
     assert not ctrl.db.get_config(f'excel_pendiente|{cid}')
     assert ctrl.db.get_cliente(cid)['email'] == 'manual@example.invalid'
@@ -382,7 +370,8 @@ def test_edicion_manual_excel_normal_sigue_permitida(entorno):
     assert ctrl.db.residencia(cid, 2025)['pais'] == 'Alemania'
 
 
-def test_excel_pendiente_preserva_fila_ausente_y_correccion_de_ficha(entorno):
+@pytest.mark.parametrize('contradiccion', [False, True])
+def test_excel_pendiente_preserva_fila_ausente_y_correccion_de_ficha(entorno, contradiccion):
     import excel_generator as eg
     ctrl, cid, _ = entorno
     ctrl.db.actualizar_cliente(cid, pasaporte='ANTERIOR-FICTICIO')
@@ -393,22 +382,67 @@ def test_excel_pendiente_preserva_fila_ausente_y_correccion_de_ficha(entorno):
     celdas = eg.database.CELDAS_RESUMEN[eg.NR]
     wb = openpyxl.load_workbook(ruta)
     wb['00_RESUMEN'][celdas['email']] = 'manual@example.invalid'
+    if contradiccion:
+        wb['00_RESUMEN'][celdas['pasaporte']] = 'OTRO-FICTICIO'
     wb.save(ruta)
     wb.close()
-    contenido = ruta.read_bytes()
-    with pytest.raises(eg.ExcelConflictoImportacion, match='00_RESUMEN'):
-        eg.import_excel_to_db(ctrl.db, cid)
+    if contradiccion:
+        original = ruta.read_bytes()
+        with pytest.raises(eg.ExcelConflictoImportacion, match='00_RESUMEN'):
+            eg.import_excel_to_db(ctrl.db, cid)
+        assert ctrl.db.get_cliente(cid)['pasaporte'] == 'CORREGIDO-FICTICIO'
+        assert ctrl.db.get_cliente(cid)['email'] != 'manual@example.invalid'
+        assert ctrl.db.get('gastos', cid, codigo)['base'] == 77
+        assert ruta.read_bytes() == original
+        return
+    eg.import_excel_to_db(ctrl.db, cid)
     assert ctrl.db.get_cliente(cid)['pasaporte'] == 'CORREGIDO-FICTICIO'
     assert ctrl.db.get('gastos', cid, codigo)['base'] == 77
-    assert ruta.read_bytes() == contenido
-    wb = openpyxl.load_workbook(ruta)
-    wb['00_RESUMEN'][celdas['pasaporte']] = 'CORREGIDO-FICTICIO'
-    wb.save(ruta)
-    wb.close()
-    eg.import_excel_to_db(ctrl.db, cid)
+    # El pasaporte solo cambió en app y el email solo en Excel: se unen.
     assert ctrl.db.get_cliente(cid)['email'] == 'manual@example.invalid'
     assert ctrl.db.get('gastos', cid, codigo)['base'] == 77
     # La instantánea local auxiliar tampoco queda huérfana tras eliminar el cliente.
     ctrl.eliminar_cliente(cid)
     for clave in ('excel_firma', 'excel_pendiente', 'excel_resumen'):
         assert ctrl.db.get_config(f'{clave}|{cid}') is None
+
+
+def test_pais_editado_en_ambas_fuentes_detiene_todo_sin_reactivar_documento(entorno, monkeypatch):
+    import excel_generator as eg
+    ctrl, cid, _ = entorno
+    codigo, _ = importar_certificado(entorno)
+    ruta = ctrl.db.ruta_excel(ctrl.db.get_cliente(cid))
+    guardar = eg._guardar_atomico
+    def bloqueado(wb, destino, carpeta, **opciones):
+        pendiente = destino.with_stem(destino.stem + '_PENDIENTE_QA')
+        wb.save(pendiente)
+        raise eg.ExcelBloqueadoError(pendiente)
+    monkeypatch.setattr(eg, '_guardar_atomico', bloqueado)
+    ctrl.retirar_documento(cid, codigo, 2026)
+    monkeypatch.setattr(eg, '_guardar_atomico', guardar)
+    wb = openpyxl.load_workbook(ruta)
+    wb['01_RESIDENCIA_FISCAL']['B2'] = 'Alemania'
+    wb.save(ruta)
+    wb.close()
+    original = ruta.read_bytes()
+    with pytest.raises(eg.ExcelConflictoImportacion):
+        ctrl.sincronizar(cid, 2026)
+    assert ctrl.obtener_documento(cid, codigo)['en_papelera']
+    assert not (ctrl.db.residencia(cid, 2025) or {}).get('pais')
+    assert ruta.read_bytes() == original
+
+
+def test_nota_excel_en_documento_retirado_se_conserva_sin_reactivarlo(entorno):
+    import excel_generator as eg
+    ctrl, cid, _ = entorno
+    codigo, _ = importar_certificado(entorno)
+    ctrl.retirar_documento(cid, codigo, 2026)
+    ruta = ctrl.db.ruta_excel(ctrl.db.get_cliente(cid))
+    wb = openpyxl.load_workbook(ruta)
+    col = next(c for c in eg.database.TABLAS['documentos'].columnas_excel if c.campo == 'observaciones')
+    wb['13_DOCUMENTACION'][f'{col.letra}2'] = 'Nota manual conservada en papelera'
+    wb.save(ruta)
+    wb.close()
+    ctrl.sincronizar(cid, 2026)
+    assert ctrl.obtener_documento(cid, codigo)['en_papelera']
+    assert ctrl.db.get('documentos', cid, codigo)['observaciones'] == 'Nota manual conservada en papelera'

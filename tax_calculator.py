@@ -84,6 +84,8 @@ _PAISES_UE_EEE = {
     "deutschland", "nederland", "the netherlands", "österreich", "sverige", "polska",
     "suomi", "eesti", "latvija", "lietuva", "hrvatska", "slovensko", "slovenija",
     "danmark", "norge", "magyarország", "éire", "românia", "ellada", "el",
+    "belgique", "belgië", "belgien", "frankreich", "italien", "česko", "republic of ireland",
+    "republique francaise", "république française", "republica francesa", "french republic",
 }
 
 
@@ -99,6 +101,31 @@ def r2(x: float) -> float:
 def grupo_territorio(pais: Optional[str]) -> str:
     """'Francia' -> 'UE/EEE'; 'Reino Unido', 'Rusia', '' -> 'Extra-UE' (Reino Unido es Extra-UE desde 2021)."""
     return GRUPO_UE if _sin_tildes(pais or "") in {_sin_tildes(p) for p in _PAISES_UE_EEE} else GRUPO_EXTRA
+
+
+_NOMBRES_UE_LARGOS = {p for p in {_sin_tildes(x) for x in _PAISES_UE_EEE} if len(p) > 3}
+
+
+def aviso_pais_residencia(pais: Optional[str]) -> Optional[str]:
+    """Texto de país que no se reconoce como UE pero lo parece (p. ej. «Federal Republic of Germany»), o España.
+    No cambia el tipo: solo pide comprobarlo, porque el 24 % sin gastos se aplicaría por defecto."""
+    texto = _sin_tildes(pais or "")
+    if not texto:
+        return None
+    if texto in ("espana", "es", "spain"):
+        return ("País de residencia: España. Un residente en España no tributa por el IRNR: comprueba el país "
+                "del certificado de residencia fiscal.")
+    # Territorios fuera de la UE con nombre de país UE (Irlanda del Norte, Antillas Neerlandesas…).
+    if any(x in texto for x in ("norte", "northern", "reino unido", "united kingdom", "antillas", "antilles")):
+        return None
+    if grupo_territorio(pais) == GRUPO_EXTRA:
+        palabras = " " + " ".join(re.findall(r"[a-z]+", texto)) + " "
+        # Por palabra o frase completa, nunca subcadena («oman» no está en «romania»).
+        parecido = next((n for n in sorted(_NOMBRES_UE_LARGOS) if f" {n} " in palabras), None)
+        if parecido:
+            return (f"País de residencia «{pais}» no reconocido, pero parece de la UE/EEE ({parecido}). "
+                    "Se calcula como fuera de la UE (24 %, sin gastos): escribe el país con su nombre en español.")
+    return None
 
 
 def tipo_gravamen_210(grupo: str) -> float:
@@ -235,7 +262,8 @@ def resumen_arrendamiento(inm: dict, contratos: list[dict], rentas_por_contrato:
     devengados = (r2(sum(renta_devengada(c, rentas_por_contrato.get(c["codigo"], []), *tenencia)
                          for c in contratos)) if tenencia else 0.0)
     return {"dias_propiedad": propiedad, "dias_alquilado": alquilados,
-            "dias_vacio": max(0, propiedad - alquilados), "ingresos_devengados": devengados}
+            "dias_vacio": max(0, propiedad - alquilados), "ingresos_devengados": devengados,
+            "avisos": avisos_contratos(contratos, rentas_por_contrato, tenencia) if tenencia else []}
 
 
 def trimestres(ejercicio: int) -> list[tuple[str, date, date]]:
@@ -250,7 +278,8 @@ def plazo_210_alquiler(ejercicio: int, periodo: str, cuota: Optional[float] = No
     - anual (agrupación desde 2024): 1-20 de enero del año siguiente para 2024 y 2025; 1-20 de abril desde 2026;
     - declaración separada por trimestre: 20 primeros días del mes siguiente al trimestre hasta los devengos de
       septiembre de 2026; desde octubre de 2026, 1-20 de abril del año siguiente."""
-    # Art. 5.c: cuota cero conserva enero; la devolución empieza en febrero.
+    # Art. 5.c.2 EHA/3316/2010, también tras HAC/623/2026: cuota cero, enero.
+    # Abril para arrendamientos desde 2026 es la regla de resultado a ingresar (5.c.1).
     # En devolución no hay un único vencimiento deducible de estos argumentos:
     # depende también del período de la retención. No usar el inicio como límite.
     if cuota is not None:
@@ -336,7 +365,6 @@ def valor_patrimonial(inm: dict, cat: Optional[dict]) -> ValorPatrimonial:
     1) valor catastral, 2) valor de adquisición con gastos inherentes, 3) valor de referencia / comprobado por la Administración."""
     catastral = float((cat or {}).get("valor_catastral") or 0)
     escritura = float(inm.get("precio_escritura") or 0)
-    referencia = float((cat or {}).get("valor_referencia") or inm.get("valor_referencia") or 0)
     # AEAT (Patrimonio 2025, bienes inmuebles): la referencia solo cuenta en adquisiciones desde el 01/01/2022 y si
     # fue la base del tributo de la adquisición (ITP/ISD). Se usa la de la escritura, no la del año consultado, y se
     # presume base cuando supera el precio declarado (la base del ITP es el mayor de ambos) · VERIFICAR si se recurrió.
@@ -383,7 +411,60 @@ _DIVISOR_PERIODICIDAD = {"Mensual": 1, "Trimestral": 3, "Semestral": 6, "Anual":
 
 
 def a_mensual(importe: Optional[float], periodicidad: Optional[str]) -> float:
-    return float(importe or 0) / _DIVISOR_PERIODICIDAD.get(periodicidad or "Mensual", 1)
+    # «Otro» no significa mensual. Se conserva el dato y se pide aclaración,
+    # sin multiplicar una renta cuya frecuencia no conocemos por doce.
+    divisor = _DIVISOR_PERIODICIDAD.get(periodicidad or "Mensual")
+    return max(0.0, float(importe or 0)) / divisor if divisor else 0.0
+
+
+def avisos_contratos(contratos: list[dict], rentas_por_contrato: dict,
+                    ventana: tuple[date, date]) -> list[str]:
+    """Incertidumbres de origen: no inventar rescisión, cesión gratuita ni carencia.
+
+    Se comprueban los cambios de renta efectivos, no una renta inicial sustituida
+    durante todo el periodo. Los días y las cifras siguen siendo provisionales.
+    """
+    avisos = []
+    for c in contratos:
+        iv = intervalo_contrato(c)
+        tramo = interseccion(iv, ventana) if iv else None
+        if not tramo:
+            continue
+        codigo = c.get("codigo") or "Contrato"
+        estado = c.get("estado")
+        prevista = a_fecha(c.get("fecha_fin_prevista"))
+        if not c.get("fecha_fin_real") and (
+                estado in ("Rescindido", "Rescindido anticipadamente")
+                or estado == "Finalizado" and (not prevista or prevista > ventana[1])):
+            avisos.append(f"{codigo}: {estado} sin fecha de fin real acreditada; "
+                          "confirma cuándo terminó. Ocupación y rentas provisionales.")
+        rentas = rentas_por_contrato.get(c.get("codigo"), [])
+        cambios = {tramo[0]}
+        for r in rentas:
+            for d in (a_fecha(r.get("desde")),
+                      (a_fecha(r.get("hasta")) + timedelta(days=1))
+                      if a_fecha(r.get("hasta")) and a_fecha(r.get("hasta")) < date.max else None):
+                if d and tramo[0] <= d <= tramo[1]:
+                    cambios.add(d)
+        problemas = set()
+        for d in cambios:
+            vigentes = [r for r in rentas if a_fecha(r.get("desde"))
+                        and a_fecha(r["desde"]) <= d
+                        and (not r.get("hasta") or d <= a_fecha(r["hasta"]))]
+            r = max(vigentes, key=lambda r: a_fecha(r["desde"])) if vigentes else None
+            importe = r.get("renta") if r else c.get("renta_inicial")
+            periodicidad = (r.get("periodicidad") if r else None) or c.get("periodicidad") or "Mensual"
+            if periodicidad not in _DIVISOR_PERIODICIDAD:
+                problemas.add("periodicidad no cuantificable; indica Mensual, Trimestral, Semestral o Anual")
+            carencia_confirmada = (r is not None and importe not in (None, "") and float(importe) == 0
+                                   and a_fecha(r.get("desde")) and a_fecha(r.get("hasta"))
+                                   and _sin_tildes(str(r.get("motivo") or "")) == "carencia confirmada")
+            if not carencia_confirmada and (importe in (None, "") or float(importe) <= 0):
+                problemas.add("renta cero, negativa o sin acreditar; confirma si existe carencia, "
+                              "cesión gratuita u otro supuesto antes de calcular la imputación. "
+                              "Para una carencia acreditada registra sus fechas, renta 0 y motivo «Carencia confirmada» en Rentas")
+        avisos.extend(f"{codigo}: {p}. Cálculo provisional." for p in sorted(problemas))
+    return avisos
 
 
 def fin_con_prorroga(ctr: dict) -> Optional[date]:
@@ -617,7 +698,7 @@ def liquidar_210_alquiler(inm: dict, contratos: list[dict], rentas_por_contrato:
                 usados.append(c["codigo"])
         ingresos = r2(ingresos_100 * tit)
         alquilado = intervalos_alquilados(contratos, ventana)
-        detalle = [f"Titularidad {tit:.0%}"]
+        detalle = [f"Titularidad {tit:.0%}", *avisos_contratos(contratos, rentas_por_contrato, ventana)]
         gastos_p, limitado, aplicado_actual, generado = 0.0, 0.0, 0.0, 0.0
         aplicaciones = {}
         if res.deduce_gastos:
@@ -644,6 +725,13 @@ def liquidar_210_alquiler(inm: dict, contratos: list[dict], rentas_por_contrato:
                 amort = amortizacion_periodo(inm, cat, dias_totales(alquilado), ejercicio, tit)
                 if amort:
                     detalle.append(f"Amortización 3 % automática: {amort:.2f} €")
+                elif dias_totales(alquilado) > 0 and (not float((cat or {}).get("valor_catastral") or 0)
+                                                      or not float((cat or {}).get("valor_construccion") or 0)):
+                    # Sin aviso, el cliente UE perdería la deducción sin saberlo.
+                    falta = ("sin valor catastral" if not float((cat or {}).get("valor_catastral") or 0)
+                             else "sin desglose suelo/construcción")
+                    detalle.append(f"Amortización no calculada: Catastro {falta}. Registra el valor de la "
+                                   "construcción para deducirla · VERIFICAR")
                 otros += amort
             gastos_p = r2(otros + aplicado_actual + sum(aplicaciones.values()))
             detalle.append(f"Intereses y reparaciones: {aplicado_actual:.2f} € actuales; "
@@ -755,16 +843,25 @@ class ResultadoPatrimonio:
     obligado: bool
     detalle_inmuebles: list[tuple[str, ValorPatrimonial, float, float]]  # (codigo, valores, tit, computado)
 
+    total_otros_activos: float = 0.0
+    avisos_activos: list[str] = field(default_factory=list)
+    provisional: bool = False
+
     @property
     def mensaje(self) -> str:
         pisos = "piso" if self.num_inmuebles == 1 else "pisos"
-        return (f"Tiene {self.num_inmuebles} {pisos}, suma {fmt_eur(self.valor_bienes)} de base y "
-                f"{'SÍ' if self.obligado else 'NO'} está obligado a presentar Impuesto sobre el Patrimonio")
+        return (f"Tiene {self.num_inmuebles} {pisos}, "
+                + (f"otros activos por {fmt_eur(self.total_otros_activos)}, " if self.total_otros_activos else "")
+                +
+                f"suma {fmt_eur(self.valor_bienes)} de bienes brutos y "
+                f"{'SÍ' if self.obligado else 'NO'} está obligado a presentar Impuesto sobre el Patrimonio"
+                + (" · PROVISIONAL: revisar activos" if self.provisional else ""))
 
 
 def calcular_patrimonio(inmuebles: list[dict], catastros: dict[str, Optional[dict]], ejercicio: int,
                         deudas: float = 0.0, bonificacion: float = 0.0,
-                        minimo_exento: float = IP_MINIMO_EXENTO) -> ResultadoPatrimonio:
+                        minimo_exento: float = IP_MINIMO_EXENTO,
+                        otros_activos: Optional[list[dict]] = None) -> ResultadoPatrimonio:
     """Obligación real: bienes en España a 31/12. Valor = mayor de los 3 valores × titularidad.
     Obligado a declarar si resultado > 0 o si el valor de los bienes supera 2.000.000 €.
     ``bonificacion``: importe de la bonificación autonómica (col. L, manual). VERIFICAR normativa CCAA aplicable."""
@@ -775,20 +872,35 @@ def calcular_patrimonio(inmuebles: list[dict], catastros: dict[str, Optional[dic
         vp = valor_patrimonial(inm, catastros.get(inm["codigo"]))
         tit = pct_titularidad(inm)
         detalle.append((inm["codigo"], vp, tit, r2(vp.valor * tit)))
-    valor = r2(sum(d[3] for d in detalle))
-    base = r2(max(0.0, valor - (deudas or 0)))
+    import otros_activos as oa
+    activos = [a for a in (otros_activos or []) if oa.ejercicio_normalizado(a.get("ejercicio")) in (None, ejercicio)]
+    valoraciones = [(a, oa.valorar_seguro(a)) for a in activos]
+    avisos = [f"{a.get('codigo') or a.get('identificador') or 'Activo'}: {aviso}"
+              for a, v in valoraciones for aviso in v['avisos']]
+    # Las mismas reglas de conciliación sirven al motor y a la interfaz.
+    # Cada valoración mantiene el importe efectivo antes del prorrateo.
+    filas_con_codigo = [{**a, "codigo": a.get("codigo") or f"ACTIVO-{i}"} for i, (a, _) in enumerate(valoraciones)]
+    por_codigo = {a["codigo"]: valoraciones[i][1] for i, a in enumerate(filas_con_codigo)}
+    avisos.extend(aviso for lista in oa.conciliar_carteras(filas_con_codigo, por_codigo).values() for aviso in lista)
+    if deudas > 0 and any(a.get("exento") or a.get("ubicacion") == "EXTRANJERO" for a in activos):
+        avisos.append("Revisar deudas: solo son deducibles las vinculadas a bienes sujetos en España; excluir las de bienes exentos o extranjeros (arts. 9.4 y 25.3 LIP).")
+    bruto_activos = r2(sum(v['valor_cliente'] for a, v in valoraciones if a.get('ubicacion') == 'ESPANA'))
+    sujeto_activos = r2(sum(v['valor_sujeto'] for a, v in valoraciones))
+    valor = r2(sum(d[3] for d in detalle) + bruto_activos)
+    valor_sujeto = r2(sum(d[3] for d in detalle) + sujeto_activos)
+    base = r2(max(0.0, valor_sujeto - (deudas or 0)))
     base_liq = r2(max(0.0, base - minimo_exento))
     cuota = aplicar_tarifa(base_liq)
     resultado = r2(max(0.0, cuota - (bonificacion or 0)))
     obligado = resultado > 0 or valor > IP_UMBRAL_DECLARAR_BIENES
     return ResultadoPatrimonio(len(detalle), valor, r2(deudas or 0), base, minimo_exento, base_liq, cuota,
-                               r2(bonificacion or 0), resultado, obligado, detalle)
+                               r2(bonificacion or 0), resultado, obligado, detalle, bruto_activos, avisos, bool(avisos))
 
 
 def calcular_its(base_liquidable: float, cuota_ip_pagada: float) -> tuple[float, float, float]:
     """(cuota ITS, deducción por cuota IP, resultado). Tributa la base liquidable que excede de 3 M€."""
     cuota = aplicar_tarifa(base_liquidable, TARIFA_ITS)
-    deduccion = r2(min(cuota, cuota_ip_pagada or 0))
+    deduccion = r2(min(cuota, max(0.0, cuota_ip_pagada or 0)))
     return cuota, deduccion, r2(max(0.0, cuota - deduccion))
 
 
@@ -987,6 +1099,17 @@ def _estado_auto(previa: Optional[dict], nuevo: str) -> str:
     """Estado que pone la calculadora. Si el usuario puso uno manual (En preparación, Revisar, Presentado), se respeta."""
     actual = (previa or {}).get("estado")
     return nuevo if actual in (None, "", *ESTADOS_AUTOMATICOS) else actual
+
+
+
+def _estado_patrimonial(previa, provisional, obligado):
+    anterior = dict(previa or {})
+    if anterior.get("revision_automatica") == 1 and anterior.get("estado") == "Revisar":
+        anterior["estado"] = "Pendiente"
+    nuevo = "Revisar" if provisional else "Pendiente" if obligado else "No procede"
+    estado = _estado_auto(anterior, nuevo)
+    automatica = int(provisional and estado == "Revisar" and anterior.get("estado") in (None, "", *ESTADOS_AUTOMATICOS))
+    return estado, automatica
 
 
 def _gasto_toca_ejercicio(g: dict, ejercicio: int) -> bool:
@@ -1287,6 +1410,17 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
     catastros: dict[str, Optional[dict]] = {}
     discrepancias: list[Alerta] = []   # declaraciones presentadas que no cuadran con el cálculo de la app
     alquileres_bloqueados = {}
+    # Residencia de otro año: el tipo (19/24 %) y los gastos pueden haber cambiado. Cálculo provisional.
+    residencia_heredada = bool(fila_res) and fila_res.get("ejercicio") != ejercicio
+    if residencia_heredada:
+        discrepancias.append(Alerta(
+            "grave", None, "residencia heredada",
+            f"Sin residencia fiscal de {ejercicio}: se usa la de {fila_res.get('ejercicio')} ({res.pais or res.grupo}). "
+            "Los 210 quedan provisionales hasta confirmar la residencia del ejercicio. "
+            "Revisa la vigencia y el alcance temporal del certificado; puede haberse expedido en otro año."))
+    aviso_pais = aviso_pais_residencia(res.pais)
+    if aviso_pais:
+        discrepancias.append(Alerta("grave", None, "país de residencia", aviso_pais))
 
     for inm in inmuebles:
         cod = inm["codigo"]
@@ -1308,7 +1442,20 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
                 "Se respetan los datos explícitos del asesor; revisa la valoración de Patrimonio · VERIFICAR"))
         contratos = db.listar("contratos", cid, inmueble=cod)
         rentas = {c["codigo"]: db.listar("rentas", cid, contrato=c["codigo"]) for c in contratos}
+        avisos_origen = avisos_contratos(contratos, rentas, periodo_tenencia(inm, ejercicio) or anio(ejercicio))
+        if avisos_origen:
+            discrepancias.append(Alerta("grave", cod, "datos contrato", " ".join(avisos_origen)))
+        if avisos_origen:
+            informe_estados.append(f"{cod} · PROVISIONAL: confirma los datos del contrato antes de presentar el 210.")
         gastos = [g for g in db.listar("gastos", cid, inmueble=cod) if _gasto_toca_ejercicio(g, ejercicio)]
+        for g in gastos:
+            periodo = periodo_gasto(g)
+            registrado = ejercicio_registrado(g)
+            if registrado and periodo and not periodo[0].year <= registrado <= periodo[1].year:
+                discrepancias.append(Alerta("aviso", cod, f"ejercicio gasto {g['codigo']}",
+                    f"{g['codigo']}: ejercicio registrado {registrado} distinto del periodo de gasto "
+                    f"{periodo[0]:%d/%m/%Y}–{periodo[1]:%d/%m/%Y}. Se deduce por sus fechas, "
+                    "sin duplicarlo; confirma el ejercicio del justificante."))
         filas_modelos = db.listar("m210_alquiler", cid, inmueble=cod, ejercicio=ejercicio)
         invalidos = [f for f in filas_modelos if not periodo_210_o_none(f.get("periodo"))]
         for f in invalidos:
@@ -1328,7 +1475,8 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
                     discrepancias.append(Alerta("aviso", cod, f"base 210 {f['periodo']}",
                         f"La base presentada no coincide con ingresos menos gastos: {fmt_eur(esperada)}. "
                         "Revisa el justificante; los importes presentados se conservan."))
-        _generar_cobros(db, cid, ejercicio, inm, contratos, rentas)
+        if not avisos_origen:
+            _generar_cobros(db, cid, ejercicio, inm, contratos, rentas)
 
         # ---- 210 rendimientos
         inicio_filas, inicio_estados, inicio_alertas = len(filas_a), len(informe_estados), len(discrepancias)
@@ -1382,7 +1530,8 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
                             "ejercicio": ejercicio, "inmueble": cod, "contrato": ", ".join(r.contratos), "periodo": r.periodo,
                             "desde": r.desde, "hasta": r.hasta, "pais": res.pais or res.grupo, "ingresos": r.ingresos,
                             "gastos": r.gastos, "base": r.base, "tipo": r.tipo, "cuota": r.cuota,
-                            "estado": _estado_auto(previa, "Pendiente"),
+                            "estado": _estado_auto(previa, "Falta documentación"
+                                                   if avisos_origen or residencia_heredada else "Pendiente"),
                             "observaciones": "; ".join(r.detalle),
                             "detalle_limite": json.dumps(r.detalle_limite, sort_keys=True)}, clave=clave,
                             solo_si_vacio=("observaciones",) if previa and previa.get("estado")
@@ -1402,6 +1551,13 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
                     if (viejo["codigo"] in vigentes or _presentado(viejo)
                             or not periodo_210_o_none(viejo.get("periodo"))
                             or not (viejo.get("clave") or "").startswith("210A|")):
+                        continue
+                    if avisos_origen:
+                        # La renta no cuantificable no acredita el cese del devengo.
+                        # Mantener importes previos hasta que el asesor aclare el origen.
+                        if viejo.get("estado") != "No procede":
+                            db.upsert("m210_alquiler", cid, {"codigo": viejo["codigo"],
+                                "estado": _estado_auto(viejo, "Falta documentación")})
                         continue
                     # Mantener importes del calendario sustituido para trazabilidad;
                     # No procede lo excluye del resumen, sin borrar datos previos.
@@ -1438,6 +1594,12 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
         clave_i = f"210I|{ejercicio}|{cod}"
         previa_i = db.get_por_clave("m210_imputacion", cid, clave_i)
         imp = calcular_210_imputacion(inm, contratos, cat, res, ejercicio)
+        if imp and avisos_origen:
+            imp.provisional = True
+            imp.detalle.extend(avisos_origen)
+        if imp and residencia_heredada:
+            imp.provisional = True
+            imp.detalle.append(f"Residencia de {fila_res.get('ejercicio')}: falta el certificado de {ejercicio}")
         if imp and _presentado(previa_i) and abs(float(previa_i.get("renta_imputada") or 0) - imp.renta_imputada) > 1:
             discrepancias.append(Alerta(
                 "aviso", cod, "presentado 210 imputación",
@@ -1455,10 +1617,13 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
             # Las notas escritas a mano se conservan.
             if not imp.detalle and str((previa_i or {}).get("observaciones") or "").startswith(_OBS_AUTO_IMPUTACION):
                 db.vaciar_campo("m210_imputacion", cid, codigo_i, "observaciones")
-        elif not imp and previa_i and not _presentado(previa_i):
+        elif not imp and previa_i and not _presentado(previa_i) and not avisos_origen:
             codigo_i = db.upsert("m210_imputacion", cid, {"codigo": previa_i["codigo"], "dias": 0,
                                                             "renta_imputada": 0, "cuota": 0,
                                                             "estado": _estado_auto(previa_i, "No procede")})
+        elif not imp and previa_i and not _presentado(previa_i) and avisos_origen:
+            codigo_i = db.upsert("m210_imputacion", cid, {"codigo": previa_i["codigo"],
+                "estado": _estado_auto(previa_i, "Falta documentación")})
         else:
             codigo_i = previa_i["codigo"] if previa_i else None
         if codigo_i:
@@ -1470,6 +1635,9 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
             if fila_i.get("estado") not in ("Presentado", "No procede"):
                 motivo = (AVISO_IMPUTACION_2027 if ejercicio >= 2027 else
                           "sin valor catastral" if imp and imp.falta_valor else
+                          "datos del contrato sin confirmar" if avisos_origen else
+                          f"residencia de {fila_res.get('ejercicio')} sin certificado de {ejercicio}"
+                          if residencia_heredada else
                           "revisión catastral sin acreditar" if imp and imp.provisional else None)
                 # La cuota va delante: el resumen recorta las líneas largas.
                 informe_estados.append(f"{cod} · FALTA por presentar 210 Imputación {ejercicio} · cuota "
@@ -1528,19 +1696,99 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
     previa_p = db.get_por_clave("patrimonio_714", cid, clave_p)
     deudas = float((previa_p or {}).get("deudas") or 0)
     bonif = float((previa_p or {}).get("bonificacion") or 0)
-    pat = calcular_patrimonio(inmuebles, catastros, ejercicio, deudas, bonif)
+    fila_r = db.residencia(cid, ejercicio) or {}
+    normativa = str(fila_r.get("normativa_ip") or (previa_p or {}).get("normativa") or "Estatal (no residente)")
+    autonomica = not normativa.strip().casefold().removeprefix("normativa ").startswith("estatal")
+    minimo = ((previa_p or {}).get("minimo_exento") if autonomica else None)
+    minimo = IP_MINIMO_EXENTO if minimo is None else float(minimo)
+    if not math.isfinite(minimo) or minimo < 0:
+        raise ValueError("El mínimo exento de Patrimonio debe ser un importe válido no negativo.")
+    pat = calcular_patrimonio(inmuebles, catastros, ejercicio, deudas, bonif, minimo_exento=minimo,
+                              otros_activos=db.listar("otros_activos", cid, ejercicio=ejercicio))
+    import normativa_patrimonio as np
+    eleccion = np.fijar_herencia(db, cid, ejercicio)
+    manual_minimo = bool(db.get_config(f'minimo714_manual|{cid}|{ejercicio}'))
+    if (previa_p and previa_p.get('minimo_exento') is not None and eleccion.get('confirmado')
+            and db.get_config(f'minimo714_auto|{cid}|{ejercicio}') is None):
+        anterior_regla = np.regla(np.codigo_desde_nombre(previa_p.get('normativa')), ejercicio)
+        if anterior_regla is None or previa_p['minimo_exento'] != anterior_regla[0]:
+            # Un importe histórico distinto del general no se presume un error:
+            # puede ser una circunstancia particular acreditada por el asesor.
+            db.set_config(f'minimo714_manual|{cid}|{ejercicio}', '1')
+            manual_minimo = True
+    manual_bonif = bool(db.get_config(f'bonificacion714_manual|{cid}|{ejercicio}'))
+    auto_bonif_anterior = db.get_config(f'bonificacion714_auto|{cid}|{ejercicio}')
+    if previa_p and bonif and auto_bonif_anterior is None and eleccion.get('confirmado'):
+        # Un importe histórico anterior al motor no se presume automático.
+        db.set_config(f'bonificacion714_manual|{cid}|{ejercicio}', '1')
+        manual_bonif = True
+    regla = np.regla(eleccion['normativa'], ejercicio) if eleccion.get('confirmado') else None
+    ccaa = fila_r.get("ccaa_ip") or (previa_p or {}).get("ccaa")
+    if eleccion.get('confirmado'):
+        normativa = np.NOMBRES.get(eleccion['normativa'], 'Normativa pendiente')
+        ccaa = eleccion.get('comunidad') if eleccion['normativa'] == 'OTRA' else (normativa if eleccion['normativa'] != 'ESTATAL' else None)
+        if regla:
+            pat.minimo_exento = float(previa_p['minimo_exento']) if manual_minimo and previa_p else regla[0]
+            if not manual_minimo and not _presentado(previa_p):
+                db.set_config(f'minimo714_auto|{cid}|{ejercicio}', str(regla[0]))
+            if manual_minimo:
+                pat.avisos_activos.append('PROVISIONAL: se conserva el mínimo exento manual del asesor. Verificar la circunstancia particular y su justificación; no se sustituye por el mínimo general.')
+            pat.base_liquidable = r2(max(0, pat.base - pat.minimo_exento))
+            pat.cuota_integra = np.cuota(pat.base_liquidable, regla[1]) if regla[1] else aplicar_tarifa(pat.base_liquidable)
+            general = np.bonificacion_general(eleccion['normativa'], ejercicio, pat.cuota_integra,
+                calcular_its(r2(max(0, pat.base - IP_MINIMO_EXENTO)), 0)[0])
+            if general is not None and not manual_bonif:
+                pat.bonificacion = general
+                if not _presentado(previa_p):
+                    db.set_config(f'bonificacion714_auto|{cid}|{ejercicio}', str(general))
+            elif general is None and not manual_bonif:
+                # Una bonificación automática de otra normativa no es un dato
+                # manual y nunca debe arrastrarse a un régimen sin regla validada.
+                pat.bonificacion = 0
+                if not _presentado(previa_p):
+                    db.set_config(f'bonificacion714_auto|{cid}|{ejercicio}', '0')
+                pat.avisos_activos.append('PROVISIONAL: bonificación general sin regla validada para esta normativa y ejercicio; no se arrastra la automática de la normativa anterior. Revisar con el asesor.')
+            pat.resultado = r2(max(0, pat.cuota_integra - pat.bonificacion))
+            pat.obligado = pat.resultado > 0 or pat.valor_bienes > IP_UMBRAL_DECLARAR_BIENES
+        else:
+            pat.minimo_exento = float(previa_p['minimo_exento']) if manual_minimo and previa_p else IP_MINIMO_EXENTO
+            pat.base_liquidable = r2(max(0, pat.base - pat.minimo_exento))
+            pat.cuota_integra = aplicar_tarifa(pat.base_liquidable)
+            pat.bonificacion = bonif if manual_bonif else 0
+            pat.resultado = r2(max(0, pat.cuota_integra - pat.bonificacion))
+            pat.obligado = pat.resultado > 0 or pat.valor_bienes > IP_UMBRAL_DECLARAR_BIENES
+            pat.avisos_activos.append('PROVISIONAL: comunidad o ejercicio sin motor validado; referencia estatal sin trasladar mínimos ni bonificaciones automáticas de otra comunidad. No es una cuota autonómica definitiva.')
+        if eleccion['normativa'] != 'ESTATAL':
+            pat.avisos_activos.append('PROVISIONAL: mínimo, tarifa y bonificación generales antes de límites conjuntos. Revisar beneficios particulares, convenios y límite conjunto de cuotas; la selección no acredita esos requisitos.')
+        if ejercicio >= date.today().year:
+            pat.avisos_activos.append('PROVISIONAL: ejercicio aún no cerrado; confirmar normativa vigente al devengo.')
+        pat.provisional = bool(pat.avisos_activos)
+    elif autonomica:
+        pat.provisional = True
+        pat.avisos_activos.append("PROVISIONAL: normativa autonómica; se conserva el mínimo registrado por el asesor, pero tarifa, deducciones y bonificación requieren validación. La tarifa mostrada es estatal (DA4, todos los no residentes).")
+    if not eleccion.get('confirmado') and db.listar('otros_activos', cid, ejercicio=ejercicio):
+        pat.provisional = True
+        pat.avisos_activos.append('PROVISIONAL: selecciona y confirma la normativa de Patrimonio para este expediente; hasta entonces se muestra una estimación, sin decidir la comunidad por el domicilio del asesor.')
+    if eleccion.get('normativa') == 'ESTATAL' and pat.cuota_integra > 0:
+        # STS 1372/2025, 29/10/2025; AEAT Manual 2025 y TEAC 8384/2025:
+        # no excluir al NR del art.31 por el mero hecho de obligación real.
+        pat.provisional = True
+        pat.avisos_activos.append('PROVISIONAL: comprobar con el asesor el límite conjunto del art. 31 LIP aplicable también a no residentes según la jurisprudencia; faltan los datos necesarios para aplicarlo automáticamente.')
     obs_p = pat.mensaje + ". " + "; ".join(f"{c}: {vp.fuente} {fmt_eur(vp.valor)} × {t:.0%} = {fmt_eur(v)}"
                                             for c, vp, t, v in pat.detalle_inmuebles)
-    fila_r = db.residencia(cid, ejercicio) or {}
+    for aviso in pat.avisos_activos:
+        discrepancias.append(Alerta("grave", "Otros activos", "Patrimonio 714", aviso))
+    obs_p += ". " + "; ".join(pat.avisos_activos)
+    estado_p, revision_p = _estado_patrimonial(previa_p, pat.provisional, pat.obligado)
     if not _presentado(previa_p):
         codigo_p = db.upsert("patrimonio_714", cid, {
-            "ejercicio": ejercicio, "pais": res.pais or res.grupo, "ccaa": fila_r.get("ccaa_ip"),
-            "normativa": fila_r.get("normativa_ip") or "Estatal (no residente)", "valor_bienes": pat.valor_bienes,
+            "ejercicio": ejercicio, "pais": res.pais or res.grupo, "ccaa": ccaa,
+            "normativa": normativa, "valor_bienes": pat.valor_bienes,
             "deudas": pat.deudas, "base": pat.base, "minimo_exento": pat.minimo_exento,
             "base_liquidable": pat.base_liquidable, "cuota_integra": pat.cuota_integra,
             "bonificacion": pat.bonificacion, "resultado": pat.resultado,
-            "estado": _estado_auto(previa_p, "Pendiente" if pat.obligado else "No procede"),
-            "observaciones": obs_p[:1000]},
+            "estado": estado_p, "revision_automatica": revision_p,
+            "observaciones": obs_p if len(obs_p) <= 1000 else obs_p[:950] + " · Más avisos en Pendientes."},
             clave=clave_p)
     else:
         codigo_p = previa_p["codigo"]
@@ -1550,17 +1798,25 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
 
     clave_t = f"718|{ejercicio}"
     previa_t = db.get_por_clave("its_718", cid, clave_t)
-    its = calcular_its(float(fila_p.get("base_liquidable") or 0), float(fila_p.get("resultado") or 0))
+    # El mínimo del 718 es estatal e independiente del elegido para el 714.
+    # Ley 38/2022 art. 3.9 vigente: también se aplica a obligación real.
+    base_its = r2(max(0.0, pat.base - IP_MINIMO_EXENTO))
+    pago_ip = fila_p.get("pagado")
+    its = calcular_its(base_its, float(pago_ip or 0))
+    provisional_its = pat.provisional or (pago_ip is None and its[0] > 0)
+    obs_its = ("PROVISIONAL: confirmar el 714 y su cuota efectivamente satisfecha antes de cerrar el 718. "
+               "No se deducen pagos no acreditados (art. 3.15 Ley 38/2022)." if provisional_its else "")
+    estado_t, revision_t = _estado_patrimonial(previa_t, provisional_its, its[2] > 0)
     if not _presentado(previa_t):
         codigo_t = db.upsert("its_718", cid, {
-            "ejercicio": ejercicio, "pais": res.pais or res.grupo, "criterio": "Ley 38/2022 (no residente)",
-            "base": float(fila_p.get("base_liquidable") or 0), "cuota": its[0], "deducciones": its[1], "resultado": its[2],
-            "estado": _estado_auto(previa_t, "Pendiente" if its[2] > 0 else "No procede")}, clave=clave_t)
+            "ejercicio": ejercicio, "pais": res.pais or res.grupo,
+            "base": base_its, "cuota": its[0], "deducciones": its[1], "resultado": its[2],
+            "estado": estado_t, "revision_automatica": revision_t, "criterio": "Ley 38/2022 (no residente). " + obs_its}, clave=clave_t)
     else:
         codigo_t = previa_t["codigo"]
     fila_t = db.get("its_718", cid, codigo_t)
     _obligacion(db, cid, ejercicio, "ITS 718", None, f"OBL|{clave_t}", plazo_718(ejercicio), codigo_t,
-                fila_t.get("estado"), "", fila_t.get("pagado"), fila_t.get("fecha_presentacion"))
+                fila_t.get("estado"), obs_its, fila_t.get("pagado"), fila_t.get("fecha_presentacion"))
 
     # ---- Asesor interanual + avisos -> 15_NOTAS
     alertas = comparar_interanual(db, cid, ejercicio)
@@ -1573,6 +1829,11 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
                     f"{c['codigo']}: fin previsto el {prevista:%d/%m/%Y}, pero un alquiler de vivienda se prorroga por "
                     f"ley hasta el {legal:%d/%m/%Y} (LAU art. 9). Se calcula como alquilado; si el inquilino se fue, "
                     "registra la fecha de fin real · VERIFICAR"))
+                informe_estados.append(f"{inm['codigo']} · PROVISIONAL: {c['codigo']} en prórroga legal; "
+                                       "confirma si el inquilino sigue")
+    if residencia_heredada:
+        # La alerta grave «residencia heredada» ya lo dice (y lleva el botón de confirmar): sin aviso repetido.
+        alertas[:] = [a for a in alertas if not (a.tipo == "residencia" and "se usa la de" in a.mensaje)]
     alertas.extend(discrepancias)
     vinculadas = {}
     for obligacion in db.listar("obligaciones", cid, ejercicio=ejercicio, tipo="210 Alquiler"):
@@ -1588,7 +1849,22 @@ def recalcular_cliente(db: Database, cid: int, ejercicio: int) -> InformeFiscal:
     if res.asumida:
         alertas.insert(0, Alerta("grave", None, "residencia",
                                  "Sin residencia fiscal registrada: se calcula como Extra-UE (24 %, sin gastos)."))
+    for tipo_resuelto in ("residencia heredada", "país de residencia"):
+        clave_res = f"ALERTA|{ejercicio}|-|{tipo_resuelto}"
+        if not any(a.tipo == tipo_resuelto for a in alertas):
+            nota = db.get_por_clave("notas", cid, clave_res)
+            if nota and not str(nota.get("nota") or "").startswith("RESUELTO"):
+                db.nota(cid, "Asesor interanual", nota.get("asunto") or tipo_resuelto,
+                        "RESUELTO al recalcular.\n" + (nota.get("nota") or ""), clave=clave_res,
+                        proxima_accion="Sin acción pendiente")
     for inm in inmuebles:
+        clave_contrato = f"ALERTA|{ejercicio}|{inm['codigo']}|datos contrato"
+        if not any(a.inmueble == inm['codigo'] and a.tipo == 'datos contrato' for a in alertas):
+            nota = db.get_por_clave('notas', cid, clave_contrato)
+            if nota and not str(nota.get('nota') or '').startswith('RESUELTO'):
+                db.nota(cid, 'Asesor interanual', nota.get('asunto') or 'Datos del contrato',
+                        'RESUELTO al recalcular: datos del contrato aclarados.\n' + (nota.get('nota') or ''),
+                        clave=clave_contrato, proxima_accion='Sin acción pendiente')
         if inm['codigo'] not in alquileres_bloqueados:
             clave = f"ALERTA|{ejercicio}|{inm['codigo']}|conflicto 210 alquiler"
             nota = db.get_por_clave('notas', cid, clave)

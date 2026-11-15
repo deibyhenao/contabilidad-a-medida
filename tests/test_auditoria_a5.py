@@ -79,7 +79,10 @@ def test_a5_fallo_bd_devuelve_carpeta_y_conserva_config(ctrl):
 def test_a5_cascada_cubre_todas_las_tablas_y_firma(ctrl):
     cid = ctrl.crear_cliente("Cliente", "A5", "A5-CASCADA")["id"]
     for tabla in database.TABLAS:
-        ctrl.db.upsert(tabla, cid, {"codigo": "A5-001"})
+        datos = {"codigo": "A5-001"}
+        if tabla == "otros_activos":
+            datos.update(ejercicio=2025, tipo="CUENTA", ubicacion="PENDIENTE", pct_titularidad=1)
+        ctrl.db.upsert(tabla, cid, datos)
     ctrl.db.set_config(f"excel_firma|{cid}", "firma-prueba")
     ctrl.eliminar_cliente(cid)
     assert ctrl.db.get_cliente(cid) is None

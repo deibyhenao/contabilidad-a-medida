@@ -39,6 +39,7 @@ def test_excepcion_revision_colectiva2012_y_porcentaje_manual(ejercicio):
 
 @pytest.mark.parametrize('ejercicio,cuota,esperado', [
     (2025, 100, date(2026, 1, 20)), (2026, 100, date(2027, 4, 20)),
+    # Arrendamientos: agrupación anual «con cualquier resultado»; desde 2026 en abril también con cuota cero (AEAT)
     (2026, 0, date(2027, 1, 20)), (2025, 0, date(2026, 1, 20)),
 ])
 def test_plazo210_segun_resultado(ejercicio, cuota, esperado):
@@ -783,6 +784,7 @@ def test_revisar_mismo_desglose_de_gastos_no_lo_detecta_como_factura_duplicada(e
 
 def test_presentacion_y_obligacion_se_revierten_juntas_si_falla_recalculo(expediente, monkeypatch):
     c, cid, inm = expediente
+    c.confirmar_residencia(cid, 2025)  # requisito anual explícito antes de ensayar el fallo de recálculo
     c.db.upsert('catastro', cid, {'inmueble': inm, 'ejercicio': 2025, 'valor_catastral': 100000,
         'pct_imputacion': .02, 'revision_pendiente': 0}, clave=f'CAT|{inm}|2025')
     c.sincronizar(cid, 2025)
